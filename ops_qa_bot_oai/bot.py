@@ -23,11 +23,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agents import Agent, MaxTurnsExceeded, Runner
+from agents import Agent, AgentOutputSchema, MaxTurnsExceeded, Runner
 from openai.types.responses import ResponseTextDeltaEvent
 
 from .model import ModelChoice, resolve_model
-from .prompt import build_system_prompt
+from .prompt import build_structured_system_prompt, build_system_prompt
+from .schema import AnswerContract, Decision, validate_citations
 from .tools import DOC_TOOLS, DocsContext
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,18 @@ class AnswerResult:
     subtype: str = "success"
 
 
+@dataclass
+class StructuredAnswer:
+    """`OpsQABot.answer_structured()` 的返回值：强类型契约 + 来源校验 + 用量。"""
+
+    contract: AnswerContract
+    # 契约里 citations 中**不存在/越界**的路径（空表示全部真实存在）。
+    invalid_citations: list[str] = field(default_factory=list)
+    usage: dict[str, Any] | None = None
+    num_turns: int | None = None
+    subtype: str = "success"
+
+
 def format_tool_call(name: str, args: dict) -> str:
     """紧凑展示工具调用，用于日志和 CLI。"""
     if name == "read_doc":
@@ -152,10 +165,28 @@ class OpsQABot:
         self._context = DocsContext(docs_root=self.docs_root)
         # 多轮对话历史（OpenAI SDK 的 input 列表形态）；reset() 清空。
         self._history: list[Any] = []
+        # 结构化输出 agent 懒构造（仅 answer_structured 用到时才建）。
+        self._structured_agent: Agent[DocsContext] | None = None
 
     def reset(self) -> None:
         """清空会话上下文，开始新对话。"""
         self._history = []
+
+    def _get_structured_agent(self) -> Agent[DocsContext]:
+        """懒构造结构化输出 agent：同样的工具/模型，但 output_type=AnswerContract。
+
+        用非严格 schema（strict_json_schema=False）下发，以兼容 Claude / 智谱 / 火山等
+        不支持 OpenAI strict 结构化输出的 provider。
+        """
+        if self._structured_agent is None:
+            self._structured_agent = Agent(
+                name="ops-qa-bot-structured",
+                instructions=build_structured_system_prompt(self.docs_root),
+                tools=list(DOC_TOOLS),
+                model=self.model_choice.model,
+                output_type=AgentOutputSchema(AnswerContract, strict_json_schema=False),
+            )
+        return self._structured_agent
 
     def _run_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"context": self._context}
@@ -224,6 +255,51 @@ class OpsQABot:
             markers=markers,
             usage=usage,
             num_turns=num_turns,
+            subtype=subtype,
+        )
+
+    async def answer_structured(self, question: str) -> StructuredAnswer:
+        """结构化输出模式（差异化 #1）：返回强类型 AnswerContract + 来源真实性校验。
+
+        与 `answer()` 不同，这里 agent 的 `output_type=AnswerContract`，SDK 强制模型
+        按 schema 产出（不合法会重试），路由决策（answer/clarify/escalate/reject）、
+        来源、追问都是类型字段而非文本标记。拿到契约后再用代码逐条核对 citations
+        是否指向真实存在的文档——把"答案必须引用真实文档"从 prompt 自律变成硬校验。
+
+        注意：结构化输出不便逐 token 流式，这里走非流式 `Runner.run`。多轮历史与
+        流式 `ask()` 共享 `self._history`。
+        """
+        logger.info("question (structured): %s", question)
+        agent = self._get_structured_agent()
+        input_items = self._history + [{"role": "user", "content": question}]
+        subtype = "success"
+        try:
+            result = await Runner.run(agent, input=input_items, **self._run_kwargs())
+        except MaxTurnsExceeded:
+            # 撞上限时没有合法契约可返回，退化成一个 reject 契约并标记 subtype。
+            return StructuredAnswer(
+                contract=AnswerContract(
+                    decision=Decision.reject,
+                    answer="本轮检索步数过多被中断（max_turns），结论可能不完整，请换个问法或缩小范围。",
+                ),
+                subtype="error_max_turns",
+            )
+
+        contract = result.final_output  # 已被 SDK 按 schema 校验
+        assert isinstance(contract, AnswerContract)
+        try:
+            self._history = result.to_input_list()
+        except Exception:  # noqa: BLE001
+            logger.debug("to_input_list() 失败，保留旧历史", exc_info=True)
+
+        invalid = validate_citations(self.docs_root, contract.citations)
+        if invalid:
+            logger.warning("结构化答案引用了不存在/越界的来源: %s", invalid)
+        return StructuredAnswer(
+            contract=contract,
+            invalid_citations=invalid,
+            usage=_usage_dict(result),
+            num_turns=_num_turns(result),
             subtype=subtype,
         )
 

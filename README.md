@@ -19,8 +19,9 @@ ops-qa-bot-openai/
 │   ├── tools.py              # read_doc / glob_docs / grep_docs（对标 Claude 内置 Read/Glob/Grep）
 │   ├── prompt.py             # system prompt（移植自 ops-qa-bot 的核心主线）
 │   ├── model.py              # provider 解析：openai / responses / compatible / anthropic / litellm 运行时切换
-│   ├── bot.py                # OpsQABot：封装 Agent + Runner，ask()/answer() + 标记解析
-│   └── cli.py                # 交互式 REPL + 一次性 --ask 模式
+│   ├── schema.py             # 结构化输出契约 AnswerContract + 来源真实性校验（差异化 #1）
+│   ├── bot.py                # OpsQABot：封装 Agent + Runner，ask()/answer()（标记）+ answer_structured()（契约）
+│   └── cli.py                # 交互式 REPL + 一次性 --ask + --structured 模式
 ├── tests/test_tools.py       # 检索工具 + 沙箱 + 标记解析的回归测试（无需 LLM）
 ├── run.py                    # CLI 入口
 └── pyproject.toml
@@ -131,10 +132,30 @@ uv run python run.py --ask "MySQL 主从延迟怎么排查？"
 - **纯 SDK 框架对比**：用 `anthropic` / `compatible` / `litellm` 让本项目跑**和 ops-qa-bot 同一个模型/代理**，把模型变量固定住，剩下的差异就是两个 agent 框架本身（工具机制、agent loop、prompt 适配）。
 - **整套产品对比**：用 `openai` 跑 OpenAI 原生模型，对比"OpenAI SDK + OpenAI 模型" vs "Claude SDK + Claude 模型"的整体效果。
 
+## 结构化输出模式（差异化原型 #1）
+
+OpenAI Agents SDK 支持 `output_type=`：把一轮回答强制成**带 schema 校验的类型对象**，模型必须按字段填、不合法 SDK 会重试。这是 Claude Agent SDK 给不了的一等公民能力（那边只能像 ops-qa-bot 那样在文本里塞 `<<MARKER>>` 再正则解析，模型写错格式就丢信息）。
+
+加 `--structured` 即用这条路径：
+
+```bash
+uv run python run.py --ask "Redis 内存告警怎么处理？" --structured
+# REPL 也支持：uv run python run.py --structured
+```
+
+模型这一轮产出 `AnswerContract`（见 `ops_qa_bot_oai/schema.py`）：
+
+- `decision`：`answer` / `clarify` / `escalate` / `reject`（取代旧的 `<<CLARIFY>>`/`<<ESCALATE>>`）
+- `answer`：中文 markdown 正文
+- `citations`：答案依据的文档路径列表 —— 拿到后**用代码逐条核对是否真实存在**（把"必须引用真实文档"从 prompt 自律升级成硬校验，编造/越界的来源会被标 ✗ 并告警）
+- `escalate_to` / `escalate_dir` / `followups` / `confidence`
+
+跨 provider 用**非严格** schema 下发（`strict_json_schema=False`），兼容 Claude / 智谱 / 火山等不支持 OpenAI strict 结构化输出的端点。自由文本 + 标记的老路径（`answer()` / 不带 `--structured`）保留着，方便并排对比两种产出方式。
+
 ## 测试
 
 ```bash
-uv run pytest            # 检索工具 / 沙箱 / 标记解析（确定性，无需 LLM 或网络）
+uv run pytest            # 检索 / 沙箱 / 标记解析 / base_url 容错 / 结构化契约 + 来源校验（确定性，无需 LLM）
 uv run ruff check .      # lint
 uv run ruff format .     # 格式化
 ```

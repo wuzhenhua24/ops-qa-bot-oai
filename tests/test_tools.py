@@ -19,6 +19,7 @@ import pytest
 
 from ops_qa_bot_oai.bot import parse_markers
 from ops_qa_bot_oai.model import normalize_openai_base_url
+from ops_qa_bot_oai.schema import AnswerContract, Decision, Followup, validate_citations
 from ops_qa_bot_oai.tools import _glob_docs, _grep_docs, _read_doc
 
 _INDEX = """# 索引
@@ -264,3 +265,47 @@ def test_anthropic_default_uses_x_api_key(monkeypatch):
 
     mc = resolve_model()
     assert mc.model.api_key == "k"
+
+
+# ---------------------------------------------------------------------------
+# 结构化输出契约（差异化 #1）：AnswerContract 解析 + 来源真实性校验
+# ---------------------------------------------------------------------------
+
+
+def test_contract_parses_from_json():
+    # 模型产出的 JSON 应能按 schema 解析，enum 字段被正确收敛
+    c = AnswerContract.model_validate(
+        {
+            "decision": "answer",
+            "answer": "先看 maxmemory。",
+            "citations": ["redis/troubleshooting.md"],
+            "followups": ["troubleshoot", "commands"],
+            "confidence": 0.8,
+        }
+    )
+    assert c.decision is Decision.answer
+    assert c.followups == [Followup.troubleshoot, Followup.commands]
+    assert c.escalate_to == ""  # 默认值
+
+
+def test_contract_defaults_minimal():
+    # 只给必填项，其余走默认（reject/clarify 常见）
+    c = AnswerContract.model_validate({"decision": "reject", "answer": "不在范围内。"})
+    assert c.citations == []
+    assert c.confidence == 0.0
+
+
+def test_validate_citations_all_real(docs_root):
+    invalid = validate_citations(docs_root, ["redis/overview.md", "mysql/overview.md"])
+    assert invalid == []
+
+
+def test_validate_citations_flags_missing_and_traversal(docs_root):
+    invalid = validate_citations(
+        docs_root,
+        ["redis/overview.md", "redis/ghost.md", "../../../etc/passwd"],
+    )
+    # 真实的不报，编造的 + 越界的都报
+    assert "redis/overview.md" not in invalid
+    assert "redis/ghost.md" in invalid
+    assert "../../../etc/passwd" in invalid

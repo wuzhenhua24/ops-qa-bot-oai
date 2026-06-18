@@ -11,16 +11,52 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from .bot import OpsQABot, format_tool_call
+from .bot import OpsQABot, StructuredAnswer, format_tool_call
 from .model import resolve_model
 
 _RESET_WORDS = {"/reset", "/new", "新对话", "重置"}
 
 
-async def run_once(docs_root: Path, question: str, show_tools: bool) -> None:
+def _print_structured(sa: StructuredAnswer) -> None:
+    """渲染结构化契约：决策 + 正文 + 来源（带真实性校验）+ 追问 + 置信度。"""
+    c = sa.contract
+    print(f"bot> [{c.decision.value}]")
+    print(c.answer)
+    if c.citations:
+        invalid = set(sa.invalid_citations)
+        print("\n来源：")
+        for cite in c.citations:
+            mark = "✗ 不存在/越界" if cite in invalid else "✓"
+            print(f"  - {cite}  {mark}")
+    if c.decision.value == "escalate" and c.escalate_to:
+        print(f"\n升级给：{c.escalate_to}（组件目录：{c.escalate_dir or '?'}）")
+    if c.followups:
+        print("追问建议：" + "、".join(f.value for f in c.followups))
+    print(f"置信度：{c.confidence:.2f}")
+    if sa.invalid_citations:
+        print(f"⚠️ 有 {len(sa.invalid_citations)} 条来源不指向真实文档，答案可能不可靠。")
+
+
+async def run_once(
+    docs_root: Path, question: str, show_tools: bool, structured: bool = False
+) -> None:
     """一次性问一个问题就退出。方便把同一问题分别喂给两个项目做 A/B 对比。"""
     model_choice = resolve_model()
     bot = OpsQABot(docs_root=docs_root, model_choice=model_choice)
+
+    if structured:
+        sa = await bot.answer_structured(question)
+        if show_tools and sa.num_turns is not None:
+            print(f"[模型 {model_choice.description} · {sa.num_turns} 次模型调用 · 结构化输出]\n")
+        _print_structured(sa)
+        if sa.usage:
+            print(
+                f"\n[in={sa.usage.get('input_tokens', 0)} "
+                f"out={sa.usage.get('output_tokens', 0)} "
+                f"reqs={sa.usage.get('requests', 0)}]"
+            )
+        return
+
     result = await bot.answer(question)
     if show_tools and result.num_turns is not None:
         print(f"[模型 {model_choice.description} · {result.num_turns} 次模型调用]\n")
@@ -44,11 +80,11 @@ async def run_once(docs_root: Path, question: str, show_tools: bool) -> None:
         print("⚠️ 撞到 max_turns 上限，结论可能不完整。")
 
 
-async def run_repl(docs_root: Path, show_tools: bool) -> None:
+async def run_repl(docs_root: Path, show_tools: bool, structured: bool = False) -> None:
     model_choice = resolve_model()
     print("运维文档问答机器人（OpenAI Agents SDK）")
     print(f"文档根目录：{docs_root}")
-    print(f"模型：{model_choice.description}")
+    print(f"模型：{model_choice.description}" + ("（结构化输出）" if structured else ""))
     print("输入问题后回车提问；/reset 开新会话；空行或 Ctrl+C 退出。\n")
 
     bot = OpsQABot(docs_root=docs_root, model_choice=model_choice)
@@ -70,6 +106,17 @@ async def run_repl(docs_root: Path, show_tools: bool) -> None:
             continue
 
         print()
+        if structured:
+            try:
+                sa = await bot.answer_structured(question)
+                _print_structured(sa)
+                print()
+            except KeyboardInterrupt:
+                print("\n（已中断本次回答）\n")
+            except Exception as e:  # noqa: BLE001
+                print(f"\n[出错] {type(e).__name__}: {e}\n")
+            continue
+
         printed_prefix = False
         try:
             async for event in bot.ask(question):
@@ -116,13 +163,20 @@ def main() -> None:
         metavar="问题",
         help="一次性问一个问题就退出（不进 REPL），方便做 A/B 对比",
     )
+    parser.add_argument(
+        "--structured",
+        action="store_true",
+        help="用结构化输出契约（AnswerContract）替代自由文本 + <<MARKER>>，并校验来源真实性",
+    )
     args = parser.parse_args()
     docs_root = Path(args.docs).resolve()
     show_tools = not args.hide_tools
     if args.ask:
-        asyncio.run(run_once(docs_root, args.ask, show_tools=show_tools))
+        asyncio.run(
+            run_once(docs_root, args.ask, show_tools=show_tools, structured=args.structured)
+        )
     else:
-        asyncio.run(run_repl(docs_root, show_tools=show_tools))
+        asyncio.run(run_repl(docs_root, show_tools=show_tools, structured=args.structured))
 
 
 if __name__ == "__main__":
