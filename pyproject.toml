@@ -1,0 +1,41 @@
+[project]
+name = "ops-qa-bot-openai"
+version = "0.1.0"
+description = "基于 OpenAI Agents SDK 的内部运维文档问答机器人（对标 Claude Agent SDK 版 ops-qa-bot）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai-agents>=0.17.5",
+]
+
+[project.optional-dependencies]
+# provider=litellm 时需要：经 LiteLLM 直连任意 provider（含 Claude）。
+# provider=openai / compatible 不需要这个 extra。
+litellm = [
+    "openai-agents[litellm]>=0.17.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# prompt.py 是一大段中文 prose 模板，按句换行反而破坏 prompt 可读性，豁免行长。
+"ops_qa_bot_oai/prompt.py" = ["E501"]

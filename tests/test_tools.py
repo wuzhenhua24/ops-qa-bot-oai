@@ -1,0 +1,266 @@
+"""文档检索工具 + 标记解析的回归测试（纯逻辑，无需 LLM / 网络）。
+
+覆盖：
+- _read_doc：正常读取 / 不存在 / 路径越界。
+- _glob_docs：命中 / 无匹配 / `..` 逃逸被挡。
+- _grep_docs：命中行格式 / 限定子目录 / 无命中 / 越界 / 非法正则。
+- parse_markers：ESCALATE / CLARIFY / FOLLOWUPS 解析 + 白名单过滤 + 文本剥离。
+
+跑法：
+    uv run pytest
+"""
+
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from ops_qa_bot_oai.bot import parse_markers
+from ops_qa_bot_oai.model import normalize_openai_base_url
+from ops_qa_bot_oai.tools import _glob_docs, _grep_docs, _read_doc
+
+_INDEX = """# 索引
+| 组件 | 目录 | open_id |
+|------|------|---------|
+| Redis | `redis/` | ou_aaa |
+"""
+
+_REDIS_OVERVIEW = "# Redis 概览\n\nRedis 是内存缓存。\nmaxmemory 默认无上限。\n"
+_REDIS_TROUBLE = "# 故障排查\n\n## 内存告警\n监控报 memory > 85%。\n慢查询用 SLOWLOG GET。\n"
+_MYSQL_OVERVIEW = "# MySQL 概览\n\n主从复制基础。\n慢查询日志 slow_query_log。\n"
+
+
+@pytest.fixture()
+def docs_root() -> Path:
+    d = Path(tempfile.mkdtemp(prefix="opsqa_oai_test_"))
+    (d / "INDEX.md").write_text(_INDEX, encoding="utf-8")
+    (d / "redis").mkdir()
+    (d / "redis" / "overview.md").write_text(_REDIS_OVERVIEW, encoding="utf-8")
+    (d / "redis" / "troubleshooting.md").write_text(_REDIS_TROUBLE, encoding="utf-8")
+    (d / "mysql").mkdir()
+    (d / "mysql" / "overview.md").write_text(_MYSQL_OVERVIEW, encoding="utf-8")
+    return d
+
+
+# ---------------------------------------------------------------------------
+# read_doc
+# ---------------------------------------------------------------------------
+
+
+def test_read_doc_ok(docs_root: Path):
+    out = _read_doc(docs_root, "redis/overview.md")
+    assert "Redis 是内存缓存" in out
+
+
+def test_read_doc_index_at_root(docs_root: Path):
+    assert "索引" in _read_doc(docs_root, "INDEX.md")
+
+
+def test_read_doc_missing(docs_root: Path):
+    out = _read_doc(docs_root, "redis/nope.md")
+    assert out.startswith("[未找到]")
+
+
+def test_read_doc_path_traversal_blocked(docs_root: Path):
+    # 试图读 docs_root 之外的文件
+    out = _read_doc(docs_root, "../../../etc/passwd")
+    assert out.startswith("[错误]")
+    assert "越界" in out
+
+
+# ---------------------------------------------------------------------------
+# glob_docs
+# ---------------------------------------------------------------------------
+
+
+def test_glob_docs_dir(docs_root: Path):
+    out = _glob_docs(docs_root, "redis/*.md")
+    lines = set(out.splitlines())
+    assert "redis/overview.md" in lines
+    assert "redis/troubleshooting.md" in lines
+    assert "mysql/overview.md" not in lines
+
+
+def test_glob_docs_recursive(docs_root: Path):
+    out = _glob_docs(docs_root, "**/*.md")
+    assert "redis/overview.md" in out
+    assert "mysql/overview.md" in out
+
+
+def test_glob_docs_no_match(docs_root: Path):
+    assert _glob_docs(docs_root, "kafka/*.md").startswith("[无匹配]")
+
+
+def test_glob_docs_escape_blocked(docs_root: Path):
+    # ../ 逃逸不应列出 docs_root 之外的文件
+    out = _glob_docs(docs_root, "../*")
+    assert out.startswith("[无匹配]")
+
+
+# ---------------------------------------------------------------------------
+# grep_docs
+# ---------------------------------------------------------------------------
+
+
+def test_grep_docs_hit_format(docs_root: Path):
+    out = _grep_docs(docs_root, "慢查询")
+    # 命中两个文件，格式为 路径:行号: 内容
+    assert "redis/troubleshooting.md:" in out
+    assert "mysql/overview.md:" in out
+    assert ": " in out
+
+
+def test_grep_docs_scoped_to_subdir(docs_root: Path):
+    out = _grep_docs(docs_root, "慢查询", path="redis")
+    assert "redis/troubleshooting.md:" in out
+    assert "mysql/" not in out
+
+
+def test_grep_docs_no_hit(docs_root: Path):
+    assert _grep_docs(docs_root, "kubernetes").startswith("[无命中]")
+
+
+def test_grep_docs_regex_alternation(docs_root: Path):
+    out = _grep_docs(docs_root, "maxmemory|memory")
+    assert "redis/" in out
+
+
+def test_grep_docs_bad_regex(docs_root: Path):
+    assert _grep_docs(docs_root, "[unclosed").startswith("[错误]")
+
+
+def test_grep_docs_path_traversal_blocked(docs_root: Path):
+    out = _grep_docs(docs_root, "x", path="../..")
+    assert out.startswith("[错误]")
+
+
+# ---------------------------------------------------------------------------
+# parse_markers
+# ---------------------------------------------------------------------------
+
+
+def test_parse_escalate():
+    text = "文档中未找到相关内容。\n\n<<ESCALATE:ou_abc:redis>>"
+    cleaned, m = parse_markers(text)
+    assert m.escalate == "ou_abc:redis"
+    assert "<<ESCALATE" not in cleaned
+    assert "文档中未找到相关内容" in cleaned
+
+
+def test_parse_clarify():
+    cleaned, m = parse_markers("你用 6.x 还是 7.x？\n\n<<CLARIFY>>")
+    assert m.clarify is True
+    assert "<<CLARIFY>>" not in cleaned
+
+
+def test_parse_followups_whitelist_and_dedup():
+    text = "扩容步骤...\n\n<<FOLLOWUPS:rollback|risks|rollback|bogus|commands|related>>"
+    cleaned, m = parse_markers(text)
+    # 去重 + 白名单过滤 + 最多 3 个
+    assert m.followups == ["rollback", "risks", "commands"]
+    assert "bogus" not in m.followups
+    assert "<<FOLLOWUPS" not in cleaned
+
+
+def test_parse_no_markers():
+    cleaned, m = parse_markers("普通答案，无标记。")
+    assert m.escalate is None
+    assert m.clarify is False
+    assert m.followups == []
+    assert cleaned == "普通答案，无标记。"
+
+
+# ---------------------------------------------------------------------------
+# normalize_openai_base_url（OpenAI 协议 base_url 容错，以智谱 URL 为例）
+# ---------------------------------------------------------------------------
+
+
+def test_base_url_strips_chat_completions_suffix():
+    # 用户直接粘贴完整 URL（智谱 OpenAI 格式）
+    assert (
+        normalize_openai_base_url("https://open.bigmodel.cn/api/paas/v4/chat/completions")
+        == "https://open.bigmodel.cn/api/paas/v4"
+    )
+
+
+def test_base_url_already_prefix_unchanged():
+    assert (
+        normalize_openai_base_url("https://open.bigmodel.cn/api/paas/v4")
+        == "https://open.bigmodel.cn/api/paas/v4"
+    )
+
+
+def test_base_url_trailing_slash_trimmed():
+    assert (
+        normalize_openai_base_url("https://open.bigmodel.cn/api/paas/v4/chat/completions/")
+        == "https://open.bigmodel.cn/api/paas/v4"
+    )
+
+
+def test_base_url_strips_responses_suffix():
+    # Responses 协议端点：client 会自己追加 /responses，base_url 里多余的要剥掉
+    assert (
+        normalize_openai_base_url("https://api.example.com/v1/responses")
+        == "https://api.example.com/v1"
+    )
+
+
+# ---------------------------------------------------------------------------
+# anthropic provider 的 Bearer 鉴权开关（以火山引擎为例）
+# ---------------------------------------------------------------------------
+
+
+def test_anthropic_bearer_promotes_key_to_auth_token(monkeypatch):
+    # OPS_QA_ANTHROPIC_AUTH=bearer 时，应把 OPS_QA_API_KEY 提升成 ANTHROPIC_AUTH_TOKEN
+    # 并不再以 api_key 传入（这样 litellm 才发 Authorization: Bearer 而非 x-api-key）。
+    from ops_qa_bot_oai.model import resolve_model
+
+    for k in (
+        "OPS_QA_PROVIDER",
+        "OPS_QA_MODEL",
+        "OPS_QA_BASE_URL",
+        "OPS_QA_API_KEY",
+        "OPS_QA_ANTHROPIC_AUTH",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("OPS_QA_PROVIDER", "anthropic")
+    monkeypatch.setenv("OPS_QA_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding")
+    monkeypatch.setenv("OPS_QA_API_KEY", "volc-key")
+    monkeypatch.setenv("OPS_QA_ANTHROPIC_AUTH", "bearer")
+    monkeypatch.setenv("OPS_QA_MODEL", "claude-opus-4-8")
+
+    mc = resolve_model()
+    # key 被提升到 ANTHROPIC_AUTH_TOKEN
+    import os
+
+    assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == "volc-key"
+    # LitellmModel 不再持有 api_key（改由 auth_token 走 Bearer）
+    assert mc.model.api_key is None
+    assert mc.model.model == "anthropic/claude-opus-4-8"
+    assert mc.model.base_url == "https://ark.cn-beijing.volces.com/api/coding"
+
+
+def test_anthropic_default_uses_x_api_key(monkeypatch):
+    # 默认（不设 OPS_QA_ANTHROPIC_AUTH）保持 x-api-key：api_key 照常传入。
+    from ops_qa_bot_oai.model import resolve_model
+
+    for k in (
+        "OPS_QA_PROVIDER",
+        "OPS_QA_MODEL",
+        "OPS_QA_BASE_URL",
+        "OPS_QA_API_KEY",
+        "OPS_QA_ANTHROPIC_AUTH",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("OPS_QA_PROVIDER", "anthropic")
+    monkeypatch.setenv("OPS_QA_API_KEY", "k")
+    monkeypatch.setenv("OPS_QA_MODEL", "claude-opus-4-8")
+
+    mc = resolve_model()
+    assert mc.model.api_key == "k"
