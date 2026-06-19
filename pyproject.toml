@@ -37,5 +37,7 @@ target-version = "py310"
 select = ["E", "F", "I"]
 
 [tool.ruff.lint.per-file-ignores]
-# prompt.py 是一大段中文 prose 模板，按句换行反而破坏 prompt 可读性，豁免行长。
+# prompt.py / orchestration.py 含大段中文 prose prompt 模板，按句换行反而破坏 prompt
+# 可读性，豁免行长。
 "ops_qa_bot_oai/prompt.py" = ["E501"]
+"ops_qa_bot_oai/orchestration.py" = ["E501"]

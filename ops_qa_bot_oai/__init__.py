@@ -5,6 +5,7 @@
 
 from .bot import AnswerResult, Markers, OpsQABot, StructuredAnswer, parse_markers
 from .model import ModelChoice, resolve_model
+from .orchestration import Component, build_triage_agent, parse_index_components
 from .schema import AnswerContract, Decision, Followup, validate_citations
 
 __all__ = [
@@ -19,4 +20,7 @@ __all__ = [
     "Decision",
     "Followup",
     "validate_citations",
+    "Component",
+    "parse_index_components",
+    "build_triage_agent",
 ]

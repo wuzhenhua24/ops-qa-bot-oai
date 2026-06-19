@@ -19,6 +19,7 @@ import pytest
 
 from ops_qa_bot_oai.bot import parse_markers
 from ops_qa_bot_oai.model import normalize_openai_base_url
+from ops_qa_bot_oai.orchestration import parse_index_components
 from ops_qa_bot_oai.schema import AnswerContract, Decision, Followup, validate_citations
 from ops_qa_bot_oai.tools import _glob_docs, _grep_docs, _read_doc
 
@@ -309,3 +310,38 @@ def test_validate_citations_flags_missing_and_traversal(docs_root):
     assert "redis/overview.md" not in invalid
     assert "redis/ghost.md" in invalid
     assert "../../../etc/passwd" in invalid
+
+
+# ---------------------------------------------------------------------------
+# 多 agent 编排（差异化 #3）：INDEX.md 组件解析
+# ---------------------------------------------------------------------------
+
+_INDEX_FULL = """# 索引
+| 组件 | 来源 | 目录 | 飞书文档 | 覆盖内容 | 负责人 | open_id |
+|------|------|------|----------|----------|--------|---------|
+| Redis | local | `redis/` | - | Redis 集群运维、故障排查 | 张三 | ou_aaa |
+| MySQL | local | `mysql/` | - | 主从、备份、慢查询 | 李四 | ou_bbb |
+| Nginx | feishu | `nginx/` | docx_X | 网关配置（飞书） | 赵六 | ou_ccc |
+"""
+
+
+def test_parse_components_fields_and_dir_cleaned(tmp_path):
+    (tmp_path / "INDEX.md").write_text(_INDEX_FULL, encoding="utf-8")
+    comps = parse_index_components(tmp_path)
+    by_name = {c.name: c for c in comps}
+    assert set(by_name) == {"Redis", "MySQL", "Nginx"}
+    assert by_name["Redis"].dir == "redis"  # 去掉了反引号和斜杠
+    assert by_name["Redis"].source == "local"
+    assert by_name["Redis"].open_id == "ou_aaa"
+    assert by_name["Nginx"].source == "feishu"
+
+
+def test_parse_components_local_only_index(docs_root):
+    # fixture 的 INDEX 没有「来源」列 → 一律按 local
+    comps = parse_index_components(docs_root)
+    assert all(c.source == "local" for c in comps)
+    assert "redis" in {c.dir for c in comps}
+
+
+def test_parse_components_missing_index_empty(tmp_path):
+    assert parse_index_components(tmp_path) == []

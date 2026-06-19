@@ -20,8 +20,9 @@ ops-qa-bot-openai/
 │   ├── prompt.py             # system prompt（移植自 ops-qa-bot 的核心主线）
 │   ├── model.py              # provider 解析：openai / responses / compatible / anthropic / litellm 运行时切换
 │   ├── schema.py             # 结构化输出契约 AnswerContract + 来源真实性校验（差异化 #1）
+│   ├── orchestration.py      # 多 agent 编排：从 INDEX.md 生成分诊 + 组件专家（差异化 #3）
 │   ├── bot.py                # OpsQABot：封装 Agent + Runner，ask()/answer()（标记）+ answer_structured()（契约）
-│   └── cli.py                # 交互式 REPL + 一次性 --ask + --structured 模式
+│   └── cli.py                # 交互式 REPL + 一次性 --ask + --structured + --multi-agent 模式
 ├── tests/test_tools.py       # 检索工具 + 沙箱 + 标记解析的回归测试（无需 LLM）
 ├── run.py                    # CLI 入口
 └── pyproject.toml
@@ -151,6 +152,25 @@ uv run python run.py --ask "Redis 内存告警怎么处理？" --structured
 - `escalate_to` / `escalate_dir` / `followups` / `confidence`
 
 跨 provider 用**非严格** schema 下发（`strict_json_schema=False`），兼容 Claude / 智谱 / 火山等不支持 OpenAI strict 结构化输出的端点。自由文本 + 标记的老路径（`answer()` / 不带 `--structured`）保留着，方便并排对比两种产出方式。
+
+## 多 agent 编排模式（差异化原型 #3）
+
+ops-qa-bot（Claude SDK 版）用一个巨型 system prompt 同时承担「路由 + 各组件答题」，组件一多 prompt 越堆越长、上下文越吃越多。OpenAI Agents SDK 的 **handoffs** 让我们把它拆成「分诊台 + 组件专家」：
+
+- **Triage（分诊）agent**：只做路由，按问题关键词 `handoff` 给对应组件专家；问候/能力介绍/范围外的自己短答。
+- **组件专家 agent**：每个只挂自己组件目录的文档作用域 + 更窄更准的 prompt，互不干扰。
+
+专家**从 `INDEX.md` 动态生成**（每个 `local` 组件一个，保持"加组件=改 INDEX、不改代码"），是可组合、可单独定制 instructions 的 Python 对象——这种掌控度是 Claude SDK 的 CLI 托管 subagent 给不了的。
+
+```bash
+uv run python run.py --ask "Redis 内存告警怎么处理？" --multi-agent
+# REPL 模式能看到实时转交：uv run python run.py --multi-agent
+#   你> Redis 内存爆了
+#     ⇒ 转交给 redis_specialist
+#   bot> ...（redis 专家基于 redis/ 文档作答）
+```
+
+实现见 `ops_qa_bot_oai/orchestration.py`（`parse_index_components` / `build_triage_agent`）。当前核心版只为 `local` 来源的组件建专家；跨组件问题由分诊先反问澄清主组件再转交。
 
 ## 测试
 

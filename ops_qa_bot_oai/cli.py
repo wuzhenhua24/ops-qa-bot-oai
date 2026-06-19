@@ -38,13 +38,20 @@ def _print_structured(sa: StructuredAnswer) -> None:
 
 
 async def run_once(
-    docs_root: Path, question: str, show_tools: bool, structured: bool = False
+    docs_root: Path,
+    question: str,
+    show_tools: bool,
+    structured: bool = False,
+    multi_agent: bool = False,
 ) -> None:
     """一次性问一个问题就退出。方便把同一问题分别喂给两个项目做 A/B 对比。"""
     model_choice = resolve_model()
-    bot = OpsQABot(docs_root=docs_root, model_choice=model_choice)
+    bot = OpsQABot(docs_root=docs_root, model_choice=model_choice, multi_agent=multi_agent)
+    if multi_agent and show_tools:
+        roster = "、".join(c.name for c in bot.components) or "（无）"
+        print(f"[多 agent 编排：分诊 → {roster}]\n")
 
-    if structured:
+    if structured and not multi_agent:
         sa = await bot.answer_structured(question)
         if show_tools and sa.num_turns is not None:
             print(f"[模型 {model_choice.description} · {sa.num_turns} 次模型调用 · 结构化输出]\n")
@@ -80,14 +87,21 @@ async def run_once(
         print("⚠️ 撞到 max_turns 上限，结论可能不完整。")
 
 
-async def run_repl(docs_root: Path, show_tools: bool, structured: bool = False) -> None:
+async def run_repl(
+    docs_root: Path, show_tools: bool, structured: bool = False, multi_agent: bool = False
+) -> None:
     model_choice = resolve_model()
+    bot = OpsQABot(docs_root=docs_root, model_choice=model_choice, multi_agent=multi_agent)
+    mode = []
+    if structured:
+        mode.append("结构化输出")
+    if multi_agent:
+        roster = "、".join(c.name for c in bot.components) or "（无）"
+        mode.append(f"多 agent 编排：分诊 → {roster}")
     print("运维文档问答机器人（OpenAI Agents SDK）")
     print(f"文档根目录：{docs_root}")
-    print(f"模型：{model_choice.description}" + ("（结构化输出）" if structured else ""))
+    print(f"模型：{model_choice.description}" + (f"（{'；'.join(mode)}）" if mode else ""))
     print("输入问题后回车提问；/reset 开新会话；空行或 Ctrl+C 退出。\n")
-
-    bot = OpsQABot(docs_root=docs_root, model_choice=model_choice)
 
     while True:
         try:
@@ -106,7 +120,7 @@ async def run_repl(docs_root: Path, show_tools: bool, structured: bool = False) 
             continue
 
         print()
-        if structured:
+        if structured and not multi_agent:
             try:
                 sa = await bot.answer_structured(question)
                 _print_structured(sa)
@@ -123,6 +137,10 @@ async def run_repl(docs_root: Path, show_tools: bool, structured: bool = False) 
                 if event["type"] == "tool":
                     if show_tools:
                         print(f"  → {format_tool_call(event['name'], event['input'])}")
+                elif event["type"] == "handoff":
+                    if show_tools:
+                        print(f"  ⇒ 转交给 {event['agent']}")
+                    printed_prefix = False  # 专家接手后重新打印 bot> 前缀
                 elif event["type"] == "text":
                     if not printed_prefix:
                         print("bot> ", end="", flush=True)
@@ -168,15 +186,33 @@ def main() -> None:
         action="store_true",
         help="用结构化输出契约（AnswerContract）替代自由文本 + <<MARKER>>，并校验来源真实性",
     )
+    parser.add_argument(
+        "--multi-agent",
+        action="store_true",
+        help="多 agent 编排：分诊台按问题 handoff 给从 INDEX.md 生成的组件专家",
+    )
     args = parser.parse_args()
     docs_root = Path(args.docs).resolve()
     show_tools = not args.hide_tools
     if args.ask:
         asyncio.run(
-            run_once(docs_root, args.ask, show_tools=show_tools, structured=args.structured)
+            run_once(
+                docs_root,
+                args.ask,
+                show_tools=show_tools,
+                structured=args.structured,
+                multi_agent=args.multi_agent,
+            )
         )
     else:
-        asyncio.run(run_repl(docs_root, show_tools=show_tools, structured=args.structured))
+        asyncio.run(
+            run_repl(
+                docs_root,
+                show_tools=show_tools,
+                structured=args.structured,
+                multi_agent=args.multi_agent,
+            )
+        )
 
 
 if __name__ == "__main__":

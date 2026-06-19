@@ -27,6 +27,7 @@ from agents import Agent, AgentOutputSchema, MaxTurnsExceeded, Runner
 from openai.types.responses import ResponseTextDeltaEvent
 
 from .model import ModelChoice, resolve_model
+from .orchestration import Component, build_triage_agent
 from .prompt import build_structured_system_prompt, build_system_prompt
 from .schema import AnswerContract, Decision, validate_citations
 from .tools import DOC_TOOLS, DocsContext
@@ -144,6 +145,7 @@ class OpsQABot:
         *,
         max_turns: int | None = DEFAULT_MAX_TURNS,
         model_choice: ModelChoice | None = None,
+        multi_agent: bool = False,
     ):
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
@@ -155,13 +157,23 @@ class OpsQABot:
         if max_turns is not None and max_turns <= 0:
             max_turns = None
         self.max_turns = max_turns
+        self.multi_agent = multi_agent
 
-        self._agent: Agent[DocsContext] = Agent(
-            name="ops-qa-bot",
-            instructions=build_system_prompt(self.docs_root),
-            tools=list(DOC_TOOLS),
-            model=self.model_choice.model,
-        )
+        self._agent: Agent[DocsContext]
+        self.components: list[Component]
+        if multi_agent:
+            # 差异化 #3：入口换成分诊 agent，handoff 给从 INDEX.md 动态生成的组件专家。
+            self._agent, self.components = build_triage_agent(
+                self.docs_root, self.model_choice.model
+            )
+        else:
+            self.components = []
+            self._agent = Agent(
+                name="ops-qa-bot",
+                instructions=build_system_prompt(self.docs_root),
+                tools=list(DOC_TOOLS),
+                model=self.model_choice.model,
+            )
         self._context = DocsContext(docs_root=self.docs_root)
         # 多轮对话历史（OpenAI SDK 的 input 列表形态）；reset() 清空。
         self._history: list[Any] = []
@@ -206,6 +218,7 @@ class OpsQABot:
         result = Runner.run_streamed(self._agent, input=input_items, **self._run_kwargs())
 
         subtype = "success"
+        seen_first_agent = False
         try:
             async for event in result.stream_events():
                 if event.type == "raw_response_event":
@@ -215,6 +228,12 @@ class OpsQABot:
                     if event.item.type == "tool_call_item":
                         name, args = _extract_tool_call(event.item.raw_item)
                         yield {"type": "tool", "name": name, "input": args}
+                elif event.type == "agent_updated_stream_event":
+                    # 首个 agent_updated 是入口 agent（非真 handoff），跳过；
+                    # 之后的才是 handoff 切换（分诊 → 专家 / 专家间）。
+                    if seen_first_agent:
+                        yield {"type": "handoff", "agent": event.new_agent.name}
+                    seen_first_agent = True
         except MaxTurnsExceeded:
             subtype = "error_max_turns"
 
@@ -243,6 +262,8 @@ class OpsQABot:
         async for event in self.ask(question):
             if event["type"] == "tool":
                 logger.info("  tool: %s", format_tool_call(event["name"], event["input"]))
+            elif event["type"] == "handoff":
+                logger.info("  → 转交给 %s", event["agent"])
             elif event["type"] == "text":
                 chunks.append(event["text"])
             elif event["type"] == "done":
