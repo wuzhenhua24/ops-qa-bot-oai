@@ -1,0 +1,82 @@
+{
+  "description": "ops-qa-bot-openai 评测题集。映射到项目自带 docs/（redis/mysql/kafka）。expected_decision 为 null 表示不评分该项（如问候）。expected_component 是期望被引用的组件目录名。",
+  "cases": [
+    {
+      "id": "redis-oom",
+      "question": "Redis 内存告警 memory > 85% 怎么处理？",
+      "expected_decision": "answer",
+      "expected_component": "redis",
+      "note": "redis/troubleshooting.md 内存告警"
+    },
+    {
+      "id": "redis-conn-timeout",
+      "question": "客户端报 ERR connect timeout，Redis 连接超时怎么排查？",
+      "expected_decision": "answer",
+      "expected_component": "redis",
+      "note": "redis/troubleshooting.md 连接超时"
+    },
+    {
+      "id": "redis-topology",
+      "question": "Redis 集群有哪些部署拓扑？",
+      "expected_decision": "answer",
+      "expected_component": "redis",
+      "note": "redis/overview.md 部署拓扑"
+    },
+    {
+      "id": "mysql-replica-lag",
+      "question": "MySQL 主从延迟怎么排查和应急？",
+      "expected_decision": "answer",
+      "expected_component": "mysql",
+      "note": "mysql/common_issues.md 主从延迟"
+    },
+    {
+      "id": "mysql-slow-query",
+      "question": "MySQL 慢查询怎么定位？",
+      "expected_decision": "answer",
+      "expected_component": "mysql",
+      "note": "mysql/common_issues.md 慢查询"
+    },
+    {
+      "id": "kafka-consumer-lag",
+      "question": "Kafka 消费延迟暴涨怎么办？",
+      "expected_decision": "answer",
+      "expected_component": "kafka",
+      "note": "kafka/operations.md 消费延迟暴涨"
+    },
+    {
+      "id": "kafka-create-topic",
+      "question": "Kafka 怎么创建 topic？",
+      "expected_decision": "answer",
+      "expected_component": "kafka",
+      "note": "kafka/operations.md 创建 topic"
+    },
+    {
+      "id": "redis-cross-dc-missing",
+      "question": "Redis 集群跨机房迁移的完整步骤是什么？",
+      "expected_decision": "escalate",
+      "expected_component": null,
+      "note": "文档未覆盖，应承认找不到并升级，而不是编造"
+    },
+    {
+      "id": "ambiguous-backup",
+      "question": "备份怎么做？",
+      "expected_decision": "clarify",
+      "expected_component": null,
+      "note": "redis/mysql 都涉及备份，应先反问主问哪个"
+    },
+    {
+      "id": "out-of-scope-code",
+      "question": "帮我写个 Python 快速排序函数。",
+      "expected_decision": "reject",
+      "expected_component": null,
+      "note": "运维范围外，应友好拒绝、不编造"
+    },
+    {
+      "id": "greeting",
+      "question": "你好，在吗？",
+      "expected_decision": null,
+      "expected_component": null,
+      "note": "问候，不对 decision 评分，仅记录"
+    }
+  ]
+}

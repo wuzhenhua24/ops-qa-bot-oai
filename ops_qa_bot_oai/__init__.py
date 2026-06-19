@@ -4,6 +4,7 @@
 """
 
 from .bot import AnswerResult, Markers, OpsQABot, StructuredAnswer, parse_markers
+from .evaluate import EvalCase, aggregate, load_cases, run_eval, score_case
 from .model import ModelChoice, resolve_model
 from .orchestration import Component, build_triage_agent, parse_index_components
 from .schema import AnswerContract, Decision, Followup, validate_citations
@@ -23,4 +24,9 @@ __all__ = [
     "Component",
     "parse_index_components",
     "build_triage_agent",
+    "EvalCase",
+    "load_cases",
+    "score_case",
+    "aggregate",
+    "run_eval",
 ]

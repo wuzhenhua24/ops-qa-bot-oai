@@ -21,10 +21,13 @@ ops-qa-bot-openai/
 │   ├── model.py              # provider 解析：openai / responses / compatible / anthropic / litellm 运行时切换
 │   ├── schema.py             # 结构化输出契约 AnswerContract + 来源真实性校验（差异化 #1）
 │   ├── orchestration.py      # 多 agent 编排：从 INDEX.md 生成分诊 + 组件专家（差异化 #3）
+│   ├── evaluate.py           # 离线评测 harness：题集 × 多模式打分出对比报告（差异化 #5）
 │   ├── bot.py                # OpsQABot：封装 Agent + Runner，ask()/answer()（标记）+ answer_structured()（契约）
 │   └── cli.py                # 交互式 REPL + 一次性 --ask + --structured + --multi-agent 模式
-├── tests/test_tools.py       # 检索工具 + 沙箱 + 标记解析的回归测试（无需 LLM）
+├── eval/cases.json           # 评测题集（映射到 docs/，带 expected_decision / expected_component）
+├── tests/test_tools.py       # 检索 / 沙箱 / 标记 / 契约 / 评分聚合的回归测试（无需 LLM）
 ├── run.py                    # CLI 入口
+├── run_eval.py               # 评测入口
 └── pyproject.toml
 ```
 
@@ -171,6 +174,34 @@ uv run python run.py --ask "Redis 内存告警怎么处理？" --multi-agent
 ```
 
 实现见 `ops_qa_bot_oai/orchestration.py`（`parse_index_components` / `build_triage_agent`）。当前核心版只为 `local` 来源的组件建专家；跨组件问题由分诊先反问澄清主组件再转交。
+
+## 离线评测 harness（差异化原型 #5）
+
+ops-qa-bot（Claude SDK 版）一次一个子进程、单模型，做系统性 A/B 评测很别扭。本项目是进程内库 + provider 可换 + 模式可换，天然适合搭评测台：**同一题集 × 多个配置**跑一遍、打分、出对比报告——把"OpenAI 版 vs Claude 版、单 agent vs 多 agent、各 provider"变成可量化数字。
+
+```bash
+uv run python run_eval.py                          # 默认跑 structured + free + multi 三种模式
+uv run python run_eval.py --modes structured,multi --detail
+# 换 provider 对比 = 换 OPS_QA_* 环境变量再跑一次（见上「模型 / provider 配置」）
+```
+
+题集在 `eval/cases.json`（带 `expected_decision` / `expected_component`）。报告示例：
+
+```
+配置                路由准确       组件命中     来源真实    均tokens  均轮数  均耗时ms
+----------------  ---------  --------  --------  -------  ---  -----
+gpt-5 · structured  100% (10)  100% (7)  100% (7)  150      2.0  400
+gpt-5 · multi       ...
+```
+
+确定性指标（**无需额外 API 调用**，跑一遍 bot 即可算）：
+
+- **路由准确率**：`decision`（answer/clarify/escalate/reject）是否符合预期。
+- **组件命中率**：是否引用了期望组件目录下的文档。
+- **来源真实率**：引用路径是否真实存在（复用 `validate_citations`）。
+- **成本/时延**：token、轮数、耗时。
+
+评分与聚合是**纯函数**（`score_case` / `aggregate`，已单测，无需 LLM）；只有实际跑 bot 需要 key。结构化模式下 `decision`/`citations` 是类型字段直接可评，自由文本模式靠 markers + 正则抽取（decision 是启发式）——这本身印证了 #1：**结构化输出更可评测**。
 
 ## 测试
 

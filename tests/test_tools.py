@@ -17,7 +17,16 @@ from pathlib import Path
 
 import pytest
 
-from ops_qa_bot_oai.bot import parse_markers
+from ops_qa_bot_oai.bot import Markers, parse_markers
+from ops_qa_bot_oai.evaluate import (
+    EvalCase,
+    RunOutcome,
+    aggregate,
+    extract_citations,
+    infer_decision_freetext,
+    load_cases,
+    score_case,
+)
 from ops_qa_bot_oai.model import normalize_openai_base_url
 from ops_qa_bot_oai.orchestration import parse_index_components
 from ops_qa_bot_oai.schema import AnswerContract, Decision, Followup, validate_citations
@@ -345,3 +354,96 @@ def test_parse_components_local_only_index(docs_root):
 
 def test_parse_components_missing_index_empty(tmp_path):
     assert parse_index_components(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# eval harness（差异化 #5）：抽取 / 推断 / 评分 / 聚合（纯函数，无需 LLM）
+# ---------------------------------------------------------------------------
+
+
+def test_extract_citations_full_and_half_width():
+    text = (
+        "用 redis-cli INFO memory（来源：redis/troubleshooting.md）。又见(来源: mysql/overview.md)"
+    )
+    assert extract_citations(text) == ["redis/troubleshooting.md", "mysql/overview.md"]
+
+
+def test_extract_citations_comma_and_dedup():
+    text = "（来源：redis/a.md, redis/b.md）后面又（来源：redis/a.md）"
+    assert extract_citations(text) == ["redis/a.md", "redis/b.md"]
+
+
+def test_infer_decision_from_markers():
+    assert infer_decision_freetext(Markers(clarify=True), "随便") == "clarify"
+    assert infer_decision_freetext(Markers(escalate="ou_x:redis"), "随便") == "escalate"
+    assert infer_decision_freetext(Markers(), "这个问题不在我覆盖的运维文档范围内") == "reject"
+    assert infer_decision_freetext(Markers(), "扩容步骤如下：1. ...") == "answer"
+
+
+def _outcome(decision, citations, invalid=None, tokens=100, turns=2, latency=500):
+    return RunOutcome(
+        decision=decision,
+        answer="x",
+        citations=citations,
+        invalid_citations=invalid or [],
+        usage={"total_tokens": tokens},
+        num_turns=turns,
+        latency_ms=latency,
+    )
+
+
+def test_score_case_decision_and_component():
+    case = EvalCase(id="c1", question="q", expected_decision="answer", expected_component="redis")
+    score = score_case(case, _outcome("answer", ["redis/troubleshooting.md"]))
+    assert score.decision_correct is True
+    assert score.component_cited is True
+    assert score.citations_all_valid is True
+
+
+def test_score_case_wrong_decision_and_missing_component():
+    case = EvalCase(id="c2", question="q", expected_decision="escalate", expected_component="redis")
+    score = score_case(case, _outcome("answer", ["mysql/overview.md"], invalid=[]))
+    assert score.decision_correct is False
+    assert score.component_cited is False  # 引用的是 mysql，不是期望的 redis
+
+
+def test_score_case_unscored_fields_are_none():
+    case = EvalCase(id="c3", question="你好", expected_decision=None, expected_component=None)
+    score = score_case(case, _outcome("answer", []))
+    assert score.decision_correct is None
+    assert score.component_cited is None
+
+
+def test_score_case_invalid_citations_flag():
+    case = EvalCase(id="c4", question="q", expected_decision="answer")
+    score = score_case(case, _outcome("answer", ["redis/ghost.md"], invalid=["redis/ghost.md"]))
+    assert score.citations_all_valid is False
+
+
+def test_aggregate_rates():
+    cases = [
+        EvalCase(id="a", question="q", expected_decision="answer", expected_component="redis"),
+        EvalCase(id="b", question="q", expected_decision="escalate", expected_component=None),
+        EvalCase(id="c", question="q", expected_decision=None, expected_component=None),
+    ]
+    outcomes = [
+        _outcome("answer", ["redis/x.md"], tokens=100),  # 决策对、组件对
+        _outcome("answer", [], tokens=300),  # 决策错（期望 escalate）
+        _outcome("answer", [], tokens=200),  # 不评分
+    ]
+    scores = [score_case(c, o) for c, o in zip(cases, outcomes)]
+    agg = aggregate(scores)
+    assert agg["n"] == 3
+    assert agg["decision_scored"] == 2
+    assert agg["decision_accuracy"] == 0.5  # 2 题里对 1 题
+    assert agg["component_scored"] == 1
+    assert agg["component_hit_rate"] == 1.0
+    assert agg["avg_total_tokens"] == 200.0
+
+
+def test_load_cases_from_shipped_dataset():
+    cases = load_cases(Path(__file__).resolve().parent.parent / "eval" / "cases.json")
+    ids = {c.id for c in cases}
+    assert "redis-oom" in ids
+    assert any(c.expected_decision == "escalate" for c in cases)
+    assert any(c.expected_decision is None for c in cases)  # 问候不评分
