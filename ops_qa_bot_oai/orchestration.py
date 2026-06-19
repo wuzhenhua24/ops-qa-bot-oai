@@ -21,6 +21,7 @@ from pathlib import Path
 from agents import Agent, Model
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
+from .model import ModelRouter
 from .tools import DOC_TOOLS, DocsContext
 
 
@@ -151,20 +152,22 @@ def _triage_instructions(components: list[Component]) -> str:
 
 
 def build_triage_agent(
-    docs_root: Path, model: str | Model
+    docs_root: Path, router: ModelRouter
 ) -> tuple[Agent[DocsContext], list[Component]]:
     """构造分诊 agent（持有各 local 组件专家的 handoff）+ 返回解析到的组件。
 
+    多模型路由（#2）：分诊用 `router.for_role("triage")`，每个专家用
+    `router.for_role(component.dir)`——无覆盖时都回退到默认模型（等价单模型）。
     只为 `local` 来源的组件建专家（feishu 来源无本地文档，本核心版不支持）。
     """
     components = parse_index_components(docs_root)
     local = [c for c in components if c.source == "local"]
-    specialists = [build_specialist_agent(c, model) for c in local]
+    specialists = [build_specialist_agent(c, router.for_role(c.dir)[1]) for c in local]
     triage = Agent[DocsContext](
         name="triage",
         instructions=_triage_instructions(local),
         tools=list(DOC_TOOLS),  # 仅用于"能力介绍"时读 INDEX；组件问题一律转交
         handoffs=list(specialists),
-        model=model,
+        model=router.for_role("triage")[1],
     )
     return triage, local

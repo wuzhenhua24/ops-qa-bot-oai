@@ -278,6 +278,56 @@ def test_anthropic_default_uses_x_api_key(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 多模型路由（差异化 #2）：ModelRouter（用 openai provider，无需 key）
+# ---------------------------------------------------------------------------
+
+
+def _clear_model_env(monkeypatch):
+    for k in list(__import__("os").environ):
+        if k.startswith("OPS_QA_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("OPS_QA_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+
+
+def test_router_no_overrides_all_default(monkeypatch):
+    from ops_qa_bot_oai.model import build_model_router
+
+    _clear_model_env(monkeypatch)
+    monkeypatch.setenv("OPS_QA_MODEL", "gpt-5")
+    router = build_model_router()
+    assert router.for_role("triage")[0] == "gpt-5"
+    assert router.for_role("redis")[0] == "gpt-5"
+
+
+def test_router_triage_and_component_overrides(monkeypatch):
+    from ops_qa_bot_oai.model import build_model_router
+
+    _clear_model_env(monkeypatch)
+    monkeypatch.setenv("OPS_QA_MODEL", "gpt-5")
+    monkeypatch.setenv("OPS_QA_TRIAGE_MODEL", "gpt-5-mini")
+    monkeypatch.setenv("OPS_QA_MODEL_REDIS", "gpt-5-pro")
+    router = build_model_router()
+    assert router.for_role("triage")[0] == "gpt-5-mini"  # 分诊用便宜的
+    assert router.for_role("redis")[0] == "gpt-5-pro"  # redis 专家用强的
+    assert router.for_role("mysql")[0] == "gpt-5"  # 无覆盖 → 默认
+    # openai provider 下 model 就是字符串本身
+    assert router.for_role("redis")[1] == "gpt-5-pro"
+
+
+def test_router_describe(monkeypatch):
+    from ops_qa_bot_oai.model import build_model_router
+
+    _clear_model_env(monkeypatch)
+    monkeypatch.setenv("OPS_QA_MODEL", "gpt-5")
+    monkeypatch.setenv("OPS_QA_TRIAGE_MODEL", "gpt-5-mini")
+    desc = build_model_router().describe(["triage", "redis"])
+    assert "默认=gpt-5" in desc
+    assert "triage=gpt-5-mini" in desc
+    assert "redis" not in desc  # redis 无覆盖，不列
+
+
+# ---------------------------------------------------------------------------
 # 结构化输出契约（差异化 #1）：AnswerContract 解析 + 来源真实性校验
 # ---------------------------------------------------------------------------
 

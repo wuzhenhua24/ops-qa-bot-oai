@@ -175,6 +175,29 @@ uv run python run.py --ask "Redis 内存告警怎么处理？" --multi-agent
 
 实现见 `ops_qa_bot_oai/orchestration.py`（`parse_index_components` / `build_triage_agent`）。当前核心版只为 `local` 来源的组件建专家；跨组件问题由分诊先反问澄清主组件再转交。
 
+## 多模型路由（差异化原型 #2）
+
+OpenAI Agents SDK 里每个 agent 可以用**不同的模型**，handoff 链路里各 agent 各跑各的。结合多 agent 编排（#3），就能**分层路由**——分诊用便宜小模型，组件专家用强模型，硬核诊断才烧贵 token，直接砍成本；还能按组件单独指定（如敏感组件指到私有/本地模型名）。Claude SDK 锁死单模型，做不到这种混用。
+
+仅在 `--multi-agent` 模式下生效，复用同一 provider/client、只换模型名（环境变量）：
+
+| 环境变量 | 作用 |
+|---|---|
+| `OPS_QA_MODEL` | 默认模型（专家兜底） |
+| `OPS_QA_TRIAGE_MODEL` | 分诊角色的模型（建议便宜小模型） |
+| `OPS_QA_MODEL_<组件目录大写>` | 某组件专家的模型，如 `OPS_QA_MODEL_REDIS` |
+
+```bash
+OPS_QA_MODEL=gpt-5 \
+OPS_QA_TRIAGE_MODEL=gpt-5-mini \
+OPS_QA_MODEL_REDIS=gpt-5-pro \
+uv run python run.py --multi-agent
+# 横幅会打印：模型路由：openai（默认=gpt-5，triage=gpt-5-mini，redis=gpt-5-pro）
+#   分诊用 gpt-5-mini，redis 专家用 gpt-5-pro，mysql/kafka 专家回退 gpt-5
+```
+
+无任何覆盖时所有角色都用 `OPS_QA_MODEL`，等价单模型。实现见 `ModelRouter` / `build_model_router`（`ops_qa_bot_oai/model.py`）。配合评测台（#5）可量化「分层路由省了多少 token、准确率有没有掉」。当前覆盖只换模型名（同一 provider）；按角色换**不同 provider**（如某组件走本地模型）是顺手能加的下一步。
+
 ## 离线评测 harness（差异化原型 #5）
 
 ops-qa-bot（Claude SDK 版）一次一个子进程、单模型，做系统性 A/B 评测很别扭。本项目是进程内库 + provider 可换 + 模式可换，天然适合搭评测台：**同一题集 × 多个配置**跑一遍、打分、出对比报告——把"OpenAI 版 vs Claude 版、单 agent vs 多 agent、各 provider"变成可量化数字。

@@ -26,7 +26,7 @@ from typing import Any
 from agents import Agent, AgentOutputSchema, MaxTurnsExceeded, Runner
 from openai.types.responses import ResponseTextDeltaEvent
 
-from .model import ModelChoice, resolve_model
+from .model import ModelChoice, ModelRouter, build_model_router, resolve_model
 from .orchestration import Component, build_triage_agent
 from .prompt import build_structured_system_prompt, build_system_prompt
 from .schema import AnswerContract, Decision, validate_citations
@@ -146,6 +146,7 @@ class OpsQABot:
         max_turns: int | None = DEFAULT_MAX_TURNS,
         model_choice: ModelChoice | None = None,
         multi_agent: bool = False,
+        model_router: ModelRouter | None = None,
     ):
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
@@ -161,11 +162,12 @@ class OpsQABot:
 
         self._agent: Agent[DocsContext]
         self.components: list[Component]
+        self.model_router: ModelRouter | None = None
         if multi_agent:
             # 差异化 #3：入口换成分诊 agent，handoff 给从 INDEX.md 动态生成的组件专家。
-            self._agent, self.components = build_triage_agent(
-                self.docs_root, self.model_choice.model
-            )
+            # 差异化 #2：用 ModelRouter 按角色/组件分配模型（分诊便宜、专家强）。
+            self.model_router = model_router or build_model_router()
+            self._agent, self.components = build_triage_agent(self.docs_root, self.model_router)
         else:
             self.components = []
             self._agent = Agent(

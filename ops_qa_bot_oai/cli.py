@@ -49,7 +49,11 @@ async def run_once(
     bot = OpsQABot(docs_root=docs_root, model_choice=model_choice, multi_agent=multi_agent)
     if multi_agent and show_tools:
         roster = "、".join(c.name for c in bot.components) or "（无）"
-        print(f"[多 agent 编排：分诊 → {roster}]\n")
+        print(f"[多 agent 编排：分诊 → {roster}]")
+        if bot.model_router is not None:
+            roles = ["triage"] + [c.dir for c in bot.components]
+            print(f"[模型路由：{bot.model_router.describe(roles)}]")
+        print()
 
     if structured and not multi_agent:
         sa = await bot.answer_structured(question)
@@ -101,6 +105,9 @@ async def run_repl(
     print("运维文档问答机器人（OpenAI Agents SDK）")
     print(f"文档根目录：{docs_root}")
     print(f"模型：{model_choice.description}" + (f"（{'；'.join(mode)}）" if mode else ""))
+    if multi_agent and bot.model_router is not None:
+        roles = ["triage"] + [c.dir for c in bot.components]
+        print(f"模型路由：{bot.model_router.describe(roles)}")
     print("输入问题后回车提问；/reset 开新会话；空行或 Ctrl+C 退出。\n")
 
     while True:
