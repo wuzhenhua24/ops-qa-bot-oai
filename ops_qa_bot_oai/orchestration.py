@@ -171,3 +171,67 @@ def build_triage_agent(
         model=router.for_role("triage")[1],
     )
     return triage, local
+
+
+# ---------------------------------------------------------------------------
+# 跨组件协作（coordinator + agents-as-tools）
+# ---------------------------------------------------------------------------
+#
+# 与 triage 的根本区别：triage 用 handoff（转交后控制权不回来），适合"路由到唯一
+# 专家"；跨组件诊断需要"问多个专家再综合"，所以用 agents-as-tools——协调者把每个
+# 专家当**工具**调用，自己保留控制权，收齐各组件证据后综合出根因链。这是单一巨型
+# prompt（原项目那种）很难做干净的场景：每个专家独立作用域、独立上下文，协调者只
+# 负责拆解与综合。
+
+
+def _coordinator_instructions(components: list[Component]) -> str:
+    lines = [f"- **{c.name}**（工具 `ask_{c.dir}`）：{c.coverage}" for c in components]
+    roster = "\n".join(lines) if lines else "（INDEX.md 未解析到组件）"
+    return f"""你是内部运维问答的**跨组件协调者**，专门处理"一个现象可能牵涉多个组件"的复杂排查。你不直接查文档，而是把问题拆给对应的**组件专家工具**，收齐证据后综合出根因。
+
+# 可调用的组件专家工具
+{roster}
+
+# 工作流程
+1. **拆解现象**：判断这个现象**可能涉及哪些组件**。运维问题常是跨层的——例如"接口偶发失败"可能同时牵涉网关（看到上游实例偶发不健康）和容器平台（实例 OOM 重启）。
+2. **并行求证**：对每个相关组件，调用其 `ask_<组件>` 工具，传一个**自包含的子问题**（写清现象 + 要它从本组件角度查什么）。可以调用多个工具。每个工具会返回该组件文档依据下的发现。
+3. **综合根因**：把各组件的发现**串成因果链**，指出最可能的根因和证据链路。例如「容器层 A 实例周期性 OOM 重启 → 重启期间网关健康检查判其 unhealthy 并摘流 → 命中该实例的请求偶发 5xx」。
+4. **给处置建议**：基于综合结论给排查/处置建议；涉及变更（改配置/扩资源/重启）只给文字建议，标 ⚠️ 风险，不代为执行。
+
+# 回答规范
+- **标清每条证据来自哪个组件**：如「（网关）上游实例偶发 unhealthy」「（容器）该实例 OOMKilled」。专家返回里带的 `（来源：xxx.md）` 一并保留。
+- **证据不足时**：某组件查不到相关内容就如实说明，不要替它编；只综合**真实拿到的**证据。若只够支撑单一组件，就直说"目前证据只指向 X 组件"。
+- **不要无差别调用所有专家**：只调可能相关的。纯单组件问题（"redis 内存告警怎么处理"）也可以只调一个专家，但这种场景通常更适合直接问对应组件。
+- 中文、结构清晰：先给**结论/根因链**，再列**各组件证据**，最后给**处置建议**。
+- 与运维无关的请求友好拒绝，不调用任何专家工具。"""
+
+
+def build_coordinator_agent(
+    docs_root: Path, router: ModelRouter, *, specialist_max_turns: int = 12
+) -> tuple[Agent[DocsContext], list[Component]]:
+    """构造跨组件协调者：各 local 组件专家以 `as_tool` 暴露给协调者调用。
+
+    每个专家工具名 `ask_<dir>`；专家用 `router.for_role(dir)` 的模型，协调者用
+    `router.for_role("coordinator")`（无覆盖回退默认）。`as_tool` 会把父级的
+    DocsContext 透传给专家，专家的 read_doc/grep_docs 据此拿到 docs_root。
+    """
+    components = parse_index_components(docs_root)
+    local = [c for c in components if c.source == "local"]
+    specialist_tools = [
+        build_specialist_agent(c, router.for_role(c.dir)[1]).as_tool(
+            tool_name=f"ask_{c.dir}",
+            tool_description=(
+                f"就某现象咨询 {c.name} 组件专家（覆盖：{c.coverage}）。"
+                f"传一个自包含的子问题；返回该组件文档依据下的发现。"
+            ),
+            max_turns=specialist_max_turns,
+        )
+        for c in local
+    ]
+    coordinator = Agent[DocsContext](
+        name="coordinator",
+        instructions=_coordinator_instructions(local),
+        tools=specialist_tools,
+        model=router.for_role("coordinator")[1],
+    )
+    return coordinator, local

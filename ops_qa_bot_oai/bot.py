@@ -39,7 +39,7 @@ from .guardrails import (
     injection_input_guardrail,
 )
 from .model import ModelChoice, ModelRouter, build_model_router, resolve_model
-from .orchestration import Component, build_triage_agent
+from .orchestration import Component, build_coordinator_agent, build_triage_agent
 from .prompt import build_structured_system_prompt, build_system_prompt
 from .schema import AnswerContract, Decision, validate_citations
 from .tools import DOC_TOOLS, DocsContext
@@ -161,6 +161,12 @@ def format_tool_call(name: str, args: dict) -> str:
         pattern = args.get("pattern", "?")
         path = args.get("path") or ""
         return f"grep_docs '{pattern}'" + (f" in {path}" if path else "")
+    if name.startswith("ask_"):
+        # 协调者调用组件专家（agents-as-tools）；子问题可能很长，截断展示。
+        q = str(args.get("input") or args.get("question") or args.get("query") or args)
+        if len(q) > 60:
+            q = q[:60] + "…"
+        return f"{name} ← {q}"
     return f"{name}({args})"
 
 
@@ -184,6 +190,7 @@ class OpsQABot:
         max_turns: int | None = DEFAULT_MAX_TURNS,
         model_choice: ModelChoice | None = None,
         multi_agent: bool = False,
+        coordinator: bool = False,
         model_router: ModelRouter | None = None,
         guardrails: bool = False,
     ):
@@ -198,6 +205,7 @@ class OpsQABot:
             max_turns = None
         self.max_turns = max_turns
         self.multi_agent = multi_agent
+        self.coordinator = coordinator
         self.guardrails = guardrails
 
         # 差异化 #4：开启 guardrails 时挂输入注入护栏 + 写操作审批工具（HITL）。
@@ -209,7 +217,13 @@ class OpsQABot:
         self._agent: Agent[DocsContext]
         self.components: list[Component]
         self.model_router: ModelRouter | None = None
-        if multi_agent:
+        if coordinator:
+            # 跨组件协作：协调者把各组件专家当工具（agents-as-tools）调用、综合根因。
+            self.model_router = model_router or build_model_router()
+            self._agent, self.components = build_coordinator_agent(
+                self.docs_root, self.model_router
+            )
+        elif multi_agent:
             # 差异化 #3：入口换成分诊 agent，handoff 给从 INDEX.md 动态生成的组件专家。
             # 差异化 #2：用 ModelRouter 按角色/组件分配模型（分诊便宜、专家强）。
             self.model_router = model_router or build_model_router()

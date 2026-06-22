@@ -78,20 +78,27 @@ async def run_once(
     structured: bool = False,
     multi_agent: bool = False,
     guardrails: bool = False,
+    coordinator: bool = False,
 ) -> None:
-    """一次性问一个问题就退出。方便把同一问题分别喂给两个项目做 A/B 对比。"""
+    """一次性问一个问题就退出（适合脚本调用 / 批量跑题）。"""
     model_choice = resolve_model()
-    # guardrails 模式聚焦单 agent / 结构化路径，与 multi-agent 暂不叠加。
-    if guardrails and multi_agent:
+    if coordinator:
+        # 跨组件协调者是独立的自由文本路径，与其它模式互斥。
+        structured = multi_agent = guardrails = False
+    elif guardrails and multi_agent:
         print("[注意] --guardrails 暂不与 --multi-agent 叠加，本次按单 agent + 护栏运行。\n")
         multi_agent = False
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
         multi_agent=multi_agent,
+        coordinator=coordinator,
         guardrails=guardrails,
     )
-    if multi_agent and show_tools:
+    if coordinator and show_tools:
+        roster = "、".join(c.name for c in bot.components) or "（无）"
+        print(f"[跨组件协调者 → 可咨询专家：{roster}]\n")
+    elif multi_agent and show_tools:
         roster = "、".join(c.name for c in bot.components) or "（无）"
         print(f"[多 agent 编排：分诊 → {roster}]")
         if bot.model_router is not None:
@@ -155,21 +162,28 @@ async def run_repl(
     structured: bool = False,
     multi_agent: bool = False,
     guardrails: bool = False,
+    coordinator: bool = False,
 ) -> None:
     model_choice = resolve_model()
-    if guardrails and multi_agent:
+    if coordinator:
+        structured = multi_agent = guardrails = False
+    elif guardrails and multi_agent:
         print("[注意] --guardrails 暂不与 --multi-agent 叠加，本次按单 agent + 护栏运行。")
         multi_agent = False
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
         multi_agent=multi_agent,
+        coordinator=coordinator,
         guardrails=guardrails,
     )
     approver = _make_approver(interactive=True) if guardrails else None
     mode = []
     if structured:
         mode.append("结构化输出")
+    if coordinator:
+        roster = "、".join(c.name for c in bot.components) or "（无）"
+        mode.append(f"跨组件协调者 → 可咨询专家：{roster}")
     if multi_agent:
         roster = "、".join(c.name for c in bot.components) or "（无）"
         mode.append(f"多 agent 编排：分诊 → {roster}")
@@ -287,6 +301,11 @@ def main() -> None:
         action="store_true",
         help="开启输入注入护栏 + 写操作审批（HITL）；结构化模式下额外加输出来源护栏",
     )
+    parser.add_argument(
+        "--coordinator",
+        action="store_true",
+        help="跨组件协调者：把各组件专家当工具调用、综合根因（适合一个现象牵涉多组件）",
+    )
     args = parser.parse_args()
     docs_root = Path(args.docs).resolve()
     show_tools = not args.hide_tools
@@ -299,6 +318,7 @@ def main() -> None:
                 structured=args.structured,
                 multi_agent=args.multi_agent,
                 guardrails=args.guardrails,
+                coordinator=args.coordinator,
             )
         )
     else:
@@ -309,6 +329,7 @@ def main() -> None:
                 structured=args.structured,
                 multi_agent=args.multi_agent,
                 guardrails=args.guardrails,
+                coordinator=args.coordinator,
             )
         )
 

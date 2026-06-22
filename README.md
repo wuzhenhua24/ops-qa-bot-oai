@@ -19,7 +19,7 @@
 ops-qa-bot-openai/
 ├── docs/                     # 运维文档根目录（复用 ops-qa-bot 的同一份文档素材）
 │   ├── INDEX.md              # 路由表：组件 / 目录 / 负责人 open_id
-│   └── redis|mysql|kafka/    # 各组件本地 markdown
+│   └── redis|mysql|kafka|gateway|container/  # 各组件本地 markdown
 ├── ops_qa_bot_oai/
 │   ├── tools.py              # read_doc / glob_docs / grep_docs（对标 Claude 内置 Read/Glob/Grep）
 │   ├── prompt.py             # system prompt（移植自 ops-qa-bot 的核心主线）
@@ -30,7 +30,7 @@ ops-qa-bot-openai/
 │   ├── guardrails.py         # 输入注入护栏 + 输出来源护栏（差异化 #4）
 │   ├── actions.py            # 写操作审批工具（needs_approval HITL）（差异化 #4）
 │   ├── bot.py                # OpsQABot：Agent + Runner，answer()/answer_structured()/answer_guarded()
-│   ├── cli.py                # 交互式 REPL + --ask + --structured + --multi-agent + --guardrails
+│   ├── cli.py                # 交互式 REPL + --ask/--structured/--multi-agent/--guardrails/--coordinator
 │   └── feishu/               # 飞书长连接接入：render（渲染纯逻辑）/ session / runner
 ├── eval/cases.json           # 评测题集（映射到 docs/，带 expected_decision / expected_component）
 ├── tests/test_tools.py       # 检索 / 沙箱 / 标记 / 契约 / 评分 / 护栏 / 审批 / 飞书渲染回归测试（无需 LLM）
@@ -180,6 +180,25 @@ uv run python run.py --ask "Redis 内存告警怎么处理？" --multi-agent
 ```
 
 实现见 `ops_qa_bot_oai/orchestration.py`（`parse_index_components` / `build_triage_agent`）。当前核心版只为 `local` 来源的组件建专家；跨组件问题由分诊先反问澄清主组件再转交。
+
+## 跨组件协作排查（coordinator + agents-as-tools）
+
+triage 用 `handoff`（转交后控制权不回来），适合"路由到唯一专家"。但很多运维现象是**跨层**的——同一现象要从多个组件各取证据再综合。这种用 **agents-as-tools**：一个**协调者**把各组件专家当**工具**调用（`agent.as_tool()`），自己保留控制权，收齐证据后串成根因链。
+
+> 典型场景：「某接口偶发失败」——网关层看到上游某实例**偶发不健康/被摘流**，容器层看到该实例**OOMKilled 周期性重启**。单看任一组件都只是局部现象，协调者把两层证据串起来才得到根因：*容器 OOM 重启 → 重启期间网关健康检查摘流 → 命中该实例的请求偶发 5xx*。
+
+```bash
+uv run python run.py --coordinator \
+  --ask "某接口偶发返回 502，重试又能成功，帮我排查根因"
+#   [跨组件协调者 → 可咨询专家：Redis、MySQL、Kafka、Gateway、Container]
+#     → ask_gateway ← 接口偶发 502，网关侧能看到什么？
+#     → ask_container ← 该应用实例是否有 OOM / 重启？
+#   bot> 根因链：容器层 OOM 重启 → 网关摘流 → 偶发 502；各组件证据 + 处置建议…
+```
+
+工作流程：**拆解现象 → 对每个相关组件调 `ask_<组件>` 求证 → 综合根因链 + 标清每条证据来自哪个组件 + 给处置建议**；证据不足的组件如实说明、不替它编。每个专家独立作用域、独立上下文、可走各自模型（`OPS_QA_MODEL_<组件>`，协调者用 `OPS_QA_MODEL_COORDINATOR`）。
+
+> 这正是单一巨型 prompt（原项目那种把所有组件塞一个上下文用 Read/Glob/Grep 推理）很难做干净的场景——这里每个组件的取证是独立、可控、可换模型的子 run，协调者只管拆解与综合。实现见 `build_coordinator_agent`。项目自带 docs 已加 `gateway/` 与 `container/` 两个组件作为该场景的素材。
 
 ## 多模型路由（差异化原型 #2）
 

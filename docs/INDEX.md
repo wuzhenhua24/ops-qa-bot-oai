@@ -17,6 +17,8 @@
 | Redis | local | `redis/` | - | Redis 集群运维、常见故障排查、性能调优 | 张三 | ou_REPLACE_WITH_REAL_ID_1 |
 | MySQL | local | `mysql/` | - | MySQL 主从、备份恢复、慢查询、常见故障 | 李四 | ou_REPLACE_WITH_REAL_ID_2 |
 | Kafka | local | `kafka/` | - | Kafka 集群操作、topic 管理、消费延迟处理 | 王五 | ou_REPLACE_WITH_REAL_ID_3 |
+| Gateway | local | `gateway/` | - | API 网关：路由、健康检查、偶发 5xx、Hi-Trace-Id 链路排查 | 钱七 | ou_REPLACE_WITH_REAL_ID_5 |
+| Container | local | `container/` | - | 容器平台：Pod OOM、重启、资源限制、就绪/存活探针 | 周八 | ou_REPLACE_WITH_REAL_ID_6 |
 | Nginx | feishu | `nginx/` | docx_REPLACE_WITH_REAL_TOKEN | Nginx 网关配置、上游/白名单、限流（维护在飞书文档） | 赵六 | ou_REPLACE_WITH_REAL_ID_4 |
 
 ## 使用说明

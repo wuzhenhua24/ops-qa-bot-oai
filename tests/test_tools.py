@@ -467,6 +467,72 @@ def test_build_answer_post_no_at_when_no_ids():
 
 
 # ---------------------------------------------------------------------------
+# 跨组件协作（coordinator + agents-as-tools）
+# ---------------------------------------------------------------------------
+
+
+def _coord_docs(tmp_path):
+    """造一个含多组件的 docs（gateway + container），用于协调者测试。"""
+    index = """# 索引
+| 组件 | 来源 | 目录 | 覆盖内容 | open_id |
+|------|------|------|----------|---------|
+| Gateway | local | `gateway/` | 网关偶发 5xx、上游健康 | ou_gw |
+| Container | local | `container/` | Pod OOM、重启 | ou_ct |
+| Nginx | feishu | `nginx/` | 飞书维护 | ou_nx |
+"""
+    (tmp_path / "INDEX.md").write_text(index, encoding="utf-8")
+    (tmp_path / "gateway").mkdir()
+    (tmp_path / "gateway" / "t.md").write_text(
+        "# 网关\n上游实例偶发 unhealthy。\n", encoding="utf-8"
+    )
+    (tmp_path / "container").mkdir()
+    (tmp_path / "container" / "t.md").write_text("# 容器\nPod OOMKilled 重启。\n", encoding="utf-8")
+    return tmp_path
+
+
+def test_coordinator_exposes_local_specialists_as_tools(tmp_path):
+    from ops_qa_bot_oai.model import ModelRouter
+    from ops_qa_bot_oai.orchestration import build_coordinator_agent
+
+    root = _coord_docs(tmp_path)
+    # 用 openai provider 的简单 router（模型就是字符串名，不触网）
+    router = ModelRouter(
+        provider="openai", default_name="gpt-5", overrides={}, _make=lambda n: (n, n)
+    )
+    coordinator, comps = build_coordinator_agent(root, router)
+    # 只为 local 组件建专家工具（Nginx 是 feishu，排除）
+    assert {c.dir for c in comps} == {"gateway", "container"}
+    tool_names = {t.name for t in coordinator.tools}
+    assert tool_names == {"ask_gateway", "ask_container"}
+    # 协调者本身不挂 handoff（agents-as-tools，不是转交）
+    assert not coordinator.handoffs
+
+
+def test_coordinator_per_component_model_routing(tmp_path):
+    from ops_qa_bot_oai.model import ModelRouter
+    from ops_qa_bot_oai.orchestration import build_coordinator_agent
+
+    root = _coord_docs(tmp_path)
+    router = ModelRouter(
+        provider="openai",
+        default_name="gpt-5",
+        overrides={"coordinator": "gpt-5-pro", "gateway": "gpt-5-mini"},
+        _make=lambda n: (n, n),
+    )
+    coordinator, _ = build_coordinator_agent(root, router)
+    assert coordinator.model == "gpt-5-pro"  # 协调者用 coordinator 覆盖
+
+
+def test_index_picks_up_gateway_container():
+    # 项目自带 docs 已登记 Gateway / Container（跨组件场景素材）
+    from ops_qa_bot_oai.orchestration import parse_index_components
+
+    comps = parse_index_components(Path(__file__).resolve().parent.parent / "docs")
+    dirs = {c.dir for c in comps if c.source == "local"}
+    assert {"gateway", "container"} <= dirs
+
+
+# ---------------------------------------------------------------------------
 # 结构化输出契约（差异化 #1）：AnswerContract 解析 + 来源真实性校验
 # ---------------------------------------------------------------------------
 
