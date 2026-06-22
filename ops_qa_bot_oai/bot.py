@@ -23,9 +23,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agents import Agent, AgentOutputSchema, MaxTurnsExceeded, Runner
+from agents import (
+    Agent,
+    AgentOutputSchema,
+    InputGuardrailTripwireTriggered,
+    MaxTurnsExceeded,
+    OutputGuardrailTripwireTriggered,
+    Runner,
+)
 from openai.types.responses import ResponseTextDeltaEvent
 
+from .actions import WriteCommandLog, make_write_command_tool
+from .guardrails import (
+    citation_output_guardrail,
+    injection_input_guardrail,
+)
 from .model import ModelChoice, ModelRouter, build_model_router, resolve_model
 from .orchestration import Component, build_triage_agent
 from .prompt import build_structured_system_prompt, build_system_prompt
@@ -111,6 +123,32 @@ class StructuredAnswer:
     usage: dict[str, Any] | None = None
     num_turns: int | None = None
     subtype: str = "success"
+    # 命中输出来源护栏（#4）时为拦截原因；正常为 None。
+    guardrail_blocked: str | None = None
+
+
+@dataclass
+class ApprovalRequest:
+    """一次写操作审批请求（HITL interruption 的归一化视图）。"""
+
+    tool_name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class GuardedAnswer:
+    """`OpsQABot.answer_guarded()` 的返回值：答案 + 审批记录 + 护栏拦截信息。"""
+
+    text: str
+    # 本轮经过审批的请求及其结果（approved=True/False）。
+    approvals: list[tuple[ApprovalRequest, bool]] = field(default_factory=list)
+    # 被批准并登记执行的写命令（target/command/reason）。
+    approved_writes: list[Any] = field(default_factory=list)
+    # 命中输入注入护栏时为拦截原因；正常为 None。
+    blocked: str | None = None
+    usage: dict[str, Any] | None = None
+    num_turns: int | None = None
+    subtype: str = "success"
 
 
 def format_tool_call(name: str, args: dict) -> str:
@@ -147,6 +185,7 @@ class OpsQABot:
         model_choice: ModelChoice | None = None,
         multi_agent: bool = False,
         model_router: ModelRouter | None = None,
+        guardrails: bool = False,
     ):
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
@@ -159,6 +198,13 @@ class OpsQABot:
             max_turns = None
         self.max_turns = max_turns
         self.multi_agent = multi_agent
+        self.guardrails = guardrails
+
+        # 差异化 #4：开启 guardrails 时挂输入注入护栏 + 写操作审批工具（HITL）。
+        # write_log 记录被批准并登记执行的写命令。
+        self.write_log = WriteCommandLog()
+        self._input_guardrails = [injection_input_guardrail] if guardrails else []
+        self._extra_tools = [make_write_command_tool(self.write_log)] if guardrails else []
 
         self._agent: Agent[DocsContext]
         self.components: list[Component]
@@ -173,8 +219,9 @@ class OpsQABot:
             self._agent = Agent(
                 name="ops-qa-bot",
                 instructions=build_system_prompt(self.docs_root),
-                tools=list(DOC_TOOLS),
+                tools=list(DOC_TOOLS) + self._extra_tools,
                 model=self.model_choice.model,
+                input_guardrails=self._input_guardrails,
             )
         self._context = DocsContext(docs_root=self.docs_root)
         # 多轮对话历史（OpenAI SDK 的 input 列表形态）；reset() 清空。
@@ -199,6 +246,9 @@ class OpsQABot:
                 tools=list(DOC_TOOLS),
                 model=self.model_choice.model,
                 output_type=AgentOutputSchema(AnswerContract, strict_json_schema=False),
+                # 差异化 #4：结构化模式下加输入注入护栏 + 输出来源护栏（引用不实就 trip）。
+                input_guardrails=self._input_guardrails,
+                output_guardrails=[citation_output_guardrail] if self.guardrails else [],
             )
         return self._structured_agent
 
@@ -307,6 +357,30 @@ class OpsQABot:
                 ),
                 subtype="error_max_turns",
             )
+        except InputGuardrailTripwireTriggered as e:
+            # 差异化 #4：输入注入护栏拦截（结构化模式同样生效）。
+            reason = _guardrail_reason(e)
+            return StructuredAnswer(
+                contract=AnswerContract(
+                    decision=Decision.reject,
+                    answer="这条输入触发了安全护栏（疑似提示注入/越权），已拦截，不予处理。",
+                ),
+                subtype="blocked_input",
+                guardrail_blocked=reason,
+            )
+        except OutputGuardrailTripwireTriggered as e:
+            # 输出来源护栏：答案引用了不存在的文档 / 声称作答却无来源 → 拦下不交付。
+            info = getattr(getattr(e, "guardrail_result", None), "output", None)
+            detail = getattr(info, "output_info", None)
+            logger.warning("结构化答案命中输出来源护栏: %s", detail)
+            return StructuredAnswer(
+                contract=AnswerContract(
+                    decision=Decision.escalate,
+                    answer="答案未通过来源校验（引用了不存在的文档或缺少可靠来源），已拦截以防幻觉。建议人工复核或补充文档。",
+                ),
+                subtype="blocked_output",
+                guardrail_blocked=str(detail),
+            )
 
         contract = result.final_output  # 已被 SDK 按 schema 校验
         assert isinstance(contract, AnswerContract)
@@ -325,6 +399,98 @@ class OpsQABot:
             num_turns=_num_turns(result),
             subtype=subtype,
         )
+
+    async def answer_guarded(self, question: str, approver: Any = None) -> GuardedAnswer:
+        """带护栏 + 写操作审批（HITL）的问答（差异化 #4，需 guardrails=True）。
+
+        - 输入注入护栏命中 → 直接返回拦截结果（blocked）。
+        - agent 想调写操作工具 → run 暂停抛 interruption；用 `approver(req)->bool`
+          决定批准/驳回，再 `Runner.run(agent, state)` 续跑。approver 为 None 时一律
+          驳回（安全默认：无人值守不放行写操作）。
+
+        这套 pause→approve→resume 走 SDK 的 RunState，是 ops-qa-bot 用 hook + 飞书
+        回调拼出来那套 HITL 的一等公民替代。
+        """
+        if not self.guardrails:
+            raise RuntimeError("answer_guarded 需要以 guardrails=True 构造 OpsQABot")
+        logger.info("question (guarded): %s", question)
+        input_items = self._history + [{"role": "user", "content": question}]
+        approvals: list[tuple[ApprovalRequest, bool]] = []
+        try:
+            result = await Runner.run(self._agent, input=input_items, **self._run_kwargs())
+            # 处理写操作审批中断，直到没有待批项。
+            while result.interruptions:
+                state = result.to_state()
+                for itr in result.interruptions:
+                    req = ApprovalRequest(
+                        tool_name=getattr(itr, "name", "?"),
+                        arguments=_interruption_args(itr),
+                    )
+                    approved = bool(approver(req)) if approver is not None else False
+                    approvals.append((req, approved))
+                    if approved:
+                        state.approve(itr)
+                    else:
+                        state.reject(itr)
+                result = await Runner.run(self._agent, state, max_turns=self.max_turns)
+        except InputGuardrailTripwireTriggered as e:
+            reason = _guardrail_reason(e)
+            return GuardedAnswer(
+                text="这条输入触发了安全护栏（疑似提示注入/越权），已拦截，不予处理。",
+                blocked=reason,
+                subtype="blocked_input",
+            )
+        except MaxTurnsExceeded:
+            return GuardedAnswer(
+                text="本轮检索步数过多被中断（max_turns），结论可能不完整。",
+                approvals=approvals,
+                subtype="error_max_turns",
+            )
+
+        try:
+            self._history = result.to_input_list()
+        except Exception:  # noqa: BLE001
+            logger.debug("to_input_list() 失败，保留旧历史", exc_info=True)
+
+        text = (
+            result.final_output
+            if isinstance(result.final_output, str)
+            else str(result.final_output or "")
+        )
+        cleaned, _ = parse_markers(text)
+        approved_writes = [r for r in self.write_log.requests if r.approved]
+        return GuardedAnswer(
+            text=cleaned,
+            approvals=approvals,
+            approved_writes=approved_writes,
+            usage=_usage_dict(result),
+            num_turns=_num_turns(result),
+        )
+
+
+def _interruption_args(itr: Any) -> dict[str, Any]:
+    """从 interruption 取工具参数 dict（兼容 str/JSON/dict 几种形态）。"""
+    import json
+
+    raw = getattr(itr, "arguments", None)
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {"_raw": raw}
+        except json.JSONDecodeError:
+            return {"_raw": raw}
+    return {}
+
+
+def _guardrail_reason(exc: Any) -> str:
+    """从 tripwire 异常里抠出可读的拦截原因（matched 标签）。"""
+    info = getattr(getattr(exc, "guardrail_result", None), "output", None)
+    detail = getattr(info, "output_info", None)
+    if isinstance(detail, dict) and detail.get("matched"):
+        return str(detail["matched"])
+    return str(detail) if detail else "input guardrail"
 
 
 def _extract_tool_call(raw_item: Any) -> tuple[str, dict]:

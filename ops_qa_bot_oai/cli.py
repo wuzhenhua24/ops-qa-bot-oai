@@ -11,7 +11,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from .bot import OpsQABot, StructuredAnswer, format_tool_call
+from .bot import GuardedAnswer, OpsQABot, StructuredAnswer, format_tool_call
 from .model import resolve_model
 
 _RESET_WORDS = {"/reset", "/new", "新对话", "重置"}
@@ -35,6 +35,40 @@ def _print_structured(sa: StructuredAnswer) -> None:
     print(f"置信度：{c.confidence:.2f}")
     if sa.invalid_citations:
         print(f"⚠️ 有 {len(sa.invalid_citations)} 条来源不指向真实文档，答案可能不可靠。")
+    if sa.guardrail_blocked:
+        print(f"🛡️ 已被输出护栏拦截：{sa.guardrail_blocked}")
+
+
+def _print_guarded(ga: GuardedAnswer) -> None:
+    """渲染带护栏 / 审批的回答。"""
+    if ga.blocked:
+        print(f"🛡️ bot> 已被输入护栏拦截（{ga.blocked}）：{ga.text}")
+        return
+    print(f"bot> {ga.text}")
+    for req, approved in ga.approvals:
+        mark = "✅ 已批准" if approved else "🚫 已驳回"
+        cmd = req.arguments.get("command", req.arguments)
+        target = req.arguments.get("target", "?")
+        print(f"  审批 [{req.tool_name}] 在 {target} 执行 `{cmd}` → {mark}")
+    if ga.approved_writes:
+        print(f"  （已登记 {len(ga.approved_writes)} 条写操作待人工执行）")
+
+
+def _make_approver(interactive: bool):
+    """构造审批回调。interactive=True 时 y/n 询问；否则一律驳回（安全默认）。"""
+    if not interactive:
+        return None
+
+    def approver(req) -> bool:
+        cmd = req.arguments.get("command", req.arguments)
+        target = req.arguments.get("target", "?")
+        try:
+            ans = input(f"  ⚠️ 批准在 {target} 执行 `{cmd}`？(y/N) ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return ans in ("y", "yes", "是")
+
+    return approver
 
 
 async def run_once(
@@ -43,10 +77,20 @@ async def run_once(
     show_tools: bool,
     structured: bool = False,
     multi_agent: bool = False,
+    guardrails: bool = False,
 ) -> None:
     """一次性问一个问题就退出。方便把同一问题分别喂给两个项目做 A/B 对比。"""
     model_choice = resolve_model()
-    bot = OpsQABot(docs_root=docs_root, model_choice=model_choice, multi_agent=multi_agent)
+    # guardrails 模式聚焦单 agent / 结构化路径，与 multi-agent 暂不叠加。
+    if guardrails and multi_agent:
+        print("[注意] --guardrails 暂不与 --multi-agent 叠加，本次按单 agent + 护栏运行。\n")
+        multi_agent = False
+    bot = OpsQABot(
+        docs_root=docs_root,
+        model_choice=model_choice,
+        multi_agent=multi_agent,
+        guardrails=guardrails,
+    )
     if multi_agent and show_tools:
         roster = "、".join(c.name for c in bot.components) or "（无）"
         print(f"[多 agent 编排：分诊 → {roster}]")
@@ -54,6 +98,20 @@ async def run_once(
             roles = ["triage"] + [c.dir for c in bot.components]
             print(f"[模型路由：{bot.model_router.describe(roles)}]")
         print()
+
+    if guardrails and not structured:
+        # 一次性模式无人值守：approver=None → 写操作一律驳回（安全默认）。
+        if show_tools:
+            print("[护栏：输入注入检测 + 写操作审批；一次性模式下写操作默认驳回]\n")
+        ga = await bot.answer_guarded(question, approver=None)
+        _print_guarded(ga)
+        if ga.usage:
+            print(
+                f"\n[in={ga.usage.get('input_tokens', 0)} "
+                f"out={ga.usage.get('output_tokens', 0)} "
+                f"reqs={ga.usage.get('requests', 0)}]"
+            )
+        return
 
     if structured and not multi_agent:
         sa = await bot.answer_structured(question)
@@ -92,16 +150,31 @@ async def run_once(
 
 
 async def run_repl(
-    docs_root: Path, show_tools: bool, structured: bool = False, multi_agent: bool = False
+    docs_root: Path,
+    show_tools: bool,
+    structured: bool = False,
+    multi_agent: bool = False,
+    guardrails: bool = False,
 ) -> None:
     model_choice = resolve_model()
-    bot = OpsQABot(docs_root=docs_root, model_choice=model_choice, multi_agent=multi_agent)
+    if guardrails and multi_agent:
+        print("[注意] --guardrails 暂不与 --multi-agent 叠加，本次按单 agent + 护栏运行。")
+        multi_agent = False
+    bot = OpsQABot(
+        docs_root=docs_root,
+        model_choice=model_choice,
+        multi_agent=multi_agent,
+        guardrails=guardrails,
+    )
+    approver = _make_approver(interactive=True) if guardrails else None
     mode = []
     if structured:
         mode.append("结构化输出")
     if multi_agent:
         roster = "、".join(c.name for c in bot.components) or "（无）"
         mode.append(f"多 agent 编排：分诊 → {roster}")
+    if guardrails:
+        mode.append("护栏 + 写操作审批")
     print("运维文档问答机器人（OpenAI Agents SDK）")
     print(f"文档根目录：{docs_root}")
     print(f"模型：{model_choice.description}" + (f"（{'；'.join(mode)}）" if mode else ""))
@@ -127,6 +200,17 @@ async def run_repl(
             continue
 
         print()
+        if guardrails and not structured:
+            try:
+                ga = await bot.answer_guarded(question, approver=approver)
+                _print_guarded(ga)
+                print()
+            except KeyboardInterrupt:
+                print("\n（已中断本次回答）\n")
+            except Exception as e:  # noqa: BLE001
+                print(f"\n[出错] {type(e).__name__}: {e}\n")
+            continue
+
         if structured and not multi_agent:
             try:
                 sa = await bot.answer_structured(question)
@@ -198,6 +282,11 @@ def main() -> None:
         action="store_true",
         help="多 agent 编排：分诊台按问题 handoff 给从 INDEX.md 生成的组件专家",
     )
+    parser.add_argument(
+        "--guardrails",
+        action="store_true",
+        help="开启输入注入护栏 + 写操作审批（HITL）；结构化模式下额外加输出来源护栏",
+    )
     args = parser.parse_args()
     docs_root = Path(args.docs).resolve()
     show_tools = not args.hide_tools
@@ -209,6 +298,7 @@ def main() -> None:
                 show_tools=show_tools,
                 structured=args.structured,
                 multi_agent=args.multi_agent,
+                guardrails=args.guardrails,
             )
         )
     else:
@@ -218,6 +308,7 @@ def main() -> None:
                 show_tools=show_tools,
                 structured=args.structured,
                 multi_agent=args.multi_agent,
+                guardrails=args.guardrails,
             )
         )
 
