@@ -25,11 +25,13 @@ ops-qa-bot-openai/
 │   ├── guardrails.py         # 输入注入护栏 + 输出来源护栏（差异化 #4）
 │   ├── actions.py            # 写操作审批工具（needs_approval HITL）（差异化 #4）
 │   ├── bot.py                # OpsQABot：Agent + Runner，answer()/answer_structured()/answer_guarded()
-│   └── cli.py                # 交互式 REPL + --ask + --structured + --multi-agent + --guardrails
+│   ├── cli.py                # 交互式 REPL + --ask + --structured + --multi-agent + --guardrails
+│   └── feishu/               # 飞书长连接接入：render（渲染纯逻辑）/ session / runner
 ├── eval/cases.json           # 评测题集（映射到 docs/，带 expected_decision / expected_component）
-├── tests/test_tools.py       # 检索 / 沙箱 / 标记 / 契约 / 评分 / 护栏 / 审批的回归测试（无需 LLM）
+├── tests/test_tools.py       # 检索 / 沙箱 / 标记 / 契约 / 评分 / 护栏 / 审批 / 飞书渲染回归测试（无需 LLM）
 ├── run.py                    # CLI 入口
 ├── run_eval.py               # 评测入口
+├── run_ws.py                 # 飞书长连接入口
 └── pyproject.toml
 ```
 
@@ -251,14 +253,32 @@ gpt-5 · multi       ...
 
 评分与聚合是**纯函数**（`score_case` / `aggregate`，已单测，无需 LLM）；只有实际跑 bot 需要 key。结构化模式下 `decision`/`citations` 是类型字段直接可评，自由文本模式靠 markers + 正则抽取（decision 是启发式）——这本身印证了 #1：**结构化输出更可评测**。
 
+## 飞书接入（长连接，真实群里体验）
+
+为了能在真实飞书群里和 Claude 版 ops-qa-bot 做**体验对比**，本项目提供飞书长连接（WebSocket）接入，用飞书官方推荐的 `lark_oapi.channel.FeishuChannel(transport="ws")`，**只出站、不需公网 HTTPS 入口**，内网部署最省事。
+
+```bash
+uv sync --extra feishu                 # 装 lark-oapi
+export FEISHU_APP_ID=cli_xxx
+export FEISHU_APP_SECRET=xxx
+# 模型/provider 仍走同一套 OPS_QA_* 环境变量（见上「模型 / provider 配置」）
+uv run python run_ws.py                # 群里 @机器人 提问即可
+```
+
+**飞书开放平台配置**（企业自建应用）：事件订阅方式选「长连接」（不填 Request URL）；订阅 `im.message.receive_v1`；开 `im:message`（收发/更新消息）、`im:message.group_at_msg`（群 @ 消息）、`im:message:send_as_bot` 权限；发版审批通过后把机器人加进群。
+
+**核心问答闭环**（当前范围）：群里 @机器人 → 立即发占位消息 → 跑 `OpsQABot.answer()` → 把占位**编辑**成最终答案（头部 @ 提问者；命中 `<<ESCALATE>>` 时末尾 @ 负责人）。会话按 `(chat_id, user_id)` 隔离、`/reset` 开新会话、非文字消息回友好提示。实现见 `ops_qa_bot_oai/feishu/`，渲染纯逻辑（问题清洗 / 升级 open_id 解析 / @ 段拼装）已单测；真机运行需你的飞书凭证。
+
+> 做公平体验对比的建议：用 `OPS_QA_PROVIDER=anthropic` 让本项目跑与 ops-qa-bot 同一个 Claude 模型/代理，开两个飞书应用各拉一个群，同一批问题分别问——这样差异收敛到 SDK 本身。反馈卡 / 追问卡 / 问答归档属于产品壳层（不影响 agentic 回路对比），当前未做。
+
 ## 测试
 
 ```bash
-uv run pytest            # 检索 / 沙箱 / 标记解析 / base_url 容错 / 结构化契约 + 来源校验（确定性，无需 LLM）
+uv run pytest            # 检索 / 沙箱 / 标记 / base_url / 契约 / 评分 / 护栏 / 审批 / 飞书渲染（确定性，无需 LLM）
 uv run ruff check .      # lint
 uv run ruff format .     # 格式化
 ```
 
-## 范围说明（第一版：核心问答 + CLI）
+## 范围说明
 
-本项目第一版聚焦"基于文档回答"这条**对比核心主线**，刻意没有移植参考项目里围绕飞书产品形态的扩展：飞书接入（HTTP/长连接）、SSH 实时诊断、数据库只读分析、参数变更审批、定时跟进、反馈日志与问答归档。这些是 ops-qa-bot 的可选/产品层特性，不影响"agentic 文档检索回路"本身的对比。`prompt.py` 保留了与参考项目同款的 `<<ESCALATE>>` / `<<CLARIFY>>` / `<<FOLLOWUPS>>` 标记，因此升级 / 反问 / 追问的**答案塑形行为**可以直接和 Claude 版对照（CLI 会解析这些标记并提示，但没有飞书渲染层）。
+聚焦"基于文档回答"这条**对比核心主线** + 五个差异化原型（结构化契约 / 多模型路由 / 多 agent / 护栏审批 / 评测台）+ 飞书长连接核心问答闭环。尚未移植 ops-qa-bot 的部分产品/可选特性：SSH 实时诊断、数据库只读分析、参数变更审批、定时跟进、飞书反馈卡 / 追问卡 / 问答归档。这些不影响"agentic 文档检索回路 + SDK 差异"本身的对比。

@@ -408,6 +408,65 @@ def test_write_command_tool_needs_approval_and_logs():
 
 
 # ---------------------------------------------------------------------------
+# 飞书长连接接入：渲染纯逻辑（无需 lark / 网络）
+# ---------------------------------------------------------------------------
+
+
+def test_clean_question_strips_mentions():
+    from ops_qa_bot_oai.feishu.render import clean_question
+
+    # 飞书原始文本里 @机器人 是 @_user_1 占位
+    assert clean_question("@_user_1  Redis 内存爆了", ["@_user_1"]) == "Redis 内存爆了"
+    assert clean_question("  你好  ", []) == "你好"
+
+
+def test_escalate_open_id_parsing():
+    from ops_qa_bot_oai.feishu.render import escalate_open_id
+
+    assert escalate_open_id("ou_abc123:redis") == "ou_abc123"
+    assert escalate_open_id("ou_xyz") == "ou_xyz"
+    assert escalate_open_id("none") is None
+    assert escalate_open_id("") is None
+    assert escalate_open_id(None) is None
+
+
+def test_reset_words():
+    from ops_qa_bot_oai.feishu.render import RESET_WORDS
+
+    assert "/reset" in RESET_WORDS and "新对话" in RESET_WORDS
+
+
+def test_placeholder_text_truncates():
+    from ops_qa_bot_oai.feishu.render import placeholder_text
+
+    out = placeholder_text("Redis 内存告警怎么处理啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊")
+    assert out.startswith("🔍 翻文档中：")
+    assert "…" in out
+
+
+def test_build_answer_post_at_and_escalate():
+    pytest.importorskip("lark_oapi")
+    from ops_qa_bot_oai.feishu.render import build_answer_post
+
+    post = build_answer_post("处理步骤：\n1. 看内存", asker_id="ou_asker", escalate_to="ou_owner")
+    paras = post["zh_cn"]["content"]
+    # 头部第一段是 @提问者
+    assert paras[0][0]["tag"] == "at" and paras[0][0]["user_id"] == "ou_asker"
+    # 末段含 @负责人
+    last_segs = paras[-1]
+    assert any(s.get("tag") == "at" and s.get("user_id") == "ou_owner" for s in last_segs)
+
+
+def test_build_answer_post_no_at_when_no_ids():
+    pytest.importorskip("lark_oapi")
+    from ops_qa_bot_oai.feishu.render import build_answer_post
+
+    post = build_answer_post("纯答案", asker_id=None, escalate_to=None)
+    flat = [s for para in post["zh_cn"]["content"] for s in para]
+    assert all(s.get("tag") != "at" for s in flat)
+
+
+# ---------------------------------------------------------------------------
 # 结构化输出契约（差异化 #1）：AnswerContract 解析 + 来源真实性校验
 # ---------------------------------------------------------------------------
 
