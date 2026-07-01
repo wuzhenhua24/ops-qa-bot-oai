@@ -25,6 +25,7 @@ from ops_qa_bot_oai.evaluate import (
     extract_citations,
     infer_decision_freetext,
     load_cases,
+    normalize_route,
     score_case,
 )
 from ops_qa_bot_oai.model import normalize_openai_base_url
@@ -654,7 +655,7 @@ def test_infer_decision_from_markers():
     assert infer_decision_freetext(Markers(), "扩容步骤如下：1. ...") == "answer"
 
 
-def _outcome(decision, citations, invalid=None, tokens=100, turns=2, latency=500):
+def _outcome(decision, citations, invalid=None, tokens=100, turns=2, latency=500, route=None):
     return RunOutcome(
         decision=decision,
         answer="x",
@@ -663,6 +664,7 @@ def _outcome(decision, citations, invalid=None, tokens=100, turns=2, latency=500
         usage={"total_tokens": tokens},
         num_turns=turns,
         latency_ms=latency,
+        route=route,
     )
 
 
@@ -721,3 +723,44 @@ def test_load_cases_from_shipped_dataset():
     assert "redis-oom" in ids
     assert any(c.expected_decision == "escalate" for c in cases)
     assert any(c.expected_decision is None for c in cases)  # 问候不评分
+    # 路由标注已就位：单组件题标到组件目录，且有一道跨组件题标 coordinator。
+    by_id = {c.id: c for c in cases}
+    assert by_id["redis-oom"].expected_route == "redis"
+    assert by_id["cross-502-oom"].expected_route == "coordinator"
+
+
+def test_normalize_route():
+    assert normalize_route(None) == "self"  # 无 handoff = 入口 agent 自答
+    assert normalize_route("coordinator") == "coordinator"
+    assert normalize_route("redis_specialist") == "redis"
+    assert normalize_route("gateway_specialist") == "gateway"
+
+
+def test_score_case_route_correct_and_wrong():
+    case = EvalCase(id="r1", question="q", expected_route="redis")
+    assert score_case(case, _outcome("answer", [], route="redis")).route_correct is True
+    # auto 路由到 coordinator，但期望是单专家 redis → 记为错
+    assert score_case(case, _outcome("answer", [], route="coordinator")).route_correct is False
+
+
+def test_score_case_route_unscored_when_mode_has_no_routing():
+    # single/structured 模式下 outcome.route=None → 不计路由（即便题目标了 expected_route）。
+    case = EvalCase(id="r2", question="q", expected_route="redis")
+    assert score_case(case, _outcome("answer", [], route=None)).route_correct is None
+
+
+def test_aggregate_route_accuracy():
+    cases = [
+        EvalCase(id="a", question="q", expected_route="redis"),
+        EvalCase(id="b", question="q", expected_route="coordinator"),
+        EvalCase(id="c", question="q", expected_route="mysql"),
+    ]
+    outcomes = [
+        _outcome("answer", [], route="redis"),  # 对
+        _outcome("answer", [], route="gateway"),  # 错（期望 coordinator）
+        _outcome("answer", [], route=None),  # 不计（该模式无路由）
+    ]
+    scores = [score_case(c, o) for c, o in zip(cases, outcomes)]
+    agg = aggregate(scores)
+    assert agg["route_scored"] == 2  # 只有前两题记了路由
+    assert agg["route_accuracy"] == 0.5

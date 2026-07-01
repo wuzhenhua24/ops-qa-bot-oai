@@ -8,7 +8,9 @@ ops-qa-bot（Claude SDK 版）一次一个子进程、单模型，做系统性 A
 设计：评分与聚合是**纯函数**（脱离 LLM 可单测），只有"实际跑 bot"和"可选 LLM judge"
 需要 API key。核心指标全是确定性的：
 
-- **路由准确率**：decision（answer/clarify/escalate/reject）是否符合预期。
+- **决策准确率**：decision（answer/clarify/escalate/reject）是否符合预期。
+- **转交准确率**：multi/auto 模式下分诊台把问题转交给了正确的处理者（对应组件专家 /
+  跨组件协调者 / 分诊自答），据此可量化 auto 自适应路由的准不准。
 - **来源命中率**：是否引用了期望组件目录下的文档。
 - **来源真实率**：引用的路径是否真实存在（复用 schema.validate_citations）。
 - **防幻觉**：该 escalate/reject 的题，是否没有硬编一个带来源的"答案"。
@@ -42,6 +44,9 @@ class EvalCase:
     question: str
     expected_decision: str | None = None  # answer/clarify/escalate/reject 或 None（不评分）
     expected_component: str | None = None  # 期望被引用的组件目录名，如 "redis"
+    # 期望路由（仅 multi/auto 模式评分）：组件目录名（转交给该专家）/ "coordinator"（跨组件）
+    # / "self"（分诊台自答，如问候/拒绝）/ None（不评分该项）。
+    expected_route: str | None = None
     note: str = ""
 
 
@@ -56,6 +61,8 @@ class RunOutcome:
     usage: dict[str, Any] | None
     num_turns: int | None
     latency_ms: int
+    # 归一化后的实际路由（组件名 / "coordinator" / "self"）；None 表示该模式不计路由。
+    route: str | None = None
 
 
 @dataclass
@@ -66,6 +73,9 @@ class CaseScore:
     decision_correct: bool | None  # None = 不评分该项
     component_expected: str | None
     component_cited: bool | None  # None = 不评分该项
+    route_expected: str | None
+    route_actual: str | None
+    route_correct: bool | None  # None = 不评分该项（非 multi/auto 模式或题目未标注）
     num_citations: int
     citations_all_valid: bool  # 引用的路径是否全部真实存在（无引用视作 True）
     total_tokens: int
@@ -81,6 +91,7 @@ def load_cases(path: Path) -> list[EvalCase]:
             question=c["question"],
             expected_decision=c.get("expected_decision"),
             expected_component=c.get("expected_component"),
+            expected_route=c.get("expected_route"),
             note=c.get("note", ""),
         )
         for c in data["cases"]
@@ -112,6 +123,21 @@ def infer_decision_freetext(markers: Markers, text: str) -> str:
     return "answer"
 
 
+def normalize_route(route: str | None) -> str:
+    """把 answer() 的 route（最终落点 agent 名）归一成可比对的路由标签。
+
+    `None`（无 handoff，入口 agent 自答）→ "self"；`coordinator` → "coordinator"；
+    `<dir>_specialist` → "<dir>"（组件目录名）；其余原样返回。
+    """
+    if route is None:
+        return "self"
+    if route == "coordinator":
+        return "coordinator"
+    if route.endswith("_specialist"):
+        return route[: -len("_specialist")]
+    return route
+
+
 def score_case(case: EvalCase, outcome: RunOutcome) -> CaseScore:
     """纯函数评分：不跑模型、不读盘（来源真实性已在 outcome.invalid_citations 里算好）。"""
     decision_correct: bool | None = None
@@ -123,6 +149,11 @@ def score_case(case: EvalCase, outcome: RunOutcome) -> CaseScore:
         prefix = case.expected_component.rstrip("/") + "/"
         component_cited = any(c.startswith(prefix) for c in outcome.citations)
 
+    # 路由只在能路由的模式下评分（outcome.route 为 None 表示该模式不计路由）。
+    route_correct: bool | None = None
+    if case.expected_route is not None and outcome.route is not None:
+        route_correct = outcome.route == case.expected_route
+
     usage = outcome.usage or {}
     return CaseScore(
         case_id=case.id,
@@ -131,6 +162,9 @@ def score_case(case: EvalCase, outcome: RunOutcome) -> CaseScore:
         decision_correct=decision_correct,
         component_expected=case.expected_component,
         component_cited=component_cited,
+        route_expected=case.expected_route,
+        route_actual=outcome.route,
+        route_correct=route_correct,
         num_citations=len(outcome.citations),
         citations_all_valid=len(outcome.invalid_citations) == 0,
         total_tokens=int(usage.get("total_tokens", 0) or 0),
@@ -148,6 +182,7 @@ def aggregate(scores: list[CaseScore]) -> dict[str, Any]:
     n = len(scores)
     dec_scored = [s for s in scores if s.decision_correct is not None]
     comp_scored = [s for s in scores if s.component_cited is not None]
+    route_scored = [s for s in scores if s.route_correct is not None]
     cited = [s for s in scores if s.num_citations > 0]
     return {
         "n": n,
@@ -159,6 +194,8 @@ def aggregate(scores: list[CaseScore]) -> dict[str, Any]:
             sum(1 for s in comp_scored if s.component_cited), len(comp_scored)
         ),
         "component_scored": len(comp_scored),
+        "route_accuracy": _rate(sum(1 for s in route_scored if s.route_correct), len(route_scored)),
+        "route_scored": len(route_scored),
         "citation_validity_rate": _rate(sum(1 for s in cited if s.citations_all_valid), len(cited)),
         "cases_with_citations": len(cited),
         "avg_total_tokens": _rate(sum(s.total_tokens for s in scores), n),
@@ -171,7 +208,11 @@ def aggregate(scores: list[CaseScore]) -> dict[str, Any]:
 # 实际跑 bot（需要 API key）
 # ---------------------------------------------------------------------------
 
-MODES = ("structured", "free", "multi")
+# 评测轴（不同于 OpsQABot 编排模式）：structured/free 走单 agent，multi/auto 走对应编排。
+MODES = ("structured", "free", "multi", "auto")
+# 评测轴 → OpsQABot 编排模式；能路由（handoff）的轴才计路由准确率。
+_MODE_TO_BOT = {"structured": "single", "free": "single", "multi": "multi", "auto": "auto"}
+_ROUTING_MODES = {"multi", "auto"}
 
 
 async def _run_case(bot: OpsQABot, mode: str, question: str, docs_root: Path) -> RunOutcome:
@@ -189,7 +230,7 @@ async def _run_case(bot: OpsQABot, mode: str, question: str, docs_root: Path) ->
             num_turns=sa.num_turns,
             latency_ms=latency,
         )
-    # free / multi 都走自由文本 answer()
+    # free / multi / auto 都走自由文本 answer()
     r = await bot.answer(question)
     latency = int((time.perf_counter() - t0) * 1000)
     cites = extract_citations(r.text)
@@ -201,6 +242,8 @@ async def _run_case(bot: OpsQABot, mode: str, question: str, docs_root: Path) ->
         usage=r.usage,
         num_turns=r.num_turns,
         latency_ms=latency,
+        # 仅能路由的模式记路由；单 agent 模式（free/structured）route 置 None → 不计入路由准确率。
+        route=normalize_route(r.route) if mode in _ROUTING_MODES else None,
     )
 
 
@@ -220,11 +263,10 @@ async def run_config(
     on_case: Any = None,
 ) -> ConfigResult:
     """在某个模式下跑完整题集并打分。`on_case(case, outcome, score)` 可选回调（进度）。"""
-    # 评测轴 mode（structured/free/multi）→ OpsQABot 编排模式：multi 走多 agent，其余单 agent。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
-        mode=("multi" if mode == "multi" else "single"),
+        mode=_MODE_TO_BOT.get(mode, "single"),
     )
     scores: list[CaseScore] = []
     for case in cases:
@@ -240,7 +282,7 @@ async def run_config(
 def render_report(results: list[ConfigResult]) -> str:
     """渲染多配置对比报告（纯文本表）。"""
     rows = [
-        ("配置", "路由准确", "组件命中", "来源真实", "均tokens", "均轮数", "均耗时ms"),
+        ("配置", "决策准确", "转交准确", "组件命中", "来源真实", "均tokens", "均轮数", "均耗时ms"),
     ]
     for r in results:
         s = r.summary
@@ -248,6 +290,7 @@ def render_report(results: list[ConfigResult]) -> str:
             (
                 r.label,
                 f"{s['decision_accuracy']:.0%} ({s['decision_scored']})",
+                f"{s['route_accuracy']:.0%} ({s['route_scored']})",
                 f"{s['component_hit_rate']:.0%} ({s['component_scored']})",
                 f"{s['citation_validity_rate']:.0%} ({s['cases_with_citations']})",
                 f"{s['avg_total_tokens']:.0f}",
@@ -275,6 +318,10 @@ def render_case_detail(results: list[ConfigResult]) -> str:
                 flags.append("✓决策")
             elif s.decision_correct is False:
                 flags.append(f"✗决策(期望{s.decision_expected}/实得{s.decision_actual})")
+            if s.route_correct is True:
+                flags.append("✓转交")
+            elif s.route_correct is False:
+                flags.append(f"✗转交(期望{s.route_expected}/实得{s.route_actual})")
             if s.component_cited is True:
                 flags.append("✓组件")
             elif s.component_cited is False:

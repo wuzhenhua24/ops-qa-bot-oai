@@ -116,6 +116,9 @@ class AnswerResult:
     num_turns: int | None = None
     # "success" 正常；"error_max_turns" 撞了 max_turns 保险丝（答案可能不完整）。
     subtype: str = "success"
+    # 最终处理该问题的落点 agent 名（最后一次 handoff 目标）；None 表示入口 agent 自答
+    # （auto 模式下即分诊台自答）。用于评测路由准确率。
+    route: str | None = None
 
 
 @dataclass
@@ -334,10 +337,12 @@ class OpsQABot:
         usage: dict | None = None
         num_turns: int | None = None
         subtype = "success"
+        route: str | None = None  # 最后一次 handoff 目标 = 最终落点 agent
         async for event in self.ask(question):
             if event["type"] == "tool":
                 logger.info("  tool: %s", format_tool_call(event["name"], event["input"]))
             elif event["type"] == "handoff":
+                route = event["agent"]
                 logger.info("  → 转交给 %s", event["agent"])
             elif event["type"] == "text":
                 chunks.append(event["text"])
@@ -352,6 +357,7 @@ class OpsQABot:
             usage=usage,
             num_turns=num_turns,
             subtype=subtype,
+            route=route,
         )
 
     async def answer_structured(self, question: str) -> StructuredAnswer:

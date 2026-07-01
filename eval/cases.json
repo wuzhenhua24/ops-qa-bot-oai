@@ -1,11 +1,12 @@
 {
-  "description": "ops-qa-bot-openai 评测题集。映射到项目自带 docs/（redis/mysql/kafka）。expected_decision 为 null 表示不评分该项（如问候）。expected_component 是期望被引用的组件目录名。",
+  "description": "ops-qa-bot-openai 评测题集。映射到项目自带 docs/（redis/mysql/kafka/gateway/container）。expected_decision 为 null 表示不评分该项（如问候）。expected_component 是期望被引用的组件目录名。expected_route 是期望路由（仅 multi/auto 模式评分）：组件目录名 / \"coordinator\"（跨组件）/ \"self\"（分诊自答）/ null（不评分）。",
   "cases": [
     {
       "id": "redis-oom",
       "question": "Redis 内存告警 memory > 85% 怎么处理？",
       "expected_decision": "answer",
       "expected_component": "redis",
+      "expected_route": "redis",
       "note": "redis/troubleshooting.md 内存告警"
     },
     {
@@ -13,6 +14,7 @@
       "question": "客户端报 ERR connect timeout，Redis 连接超时怎么排查？",
       "expected_decision": "answer",
       "expected_component": "redis",
+      "expected_route": "redis",
       "note": "redis/troubleshooting.md 连接超时"
     },
     {
@@ -20,6 +22,7 @@
       "question": "Redis 集群有哪些部署拓扑？",
       "expected_decision": "answer",
       "expected_component": "redis",
+      "expected_route": "redis",
       "note": "redis/overview.md 部署拓扑"
     },
     {
@@ -27,6 +30,7 @@
       "question": "MySQL 主从延迟怎么排查和应急？",
       "expected_decision": "answer",
       "expected_component": "mysql",
+      "expected_route": "mysql",
       "note": "mysql/common_issues.md 主从延迟"
     },
     {
@@ -34,6 +38,7 @@
       "question": "MySQL 慢查询怎么定位？",
       "expected_decision": "answer",
       "expected_component": "mysql",
+      "expected_route": "mysql",
       "note": "mysql/common_issues.md 慢查询"
     },
     {
@@ -41,6 +46,7 @@
       "question": "Kafka 消费延迟暴涨怎么办？",
       "expected_decision": "answer",
       "expected_component": "kafka",
+      "expected_route": "kafka",
       "note": "kafka/operations.md 消费延迟暴涨"
     },
     {
@@ -48,35 +54,48 @@
       "question": "Kafka 怎么创建 topic？",
       "expected_decision": "answer",
       "expected_component": "kafka",
+      "expected_route": "kafka",
       "note": "kafka/operations.md 创建 topic"
+    },
+    {
+      "id": "cross-502-oom",
+      "question": "某接口偶发返回 502，重试又能成功，网关和容器层各能看到什么、根因是什么？",
+      "expected_decision": "answer",
+      "expected_component": null,
+      "expected_route": "coordinator",
+      "note": "跨组件：gateway 摘流 + container OOM 重启，auto 应升级给协调者综合；multi 无协调者会路由错"
     },
     {
       "id": "redis-cross-dc-missing",
       "question": "Redis 集群跨机房迁移的完整步骤是什么？",
       "expected_decision": "escalate",
       "expected_component": null,
-      "note": "文档未覆盖，应承认找不到并升级，而不是编造"
+      "expected_route": "redis",
+      "note": "路由到 redis 专家，但文档未覆盖，应承认找不到并升级，而不是编造"
     },
     {
       "id": "ambiguous-backup",
       "question": "备份怎么做？",
       "expected_decision": "clarify",
       "expected_component": null,
-      "note": "redis/mysql 都涉及备份，应先反问主问哪个"
+      "expected_route": "self",
+      "note": "redis/mysql 都涉及备份，分诊应自己反问主问哪个，而不是盲猜某个组件"
     },
     {
       "id": "out-of-scope-code",
       "question": "帮我写个 Python 快速排序函数。",
       "expected_decision": "reject",
       "expected_component": null,
-      "note": "运维范围外，应友好拒绝、不编造"
+      "expected_route": "self",
+      "note": "运维范围外，分诊自己友好拒绝、不转交、不编造"
     },
     {
       "id": "greeting",
       "question": "你好，在吗？",
       "expected_decision": null,
       "expected_component": null,
-      "note": "问候，不对 decision 评分，仅记录"
+      "expected_route": "self",
+      "note": "问候，分诊自答；不对 decision 评分，仅记录"
     }
   ]
 }

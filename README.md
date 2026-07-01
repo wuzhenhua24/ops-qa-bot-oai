@@ -32,7 +32,7 @@ ops-qa-bot-openai/
 │   ├── bot.py                # OpsQABot：Agent + Runner，answer()/answer_structured()/answer_guarded()
 │   ├── cli.py                # 交互式 REPL + --ask/--structured/--mode/--guardrails
 │   └── feishu/               # 飞书长连接接入：render（渲染纯逻辑）/ session / runner
-├── eval/cases.json           # 评测题集（映射到 docs/，带 expected_decision / expected_component）
+├── eval/cases.json           # 评测题集（映射到 docs/，带 expected_decision / expected_component / expected_route）
 ├── tests/test_tools.py       # 检索 / 沙箱 / 标记 / 契约 / 评分 / 护栏 / 审批 / 飞书渲染回归测试（无需 LLM）
 ├── run.py                    # CLI 入口
 ├── run_eval.py               # 评测入口
@@ -274,26 +274,27 @@ REPL 交互式按 y/n 审批；一次性 `--ask` 模式无人值守，写操作*
 
 ## 离线评测 harness（差异化原型 #5）
 
-进程内库 + provider 可换 + 模式可换，天然适合搭评测台：**同一题集 × 多个配置**跑一遍、打分、出报告——把"换模型 / 单 agent vs 多 agent / 改 prompt"的效果变成可量化数字，用于回归与选型（改了检索策略或 prompt 后，跑一遍看路由准确率/来源真实率有没有掉）。
+进程内库 + provider 可换 + 模式可换，天然适合搭评测台：**同一题集 × 多个配置**跑一遍、打分、出报告——把"换模型 / 单 agent vs 多 agent / 改 prompt"的效果变成可量化数字，用于回归与选型（改了检索策略或 prompt 后，跑一遍看决策/转交/来源真实率有没有掉）。
 
 ```bash
-uv run python run_eval.py                          # 默认跑 structured + free + multi 三种模式
-uv run python run_eval.py --modes structured,multi --detail
+uv run python run_eval.py                          # 默认跑 structured + free + multi + auto 四种模式
+uv run python run_eval.py --modes multi,auto --detail   # 对比 auto 的自适应路由 vs multi
 # 换模型/provider 跑一遍 = 换 OPS_QA_* 环境变量再跑（见上「模型 / provider 配置」）
 ```
 
-题集在 `eval/cases.json`（带 `expected_decision` / `expected_component`）。报告示例：
+题集在 `eval/cases.json`（带 `expected_decision` / `expected_component` / `expected_route`）。报告示例（注意 `auto` 在跨组件题上转交准确率高于 `multi`——后者没有协调者可升级）：
 
 ```
-配置                路由准确       组件命中     来源真实    均tokens  均轮数  均耗时ms
-----------------  ---------  --------  --------  -------  ---  -----
-gpt-5 · structured  100% (10)  100% (7)  100% (7)  150      2.0  400
-gpt-5 · multi       ...
+配置            决策准确    转交准确    组件命中    来源真实   均tokens  均轮数  均耗时ms
+------------  --------  --------  --------  --------  -------  ---  -----
+glm · multi   100% (10)  50% (2)   100% (7)  100% (8)  1200     3.0  800
+glm · auto    100% (10)  100% (2)  100% (7)  100% (8)  1400     3.2  950
 ```
 
 确定性指标（**无需额外 API 调用**，跑一遍 bot 即可算）：
 
-- **路由准确率**：`decision`（answer/clarify/escalate/reject）是否符合预期。
+- **决策准确率**：`decision`（answer/clarify/escalate/reject）是否符合预期。
+- **转交准确率**：`multi`/`auto` 下分诊台是否转交给了正确处理者（组件专家 / 跨组件协调者 / 分诊自答）。**量化 auto 自适应路由准不准**——`expected_route` 标注单组件题的目标组件、跨组件题标 `coordinator`、问候/拒绝标 `self`。
 - **组件命中率**：是否引用了期望组件目录下的文档。
 - **来源真实率**：引用路径是否真实存在（复用 `validate_citations`）。
 - **成本/时延**：token、轮数、耗时。
