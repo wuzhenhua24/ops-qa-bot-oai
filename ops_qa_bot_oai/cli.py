@@ -14,7 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .bot import GuardedAnswer, OpsQABot, StructuredAnswer, format_tool_call
-from .model import env_flag, resolve_model
+from .model import MODE_LABELS, MODES, resolve_mode, resolve_model
 
 _RESET_WORDS = {"/reset", "/new", "新对话", "重置"}
 
@@ -73,39 +73,45 @@ def _make_approver(interactive: bool):
     return approver
 
 
+def _orchestration_lines(mode: str, bot: OpsQABot) -> list[str]:
+    """编排模式的横幅细节（组件专家名单 + 模型路由）；single 模式返回空。"""
+    if mode == "single":
+        return []
+    roster = "、".join(c.name for c in bot.components) or "（无）"
+    head = f"组件专家：{roster}"
+    if mode == "auto":
+        head += "（跨组件问题自动升级协调者）"
+    lines = [head]
+    if bot.model_router is not None:
+        entry = "coordinator" if mode == "coordinator" else "triage"
+        roles = [entry] + [c.dir for c in bot.components]
+        lines.append(f"模型路由：{bot.model_router.describe(roles)}")
+    return lines
+
+
 async def run_once(
     docs_root: Path,
     question: str,
     show_tools: bool,
     structured: bool = False,
-    multi_agent: bool = False,
+    mode: str = "single",
     guardrails: bool = False,
-    coordinator: bool = False,
 ) -> None:
     """一次性问一个问题就退出（适合脚本调用 / 批量跑题）。"""
     model_choice = resolve_model()
-    if coordinator:
-        # 跨组件协调者是独立的自由文本路径，与其它模式互斥。
-        structured = multi_agent = guardrails = False
-    elif guardrails and multi_agent:
-        print("[注意] --guardrails 暂不与 --multi-agent 叠加，本次按单 agent + 护栏运行。\n")
-        multi_agent = False
+    if mode != "single" and (structured or guardrails):
+        # 编排模式（auto/multi/coordinator）走自由文本 answer()，不与结构化/护栏叠加。
+        print("[注意] 结构化输出 / 护栏暂不与编排模式(auto/multi/coordinator)叠加，本次忽略。\n")
+        structured = guardrails = False
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
-        multi_agent=multi_agent,
-        coordinator=coordinator,
+        mode=mode,
         guardrails=guardrails,
     )
-    if coordinator and show_tools:
-        roster = "、".join(c.name for c in bot.components) or "（无）"
-        print(f"[跨组件协调者 → 可咨询专家：{roster}]\n")
-    elif multi_agent and show_tools:
-        roster = "、".join(c.name for c in bot.components) or "（无）"
-        print(f"[多 agent 编排：分诊 → {roster}]")
-        if bot.model_router is not None:
-            roles = ["triage"] + [c.dir for c in bot.components]
-            print(f"[模型路由：{bot.model_router.describe(roles)}]")
+    if mode != "single" and show_tools:
+        for ln in _orchestration_lines(mode, bot):
+            print(f"[{ln}]")
         print()
 
     if guardrails and not structured:
@@ -122,7 +128,7 @@ async def run_once(
             )
         return
 
-    if structured and not multi_agent:
+    if structured:
         sa = await bot.answer_structured(question)
         if show_tools and sa.num_turns is not None:
             print(f"[模型 {model_choice.description} · {sa.num_turns} 次模型调用 · 结构化输出]\n")
@@ -162,41 +168,32 @@ async def run_repl(
     docs_root: Path,
     show_tools: bool,
     structured: bool = False,
-    multi_agent: bool = False,
+    mode: str = "single",
     guardrails: bool = False,
-    coordinator: bool = False,
 ) -> None:
     model_choice = resolve_model()
-    if coordinator:
-        structured = multi_agent = guardrails = False
-    elif guardrails and multi_agent:
-        print("[注意] --guardrails 暂不与 --multi-agent 叠加，本次按单 agent + 护栏运行。")
-        multi_agent = False
+    if mode != "single" and (structured or guardrails):
+        print("[注意] 结构化输出 / 护栏暂不与编排模式(auto/multi/coordinator)叠加，本次忽略。")
+        structured = guardrails = False
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
-        multi_agent=multi_agent,
-        coordinator=coordinator,
+        mode=mode,
         guardrails=guardrails,
     )
     approver = _make_approver(interactive=True) if guardrails else None
-    mode = []
+    parts = []
+    if mode != "single":
+        parts.append(MODE_LABELS[mode])
     if structured:
-        mode.append("结构化输出")
-    if coordinator:
-        roster = "、".join(c.name for c in bot.components) or "（无）"
-        mode.append(f"跨组件协调者 → 可咨询专家：{roster}")
-    if multi_agent:
-        roster = "、".join(c.name for c in bot.components) or "（无）"
-        mode.append(f"多 agent 编排：分诊 → {roster}")
+        parts.append("结构化输出")
     if guardrails:
-        mode.append("护栏 + 写操作审批")
+        parts.append("护栏 + 写操作审批")
     print("运维文档问答机器人（OpenAI Agents SDK）")
     print(f"文档根目录：{docs_root}")
-    print(f"模型：{model_choice.description}" + (f"（{'；'.join(mode)}）" if mode else ""))
-    if multi_agent and bot.model_router is not None:
-        roles = ["triage"] + [c.dir for c in bot.components]
-        print(f"模型路由：{bot.model_router.describe(roles)}")
+    print(f"模型：{model_choice.description}" + (f"（{'；'.join(parts)}）" if parts else ""))
+    for ln in _orchestration_lines(mode, bot):
+        print(ln)
     print("输入问题后回车提问；/reset 开新会话；空行或 Ctrl+C 退出。\n")
 
     while True:
@@ -227,7 +224,7 @@ async def run_repl(
                 print(f"\n[出错] {type(e).__name__}: {e}\n")
             continue
 
-        if structured and not multi_agent:
+        if structured:
             try:
                 sa = await bot.answer_structured(question)
                 _print_structured(sa)
@@ -297,21 +294,18 @@ def main() -> None:
         help="用结构化输出契约（AnswerContract）替代自由文本 + <<MARKER>>，并校验来源真实性",
     )
     parser.add_argument(
-        "--multi-agent",
-        action=argparse.BooleanOptionalAction,
-        default=env_flag("OPS_QA_MULTI_AGENT"),
-        help="多 agent 编排：分诊台按问题 handoff 给从 INDEX.md 生成的组件专家。"
-        "默认读环境变量 OPS_QA_MULTI_AGENT，与飞书共用；--multi-agent / --no-multi-agent 可覆盖",
+        "--mode",
+        choices=MODES,
+        default=resolve_mode(),
+        help="答题编排模式：single（单 agent）/ multi（分诊→专家）/ "
+        "coordinator（跨组件协调）/ auto（自适应，默认）。"
+        "缺省读环境变量 OPS_QA_MODE，与飞书共用",
     )
     parser.add_argument(
         "--guardrails",
         action="store_true",
-        help="开启输入注入护栏 + 写操作审批（HITL）；结构化模式下额外加输出来源护栏",
-    )
-    parser.add_argument(
-        "--coordinator",
-        action="store_true",
-        help="跨组件协调者：把各组件专家当工具调用、综合根因（适合一个现象牵涉多组件）",
+        help="开启输入注入护栏 + 写操作审批（HITL）；结构化模式下额外加输出来源护栏。"
+        "仅 single 模式生效",
     )
     args = parser.parse_args()
     docs_root = Path(args.docs).resolve()
@@ -323,9 +317,8 @@ def main() -> None:
                 args.ask,
                 show_tools=show_tools,
                 structured=args.structured,
-                multi_agent=args.multi_agent,
+                mode=args.mode,
                 guardrails=args.guardrails,
-                coordinator=args.coordinator,
             )
         )
     else:
@@ -334,9 +327,8 @@ def main() -> None:
                 docs_root,
                 show_tools=show_tools,
                 structured=args.structured,
-                multi_agent=args.multi_agent,
+                mode=args.mode,
                 guardrails=args.guardrails,
-                coordinator=args.coordinator,
             )
         )
 

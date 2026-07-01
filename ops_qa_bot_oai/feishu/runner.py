@@ -31,6 +31,7 @@ from lark_oapi.channel.config import (
 )
 from lark_oapi.channel.types import InboundMessage, TextContent
 
+from ..model import MODE_LABELS
 from .render import (
     RESET_WORDS,
     build_answer_post,
@@ -114,7 +115,7 @@ class WsRunner:
         self._session = SessionManager(docs_root, idle_ttl=idle_ttl, max_turns=max_turns)
         logger.info(
             "答题模式：%s（模型 %s）",
-            "多 agent 编排" if self._session.multi_agent else "单 agent",
+            MODE_LABELS.get(self._session.mode, self._session.mode),
             self._session.model_choice.description,
         )
         self._channel.on("message", self._on_inbound)

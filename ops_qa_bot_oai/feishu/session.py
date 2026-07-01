@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from ..bot import OpsQABot
-from ..model import ModelChoice, env_flag, resolve_model
+from ..model import ModelChoice, resolve_mode, resolve_model
 
 SessionKey = tuple[str, str]  # (chat_id, user_id)
 
@@ -36,15 +36,15 @@ class SessionManager:
         idle_ttl: float = 1800.0,
         max_turns: int = 30,
         model_choice: ModelChoice | None = None,
-        multi_agent: bool | None = None,
+        mode: str | None = None,
     ):
         self.docs_root = docs_root
         self.idle_ttl = idle_ttl
         self.max_turns = max_turns
         self._model_choice = model_choice or resolve_model()
-        # 与终端 --multi-agent 对应：飞书无命令行开关，改由环境变量 OPS_QA_MULTI_AGENT 控制
-        # （param 显式传入时优先，便于测试/复用）。
-        self.multi_agent = env_flag("OPS_QA_MULTI_AGENT") if multi_agent is None else multi_agent
+        # 编排模式：飞书无命令行开关，由环境变量 OPS_QA_MODE 控制（与终端 --mode 共用一套
+        # .env，缺省 auto）；param 显式传入时优先，便于测试/复用。
+        self.mode = resolve_mode() if mode is None else mode
         self._entries: dict[SessionKey, _Entry] = {}
         self._guard = asyncio.Lock()  # 保护 _entries 结构
         self._sweeper: asyncio.Task | None = None
@@ -61,7 +61,7 @@ class SessionManager:
                     docs_root=self.docs_root,
                     model_choice=self._model_choice,
                     max_turns=self.max_turns,
-                    multi_agent=self.multi_agent,
+                    mode=self.mode,
                 )
                 entry = _Entry(bot)
                 self._entries[key] = entry

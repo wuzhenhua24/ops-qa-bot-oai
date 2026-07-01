@@ -38,8 +38,13 @@ from .guardrails import (
     citation_output_guardrail,
     injection_input_guardrail,
 )
-from .model import ModelChoice, ModelRouter, build_model_router, resolve_model
-from .orchestration import Component, build_coordinator_agent, build_triage_agent
+from .model import MODES, ModelChoice, ModelRouter, build_model_router, resolve_model
+from .orchestration import (
+    Component,
+    build_auto_agent,
+    build_coordinator_agent,
+    build_triage_agent,
+)
 from .prompt import build_structured_system_prompt, build_system_prompt
 from .schema import AnswerContract, Decision, validate_citations
 from .tools import DOC_TOOLS, DocsContext
@@ -189,11 +194,12 @@ class OpsQABot:
         *,
         max_turns: int | None = DEFAULT_MAX_TURNS,
         model_choice: ModelChoice | None = None,
-        multi_agent: bool = False,
-        coordinator: bool = False,
+        mode: str = "single",
         model_router: ModelRouter | None = None,
         guardrails: bool = False,
     ):
+        if mode not in MODES:
+            raise ValueError(f"未知 mode={mode!r}，可选：{' / '.join(MODES)}")
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
             raise ValueError(f"docs_root 不存在或不是目录: {self.docs_root}")
@@ -204,8 +210,7 @@ class OpsQABot:
         if max_turns is not None and max_turns <= 0:
             max_turns = None
         self.max_turns = max_turns
-        self.multi_agent = multi_agent
-        self.coordinator = coordinator
+        self.mode = mode
         self.guardrails = guardrails
 
         # 差异化 #4：开启 guardrails 时挂输入注入护栏 + 写操作审批工具（HITL）。
@@ -217,18 +222,22 @@ class OpsQABot:
         self._agent: Agent[DocsContext]
         self.components: list[Component]
         self.model_router: ModelRouter | None = None
-        if coordinator:
+        if mode == "coordinator":
             # 跨组件协作：协调者把各组件专家当工具（agents-as-tools）调用、综合根因。
             self.model_router = model_router or build_model_router()
             self._agent, self.components = build_coordinator_agent(
                 self.docs_root, self.model_router
             )
-        elif multi_agent:
+        elif mode == "auto":
+            # 自适应默认：分诊台 handoff 给单专家（常见）或跨组件协调者（少数）。
+            self.model_router = model_router or build_model_router()
+            self._agent, self.components = build_auto_agent(self.docs_root, self.model_router)
+        elif mode == "multi":
             # 差异化 #3：入口换成分诊 agent，handoff 给从 INDEX.md 动态生成的组件专家。
             # 差异化 #2：用 ModelRouter 按角色/组件分配模型（分诊便宜、专家强）。
             self.model_router = model_router or build_model_router()
             self._agent, self.components = build_triage_agent(self.docs_root, self.model_router)
-        else:
+        else:  # single
             self.components = []
             self._agent = Agent(
                 name="ops-qa-bot",

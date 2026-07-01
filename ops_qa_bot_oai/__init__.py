@@ -21,6 +21,7 @@ from .guardrails import (
 from .model import ModelChoice, ModelRouter, build_model_router, resolve_model
 from .orchestration import (
     Component,
+    build_auto_agent,
     build_coordinator_agent,
     build_triage_agent,
     parse_index_components,
@@ -52,6 +53,7 @@ __all__ = [
     "parse_index_components",
     "build_triage_agent",
     "build_coordinator_agent",
+    "build_auto_agent",
     "EvalCase",
     "load_cases",
     "score_case",

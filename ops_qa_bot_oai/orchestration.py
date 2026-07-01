@@ -207,13 +207,20 @@ def _coordinator_instructions(components: list[Component]) -> str:
 
 
 def build_coordinator_agent(
-    docs_root: Path, router: ModelRouter, *, specialist_max_turns: int = 12
+    docs_root: Path,
+    router: ModelRouter,
+    *,
+    specialist_max_turns: int = 12,
+    handoff_description: str | None = None,
 ) -> tuple[Agent[DocsContext], list[Component]]:
     """构造跨组件协调者：各 local 组件专家以 `as_tool` 暴露给协调者调用。
 
     每个专家工具名 `ask_<dir>`；专家用 `router.for_role(dir)` 的模型，协调者用
     `router.for_role("coordinator")`（无覆盖回退默认）。`as_tool` 会把父级的
     DocsContext 透传给专家，专家的 read_doc/grep_docs 据此拿到 docs_root。
+
+    `handoff_description` 仅在 auto 模式下把协调者当作分诊台的 handoff 目标时用到——
+    分诊台据此判断"何时转交给它"。作为独立入口（coordinator 模式）时留空即可。
     """
     components = parse_index_components(docs_root)
     local = [c for c in components if c.source == "local"]
@@ -230,8 +237,73 @@ def build_coordinator_agent(
     ]
     coordinator = Agent[DocsContext](
         name="coordinator",
+        handoff_description=handoff_description,
         instructions=_coordinator_instructions(local),
         tools=specialist_tools,
         model=router.for_role("coordinator")[1],
     )
     return coordinator, local
+
+
+# ---------------------------------------------------------------------------
+# 自适应分诊（auto）：分诊台 = 单专家 handoff + 跨组件协调者 handoff
+# ---------------------------------------------------------------------------
+#
+# 面向真实使用（非评测）：让分诊台按问题自适应选架构，而不是让用户去配"用 multi 还是
+# coordinator"。大多数问题落在单个组件 → handoff 给该专家（便宜、聚焦）；少数横跨多组件
+# 的现象 → handoff 给 coordinator 综合根因。auto 相当于 multi 多挂一个"跨组件逃生口"。
+
+_AUTO_COORDINATOR_HANDOFF_DESC = (
+    "跨组件综合排查：当一个现象可能牵涉**多个**组件、根因跨越组件边界、"
+    "或单个专家不足以定位时，转交给它——它会并行咨询多个专家并综合根因链。"
+)
+
+
+def _auto_triage_instructions(components: list[Component]) -> str:
+    lines = [f"- **{c.name}**（转交目标：{c.dir}_specialist）：{c.coverage}" for c in components]
+    roster = "\n".join(lines) if lines else "（INDEX.md 未解析到组件）"
+    body = f"""你是内部运维问答的**分诊台**（自适应路由）。你自己不查组件文档、不回答组件细节——职责是把问题**转交（handoff）给正确的处理者**。
+
+# 可转交对象
+## 单组件专家（问题明确落在某一个组件时转给它）
+{roster}
+## 跨组件协调者（转交目标：coordinator）
+当现象可能牵涉**多个**组件、根因跨越组件边界、或单个专家不足以定位时，转交给它——它会并行咨询多个专家、综合根因链。
+
+# 路由规则
+- 问题明确落在**某一个**组件 → handoff 给该组件专家（**大多数问题属此类，优先走这条**）。
+- 现象**横跨多个**组件 / 根因归属不清 / 需综合多个组件证据 → handoff 给**跨组件协调者**。
+- **问候 / 致谢 / 闲聊**（"你好"、"谢谢"）→ 自己简短回应，1-2 句，引导用户提具体运维问题。
+- **询问能力 / "你能做什么"** → 自己回答：列出上面覆盖的组件 + 1-2 个示例问题（可 `read_doc("INDEX.md")` 核对）。
+- **与运维无关的请求**（写代码 / 翻译 / 通用知识）→ 自己友好拒绝，说明只覆盖运维组件问答。
+- 拿不准是单组件还是跨组件时，**倾向先转给单组件专家**（更聚焦）；确有跨组件迹象再转协调者。
+
+转交后由处理者作答，你不需要再介入。"""
+    return prompt_with_handoff_instructions(body)
+
+
+def build_auto_agent(
+    docs_root: Path, router: ModelRouter, *, specialist_max_turns: int = 12
+) -> tuple[Agent[DocsContext], list[Component]]:
+    """构造自适应分诊 agent：handoffs = 各组件专家 + 跨组件协调者。
+
+    分诊按问题决定转交给单个专家（常见）还是 coordinator（跨组件）。复用
+    `build_specialist_agent` / `build_coordinator_agent`，不重写编排。
+    """
+    components = parse_index_components(docs_root)
+    local = [c for c in components if c.source == "local"]
+    specialists = [build_specialist_agent(c, router.for_role(c.dir)[1]) for c in local]
+    coordinator, _ = build_coordinator_agent(
+        docs_root,
+        router,
+        specialist_max_turns=specialist_max_turns,
+        handoff_description=_AUTO_COORDINATOR_HANDOFF_DESC,
+    )
+    triage = Agent[DocsContext](
+        name="triage",
+        instructions=_auto_triage_instructions(local),
+        tools=list(DOC_TOOLS),  # 仅用于"能力介绍"时读 INDEX；组件问题一律转交
+        handoffs=[*specialists, coordinator],
+        model=router.for_role("triage")[1],
+    )
+    return triage, local

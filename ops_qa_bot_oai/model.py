@@ -86,6 +86,27 @@ def env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+# 答题编排模式。single/multi/coordinator 为确定性模式（评测台按模式跑分对比用）；
+# auto 为自适应默认：分诊台按问题决定转交给单个组件专家（常见）还是跨组件协调者（少数）。
+MODES = ("single", "multi", "coordinator", "auto")
+MODE_LABELS = {
+    "single": "单 agent",
+    "multi": "多 agent 编排（分诊 → 专家）",
+    "coordinator": "跨组件协调者",
+    "auto": "自适应分诊（单专家 / 跨组件协调）",
+}
+
+
+def resolve_mode(default: str = "auto") -> str:
+    """从环境变量 OPS_QA_MODE 解析编排模式；缺省 auto。终端与飞书共用此变量。"""
+    raw = (os.environ.get("OPS_QA_MODE") or "").strip().lower()
+    if not raw:
+        return default
+    if raw not in MODES:
+        raise ValueError(f"未知 OPS_QA_MODE={raw!r}，可选：{' / '.join(MODES)}")
+    return raw
+
+
 @dataclass
 class ModelChoice:
     """解析后的模型选择：交给 Agent 的 model（字符串或 Model 实例）+ 给人看的描述。"""

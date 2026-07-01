@@ -523,6 +523,25 @@ def test_coordinator_per_component_model_routing(tmp_path):
     assert coordinator.model == "gpt-5-pro"  # 协调者用 coordinator 覆盖
 
 
+def test_auto_triage_handoffs_specialists_plus_coordinator(tmp_path):
+    from ops_qa_bot_oai.model import ModelRouter
+    from ops_qa_bot_oai.orchestration import build_auto_agent
+
+    root = _coord_docs(tmp_path)
+    router = ModelRouter(
+        provider="openai", default_name="gpt-5", overrides={}, _make=lambda n: (n, n)
+    )
+    triage, comps = build_auto_agent(root, router)
+    assert {c.dir for c in comps} == {"gateway", "container"}
+    assert triage.name == "triage"
+    # auto = multi 的分诊 + 一个跨组件协调者逃生口：handoffs = 各专家 + coordinator
+    names = {getattr(h, "name", None) for h in triage.handoffs}
+    assert names == {"gateway_specialist", "container_specialist", "coordinator"}
+    # 协调者作为 handoff 目标时带 handoff_description（分诊据此判断何时升级）
+    coord = next(h for h in triage.handoffs if getattr(h, "name", None) == "coordinator")
+    assert coord.handoff_description
+
+
 def test_index_picks_up_gateway_container():
     # 项目自带 docs 已登记 Gateway / Container（跨组件场景素材）
     from ops_qa_bot_oai.orchestration import parse_index_components

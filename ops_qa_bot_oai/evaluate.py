@@ -220,7 +220,12 @@ async def run_config(
     on_case: Any = None,
 ) -> ConfigResult:
     """在某个模式下跑完整题集并打分。`on_case(case, outcome, score)` 可选回调（进度）。"""
-    bot = OpsQABot(docs_root=docs_root, model_choice=model_choice, multi_agent=(mode == "multi"))
+    # 评测轴 mode（structured/free/multi）→ OpsQABot 编排模式：multi 走多 agent，其余单 agent。
+    bot = OpsQABot(
+        docs_root=docs_root,
+        model_choice=model_choice,
+        mode=("multi" if mode == "multi" else "single"),
+    )
     scores: list[CaseScore] = []
     for case in cases:
         outcome = await _run_case(bot, mode, case.question, docs_root)
