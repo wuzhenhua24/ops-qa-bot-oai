@@ -61,6 +61,16 @@ uv run python run.py --docs /path/to/docs --hide-tools
 
 REPL 里：输入问题回车提问；`/reset`（或 `/new`/`新对话`/`重置`）开新会话；空行或 Ctrl+C 退出。
 
+> **本地开发开了代理时**：若终端里设了 SOCKS 代理（`all_proxy=socks5://...`），启动会报
+> `ImportError: Using SOCKS proxy, but the 'socksio' package is not installed`。这来自 Agents SDK
+> 内部构造 tracing client 时读到了该变量，与本项目代码无关。生产部署本就不走代理，本地跑之前
+> 去掉这个变量即可（HTTP 代理 `http_proxy`/`https_proxy` 不受影响）：
+>
+> ```bash
+> unset all_proxy ALL_PROXY
+> uv run python run.py
+> ```
+
 ## 模型 / provider 配置（运行时切换）
 
 OpenAI Agents SDK 是 provider 无关的，本项目把"用哪个模型"收敛成几个环境变量（完整模板见 `.env.example`）。**核心原则：按第三方端点暴露的是什么协议，来选 `OPS_QA_PROVIDER`，再配 `OPS_QA_BASE_URL` + `OPS_QA_API_KEY` + `OPS_QA_MODEL`。**

@@ -11,6 +11,8 @@ import argparse
 import asyncio
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from .bot import GuardedAnswer, OpsQABot, StructuredAnswer, format_tool_call
 from .model import resolve_model
 
@@ -270,6 +272,9 @@ async def run_repl(
 
 
 def main() -> None:
+    # 加载项目根目录 .env（provider/base_url/key/model 等 OPS_QA_* 都在里面）。
+    # 已存在的环境变量优先，不被覆盖。
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     parser = argparse.ArgumentParser(description="内部运维文档问答机器人（OpenAI Agents SDK）")
     parser.add_argument(
         "--docs",

@@ -18,6 +18,8 @@ import argparse
 import asyncio
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from ops_qa_bot_oai.evaluate import (
     MODES,
     render_case_detail,
@@ -38,6 +40,7 @@ async def _main(cases: Path, docs: Path, modes: list[str], detail: bool) -> None
 
 
 def main() -> None:
+    load_dotenv(_ROOT / ".env")  # 换 provider 对比 = 改 .env 再跑；已存在的环境变量优先。
     parser = argparse.ArgumentParser(description="ops-qa-bot-openai 离线评测")
     parser.add_argument("--cases", default=str(_ROOT / "eval" / "cases.json"), help="题集 JSON")
     parser.add_argument("--docs", default=str(_ROOT / "docs"), help="文档根目录")

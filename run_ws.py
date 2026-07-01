@@ -20,10 +20,13 @@ import logging
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 _ROOT = Path(__file__).resolve().parent
 
 
 def main() -> None:
+    load_dotenv(_ROOT / ".env")  # 加载 OPS_QA_* / FEISHU_* 等配置；已存在的环境变量优先。
     parser = argparse.ArgumentParser(description="ops-qa-bot-openai 飞书长连接服务")
     parser.add_argument("--docs", default=str(_ROOT / "docs"), help="文档根目录")
     parser.add_argument("--idle-ttl", type=float, default=1800.0, help="会话空闲回收秒数")
