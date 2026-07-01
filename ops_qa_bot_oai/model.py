@@ -78,6 +78,14 @@ def normalize_openai_base_url(base_url: str) -> str:
     return url.rstrip("/")
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    """读环境变量里的布尔开关：`1/true/yes/on`（不分大小写）为真，其余为假。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class ModelChoice:
     """解析后的模型选择：交给 Agent 的 model（字符串或 Model 实例）+ 给人看的描述。"""

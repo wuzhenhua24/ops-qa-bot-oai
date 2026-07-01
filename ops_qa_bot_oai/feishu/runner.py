@@ -112,6 +112,11 @@ class WsRunner:
         )
         self._client = FeishuClient(self._channel)
         self._session = SessionManager(docs_root, idle_ttl=idle_ttl, max_turns=max_turns)
+        logger.info(
+            "答题模式：%s（模型 %s）",
+            "多 agent 编排" if self._session.multi_agent else "单 agent",
+            self._session.model_choice.description,
+        )
         self._channel.on("message", self._on_inbound)
         self._channel.on("reconnecting", lambda: logger.warning("ws reconnecting ..."))
         self._channel.on("reconnected", lambda: logger.info("ws reconnected"))
