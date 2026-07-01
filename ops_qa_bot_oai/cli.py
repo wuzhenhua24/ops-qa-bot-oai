@@ -14,7 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .bot import GuardedAnswer, OpsQABot, StructuredAnswer, format_tool_call
-from .model import resolve_model
+from .model import env_flag, resolve_model
 
 _RESET_WORDS = {"/reset", "/new", "新对话", "重置"}
 
@@ -298,8 +298,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--multi-agent",
-        action="store_true",
-        help="多 agent 编排：分诊台按问题 handoff 给从 INDEX.md 生成的组件专家",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag("OPS_QA_MULTI_AGENT"),
+        help="多 agent 编排：分诊台按问题 handoff 给从 INDEX.md 生成的组件专家。"
+        "默认读环境变量 OPS_QA_MULTI_AGENT，与飞书共用；--multi-agent / --no-multi-agent 可覆盖",
     )
     parser.add_argument(
         "--guardrails",
