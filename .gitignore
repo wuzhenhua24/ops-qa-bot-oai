@@ -7,3 +7,4 @@ config.toml
 logs/
 *.egg-info/
 .ruff_cache/
+.DS_Store
