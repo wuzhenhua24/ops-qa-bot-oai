@@ -577,6 +577,40 @@ def test_guardrails_wired_into_all_orchestration_modes(tmp_path):
     assert coord.input_guardrails == ig
 
 
+def test_structured_output_type_orthogonal_to_mode(tmp_path):
+    """结构化输出与路由正交：output_type 挂到各模式的终端 agent（专家/协调者/分诊自答）。"""
+    from agents import AgentOutputSchema
+
+    from ops_qa_bot_oai.model import ModelRouter
+    from ops_qa_bot_oai.orchestration import (
+        build_auto_agent,
+        build_coordinator_agent,
+        build_triage_agent,
+    )
+    from ops_qa_bot_oai.schema import AnswerContract
+
+    root = _coord_docs(tmp_path)
+    router = ModelRouter(
+        provider="openai", default_name="gpt-5", overrides={}, _make=lambda n: (n, n)
+    )
+    out = AgentOutputSchema(AnswerContract, strict_json_schema=False)
+
+    # multi：分诊（自答）+ 各专家（handoff 后终端）都带 output_type
+    triage, _ = build_triage_agent(root, router, output_type=out)
+    assert triage.output_type is out
+    spec = next(h for h in triage.handoffs if getattr(h, "name", "").endswith("_specialist"))
+    assert spec.output_type is out
+
+    # coordinator：协调者（终端）带 output_type
+    coord, _ = build_coordinator_agent(root, router, output_type=out)
+    assert coord.output_type is out
+
+    # auto：分诊 + handoff 专家 + coordinator 逃生口都带 output_type
+    a_triage, _ = build_auto_agent(root, router, output_type=out)
+    assert a_triage.output_type is out
+    assert all(h.output_type is out for h in a_triage.handoffs)
+
+
 def test_index_picks_up_gateway_container():
     # 项目自带 docs 已登记 Gateway / Container（跨组件场景素材）
     from ops_qa_bot_oai.orchestration import parse_index_components

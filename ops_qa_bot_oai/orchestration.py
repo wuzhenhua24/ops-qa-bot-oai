@@ -22,6 +22,7 @@ from agents import Agent, Model
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
 from .model import ModelRouter
+from .prompt import STRUCTURED_CONTRACT_SUFFIX
 from .tools import DOC_TOOLS, DocsContext
 
 
@@ -103,7 +104,9 @@ def parse_index_components(docs_root: Path) -> list[Component]:
     return components
 
 
-def _specialist_instructions(c: Component, *, has_write_tool: bool = False) -> str:
+def _specialist_instructions(
+    c: Component, *, has_write_tool: bool = False, structured: bool = False
+) -> str:
     owner = c.open_id or "（INDEX.md 未登记 open_id）"
     # 带写审批工具时，明确引导专家把"写/变更"走 request_write_command（挂起等人批），而不是
     # 把命令直接写进答案——否则"危险操作标 ⚠️ 风险"那句会把它带向纯文字，工具形同虚设。
@@ -127,23 +130,37 @@ def _specialist_instructions(c: Component, *, has_write_tool: bool = False) -> s
 - **危险操作**（删除/重启/flush/改主库等）显式标 ⚠️ 风险，并引用文档里的对应警告。{write_block}
 - 中文、简洁、分点。
 - 信息不足以准确回答（缺版本/环境/报错码且会让答案分叉）时，先反问 1-2 个关键点，不要硬答。
-"""
+{STRUCTURED_CONTRACT_SUFFIX if structured else ""}"""
 
 
 def build_specialist_agent(
-    c: Component, model: str | Model, *, extra_tools: list | None = None
+    c: Component,
+    model: str | Model,
+    *,
+    extra_tools: list | None = None,
+    output_type: object | None = None,
+    output_guardrails: list | None = None,
 ) -> Agent[DocsContext]:
     """为一个组件构造专家 agent：作用域限定在它自己的目录。
 
     `extra_tools` 用于把横切工具（如写操作审批 `request_write_command`）挂到专家上——
     多/自适应/协调者模式下真正答题、可能提议写操作的是专家，护栏得挂在这一层。
+
+    `output_type` 非空时专家作为**终端 agent** 产出结构化契约（multi/auto 下 handoff 后
+    由专家收尾）——此时叠加契约字段引导、并挂 `output_guardrails`。coordinator 模式下
+    专家是被 as_tool 调用、返回文字喂协调者，不传 output_type。
     """
+    structured = output_type is not None
     return Agent[DocsContext](
         name=f"{c.dir}_specialist",
         handoff_description=f"{c.name} 运维问题（{c.coverage}）",
-        instructions=_specialist_instructions(c, has_write_tool=bool(extra_tools)),
+        instructions=_specialist_instructions(
+            c, has_write_tool=bool(extra_tools), structured=structured
+        ),
         tools=list(DOC_TOOLS) + list(extra_tools or []),
         model=model,
+        output_type=output_type,
+        output_guardrails=list(output_guardrails or []),
     )
 
 
@@ -172,6 +189,8 @@ def build_triage_agent(
     *,
     input_guardrails: list | None = None,
     specialist_extra_tools: list | None = None,
+    output_type: object | None = None,
+    output_guardrails: list | None = None,
 ) -> tuple[Agent[DocsContext], list[Component]]:
     """构造分诊 agent（持有各 local 组件专家的 handoff）+ 返回解析到的组件。
 
@@ -181,20 +200,35 @@ def build_triage_agent(
 
     护栏（横切，与编排模式正交）：`input_guardrails` 挂在入口分诊 agent 上（输入护栏
     只在入口 agent 对用户输入跑一次）；`specialist_extra_tools`（如写审批工具）挂到各专家。
+
+    结构化输出（与路由正交）：`output_type` 非空时，各专家（handoff 后终端）与分诊自身
+    （自答场景）都产出该契约类型，`output_guardrails`（来源护栏）挂到这些终端 agent。
     """
+    structured = output_type is not None
     components = parse_index_components(docs_root)
     local = [c for c in components if c.source == "local"]
     specialists = [
-        build_specialist_agent(c, router.for_role(c.dir)[1], extra_tools=specialist_extra_tools)
+        build_specialist_agent(
+            c,
+            router.for_role(c.dir)[1],
+            extra_tools=specialist_extra_tools,
+            output_type=output_type,
+            output_guardrails=output_guardrails,
+        )
         for c in local
     ]
+    instructions = _triage_instructions(local)
+    if structured:
+        instructions += STRUCTURED_CONTRACT_SUFFIX
     triage = Agent[DocsContext](
         name="triage",
-        instructions=_triage_instructions(local),
+        instructions=instructions,
         tools=list(DOC_TOOLS),  # 仅用于"能力介绍"时读 INDEX；组件问题一律转交
         handoffs=list(specialists),
         model=router.for_role("triage")[1],
         input_guardrails=list(input_guardrails or []),
+        output_type=output_type,
+        output_guardrails=list(output_guardrails or []),
     )
     return triage, local
 
@@ -240,6 +274,8 @@ def build_coordinator_agent(
     handoff_description: str | None = None,
     input_guardrails: list | None = None,
     specialist_extra_tools: list | None = None,
+    output_type: object | None = None,
+    output_guardrails: list | None = None,
 ) -> tuple[Agent[DocsContext], list[Component]]:
     """构造跨组件协调者：各 local 组件专家以 `as_tool` 暴露给协调者调用。
 
@@ -253,7 +289,11 @@ def build_coordinator_agent(
     护栏：`input_guardrails` 挂在入口协调者上（coordinator 模式下它是入口）；
     `specialist_extra_tools`（写审批工具）挂到 as_tool 的专家——SDK 会把嵌套子 run 的
     needs_approval 中断冒到顶层，由 answer_guarded 统一 approve/reject。
+
+    结构化输出：`output_type` 非空时**只有协调者**（终端、负责综合）产出契约并挂
+    `output_guardrails`；as_tool 专家仍返回文字喂给协调者，不套 output_type。
     """
+    structured = output_type is not None
     components = parse_index_components(docs_root)
     local = [c for c in components if c.source == "local"]
     specialist_tools = [
@@ -269,13 +309,18 @@ def build_coordinator_agent(
         )
         for c in local
     ]
+    coord_instructions = _coordinator_instructions(local)
+    if structured:
+        coord_instructions += STRUCTURED_CONTRACT_SUFFIX
     coordinator = Agent[DocsContext](
         name="coordinator",
         handoff_description=handoff_description,
-        instructions=_coordinator_instructions(local),
+        instructions=coord_instructions,
         tools=specialist_tools,
         model=router.for_role("coordinator")[1],
         input_guardrails=list(input_guardrails or []),
+        output_type=output_type,
+        output_guardrails=list(output_guardrails or []),
     )
     return coordinator, local
 
@@ -324,6 +369,8 @@ def build_auto_agent(
     specialist_max_turns: int = 12,
     input_guardrails: list | None = None,
     specialist_extra_tools: list | None = None,
+    output_type: object | None = None,
+    output_guardrails: list | None = None,
 ) -> tuple[Agent[DocsContext], list[Component]]:
     """构造自适应分诊 agent：handoffs = 各组件专家 + 跨组件协调者。
 
@@ -333,11 +380,21 @@ def build_auto_agent(
     护栏：`input_guardrails` 只挂在入口分诊台（输入护栏在入口跑一次即可）；写审批工具
     （`specialist_extra_tools`）挂到两条路径的专家——直接 handoff 的专家、以及 coordinator
     逃生口内 as_tool 的专家。
+
+    结构化输出：`output_type` 非空时，三类终端都产出契约——直接 handoff 的专家、coordinator
+    逃生口（其内部 as_tool 专家仍回文字）、以及分诊自答。
     """
+    structured = output_type is not None
     components = parse_index_components(docs_root)
     local = [c for c in components if c.source == "local"]
     specialists = [
-        build_specialist_agent(c, router.for_role(c.dir)[1], extra_tools=specialist_extra_tools)
+        build_specialist_agent(
+            c,
+            router.for_role(c.dir)[1],
+            extra_tools=specialist_extra_tools,
+            output_type=output_type,
+            output_guardrails=output_guardrails,
+        )
         for c in local
     ]
     coordinator, _ = build_coordinator_agent(
@@ -346,13 +403,20 @@ def build_auto_agent(
         specialist_max_turns=specialist_max_turns,
         handoff_description=_AUTO_COORDINATOR_HANDOFF_DESC,
         specialist_extra_tools=specialist_extra_tools,
+        output_type=output_type,
+        output_guardrails=output_guardrails,
     )
+    instructions = _auto_triage_instructions(local)
+    if structured:
+        instructions += STRUCTURED_CONTRACT_SUFFIX
     triage = Agent[DocsContext](
         name="triage",
-        instructions=_auto_triage_instructions(local),
+        instructions=instructions,
         tools=list(DOC_TOOLS),  # 仅用于"能力介绍"时读 INDEX；组件问题一律转交
         handoffs=[*specialists, coordinator],
         model=router.for_role("triage")[1],
         input_guardrails=list(input_guardrails or []),
+        output_type=output_type,
+        output_guardrails=list(output_guardrails or []),
     )
     return triage, local

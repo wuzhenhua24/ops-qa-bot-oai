@@ -142,7 +142,7 @@ def build_system_prompt(docs_root: Path) -> str:
 # 结构化输出模式（差异化 #1）：复用上面的领域规则（工作流程 / 路由 / 防幻觉 / 反问
 # 判断），但**不再 emit `<<MARKER>>` 文本**，而是把路由决策、来源、追问填进
 # AnswerContract 的字段里（schema 由 SDK 强制校验）。
-_STRUCTURED_SUFFIX = """
+STRUCTURED_CONTRACT_SUFFIX = """
 
 # 输出方式（重要：本模式不要写任何 `<<...>>` 标记）
 
@@ -166,4 +166,4 @@ _STRUCTURED_SUFFIX = """
 
 def build_structured_system_prompt(docs_root: Path) -> str:
     """结构化输出模式的 system prompt：领域规则同上，但用字段取代 `<<MARKER>>`。"""
-    return SYSTEM_PROMPT_TEMPLATE.format(docs_root=str(docs_root)) + _STRUCTURED_SUFFIX
+    return SYSTEM_PROMPT_TEMPLATE.format(docs_root=str(docs_root)) + STRUCTURED_CONTRACT_SUFFIX

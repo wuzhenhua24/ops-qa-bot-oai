@@ -267,23 +267,47 @@ class OpsQABot:
         self._history = []
 
     def _get_structured_agent(self) -> Agent[DocsContext]:
-        """懒构造结构化输出 agent：同样的工具/模型，但 output_type=AnswerContract。
+        """懒构造结构化输出图：结构化输出与路由**正交**——按 self.mode 复用同一套编排图，
+        只是终端 agent 的 `output_type=AnswerContract`（multi/auto 是各专家、coordinator 是
+        协调者、single 是单 agent）。
 
         用非严格 schema（strict_json_schema=False）下发，以兼容 Claude / 智谱 / 火山等
-        不支持 OpenAI strict 结构化输出的 provider。
+        不支持 OpenAI strict 结构化输出的 provider。护栏：结构化走 `answer_structured`
+        （非流式、无写审批中断循环），故只挂输入注入护栏 + 输出来源护栏，不挂写审批工具。
         """
-        if self._structured_agent is None:
-            self._structured_agent = Agent(
+        if self._structured_agent is not None:
+            return self._structured_agent
+        out = AgentOutputSchema(AnswerContract, strict_json_schema=False)
+        og = [citation_output_guardrail] if self.guardrails else []
+        gr: dict[str, Any] = {
+            "input_guardrails": self._input_guardrails,
+            "output_type": out,
+            "output_guardrails": og,
+        }
+        if self.mode == "coordinator":
+            agent, _ = build_coordinator_agent(
+                self.docs_root, self.model_router or build_model_router(), **gr
+            )
+        elif self.mode == "auto":
+            agent, _ = build_auto_agent(
+                self.docs_root, self.model_router or build_model_router(), **gr
+            )
+        elif self.mode == "multi":
+            agent, _ = build_triage_agent(
+                self.docs_root, self.model_router or build_model_router(), **gr
+            )
+        else:  # single：单 agent + whole-docs 契约 prompt
+            agent = Agent(
                 name="ops-qa-bot-structured",
                 instructions=build_structured_system_prompt(self.docs_root),
                 tools=list(DOC_TOOLS),
                 model=self.model_choice.model,
-                output_type=AgentOutputSchema(AnswerContract, strict_json_schema=False),
-                # 差异化 #4：结构化模式下加输入注入护栏 + 输出来源护栏（引用不实就 trip）。
+                output_type=out,
                 input_guardrails=self._input_guardrails,
-                output_guardrails=[citation_output_guardrail] if self.guardrails else [],
+                output_guardrails=og,
             )
-        return self._structured_agent
+        self._structured_agent = agent
+        return agent
 
     def _run_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"context": self._context}
