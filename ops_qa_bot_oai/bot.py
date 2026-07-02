@@ -225,21 +225,28 @@ class OpsQABot:
         self._agent: Agent[DocsContext]
         self.components: list[Component]
         self.model_router: ModelRouter | None = None
+        # 护栏是横切关注点，与编排模式正交：输入注入护栏挂入口 agent，写审批工具挂各专家。
+        gr = {
+            "input_guardrails": self._input_guardrails,
+            "specialist_extra_tools": self._extra_tools,
+        }
         if mode == "coordinator":
             # 跨组件协作：协调者把各组件专家当工具（agents-as-tools）调用、综合根因。
             self.model_router = model_router or build_model_router()
             self._agent, self.components = build_coordinator_agent(
-                self.docs_root, self.model_router
+                self.docs_root, self.model_router, **gr
             )
         elif mode == "auto":
             # 自适应默认：分诊台 handoff 给单专家（常见）或跨组件协调者（少数）。
             self.model_router = model_router or build_model_router()
-            self._agent, self.components = build_auto_agent(self.docs_root, self.model_router)
+            self._agent, self.components = build_auto_agent(self.docs_root, self.model_router, **gr)
         elif mode == "multi":
             # 差异化 #3：入口换成分诊 agent，handoff 给从 INDEX.md 动态生成的组件专家。
             # 差异化 #2：用 ModelRouter 按角色/组件分配模型（分诊便宜、专家强）。
             self.model_router = model_router or build_model_router()
-            self._agent, self.components = build_triage_agent(self.docs_root, self.model_router)
+            self._agent, self.components = build_triage_agent(
+                self.docs_root, self.model_router, **gr
+            )
         else:  # single
             self.components = []
             self._agent = Agent(

@@ -99,10 +99,11 @@ async def run_once(
 ) -> None:
     """一次性问一个问题就退出（适合脚本调用 / 批量跑题）。"""
     model_choice = resolve_model()
-    if mode != "single" and (structured or guardrails):
-        # 编排模式（auto/multi/coordinator）走自由文本 answer()，不与结构化/护栏叠加。
-        print("[注意] 结构化输出 / 护栏暂不与编排模式(auto/multi/coordinator)叠加，本次忽略。\n")
-        structured = guardrails = False
+    if mode != "single" and structured:
+        # 结构化输出走独立的单 agent output_type 路径，不与编排模式叠加。护栏是横切关注点，
+        # 与任何模式并存（见 OpsQABot：注入护栏挂入口、写审批挂专家）。
+        print("[注意] 结构化输出仅 single 模式，编排模式下忽略。\n")
+        structured = False
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
@@ -172,9 +173,9 @@ async def run_repl(
     guardrails: bool = False,
 ) -> None:
     model_choice = resolve_model()
-    if mode != "single" and (structured or guardrails):
-        print("[注意] 结构化输出 / 护栏暂不与编排模式(auto/multi/coordinator)叠加，本次忽略。")
-        structured = guardrails = False
+    if mode != "single" and structured:
+        print("[注意] 结构化输出仅 single 模式，编排模式下忽略。护栏可与任何模式并存。")
+        structured = False
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
@@ -304,8 +305,8 @@ def main() -> None:
     parser.add_argument(
         "--guardrails",
         action="store_true",
-        help="开启输入注入护栏 + 写操作审批（HITL）；结构化模式下额外加输出来源护栏。"
-        "仅 single 模式生效",
+        help="开启输入注入护栏 + 写操作审批（HITL），与任何 --mode 并存；"
+        "结构化模式下额外加输出来源护栏。开启后走非流式审批路径",
     )
     args = parser.parse_args()
     docs_root = Path(args.docs).resolve()

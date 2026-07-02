@@ -543,6 +543,40 @@ def test_auto_triage_handoffs_specialists_plus_coordinator(tmp_path):
     assert coord.handoff_description
 
 
+def test_guardrails_wired_into_all_orchestration_modes(tmp_path):
+    """护栏与编排模式正交：input_guardrails 挂入口 agent，写工具挂各专家。"""
+    from ops_qa_bot_oai.actions import WriteCommandLog, make_write_command_tool
+    from ops_qa_bot_oai.guardrails import injection_input_guardrail
+    from ops_qa_bot_oai.model import ModelRouter
+    from ops_qa_bot_oai.orchestration import (
+        build_auto_agent,
+        build_coordinator_agent,
+        build_triage_agent,
+    )
+
+    root = _coord_docs(tmp_path)
+    router = ModelRouter(
+        provider="openai", default_name="gpt-5", overrides={}, _make=lambda n: (n, n)
+    )
+    ig = [injection_input_guardrail]
+    wt = [make_write_command_tool(WriteCommandLog())]
+
+    # multi：入口分诊挂输入护栏，各专家（handoff 目标）带写工具
+    triage, _ = build_triage_agent(root, router, input_guardrails=ig, specialist_extra_tools=wt)
+    assert triage.input_guardrails == ig
+    spec = next(h for h in triage.handoffs if getattr(h, "name", "").endswith("_specialist"))
+    assert "request_write_command" in {t.name for t in spec.tools}
+
+    # auto：入口分诊挂护栏（coordinator 逃生口在 handoff 里）
+    triage2, _ = build_auto_agent(root, router, input_guardrails=ig, specialist_extra_tools=wt)
+    assert triage2.input_guardrails == ig
+    assert any(getattr(h, "name", None) == "coordinator" for h in triage2.handoffs)
+
+    # coordinator：入口协调者挂输入护栏
+    coord, _ = build_coordinator_agent(root, router, input_guardrails=ig, specialist_extra_tools=wt)
+    assert coord.input_guardrails == ig
+
+
 def test_index_picks_up_gateway_container():
     # 项目自带 docs 已登记 Gateway / Container（跨组件场景素材）
     from ops_qa_bot_oai.orchestration import parse_index_components

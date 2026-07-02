@@ -103,8 +103,17 @@ def parse_index_components(docs_root: Path) -> list[Component]:
     return components
 
 
-def _specialist_instructions(c: Component) -> str:
+def _specialist_instructions(c: Component, *, has_write_tool: bool = False) -> str:
     owner = c.open_id or "（INDEX.md 未登记 open_id）"
+    # 带写审批工具时，明确引导专家把"写/变更"走 request_write_command（挂起等人批），而不是
+    # 把命令直接写进答案——否则"危险操作标 ⚠️ 风险"那句会把它带向纯文字，工具形同虚设。
+    write_block = (
+        "\n- **需要执行写/变更命令时**（重启 / 改配置 / flush / 删数据 / 改库参数等），"
+        "不要把命令直接写进答案让用户去跑，而是调用 `request_write_command` 工具**提议**——"
+        "它会挂起等人工审批，批准后才登记执行；只读诊断 / 纯知识问答不要用它。"
+        if has_write_tool
+        else ""
+    )
     return f"""你是 **{c.name}** 运维问答专家，只负责 {c.name} 这一个组件。它的文档全部在 `{c.dir}/` 目录下。
 
 # 工作流程
@@ -115,19 +124,25 @@ def _specialist_instructions(c: Component) -> str:
 # 回答规范
 - **引用来源**：每个事实结论后附 `（来源：{c.dir}/<文件>.md）`。
 - **找不到就说找不到**：文档没有就明说"文档中未找到相关内容"，**不要编**，并建议联系负责人（open_id: {owner}）。
-- **危险操作**（删除/重启/flush/改主库等）显式标 ⚠️ 风险，并引用文档里的对应警告。
+- **危险操作**（删除/重启/flush/改主库等）显式标 ⚠️ 风险，并引用文档里的对应警告。{write_block}
 - 中文、简洁、分点。
 - 信息不足以准确回答（缺版本/环境/报错码且会让答案分叉）时，先反问 1-2 个关键点，不要硬答。
 """
 
 
-def build_specialist_agent(c: Component, model: str | Model) -> Agent[DocsContext]:
-    """为一个组件构造专家 agent：作用域限定在它自己的目录。"""
+def build_specialist_agent(
+    c: Component, model: str | Model, *, extra_tools: list | None = None
+) -> Agent[DocsContext]:
+    """为一个组件构造专家 agent：作用域限定在它自己的目录。
+
+    `extra_tools` 用于把横切工具（如写操作审批 `request_write_command`）挂到专家上——
+    多/自适应/协调者模式下真正答题、可能提议写操作的是专家，护栏得挂在这一层。
+    """
     return Agent[DocsContext](
         name=f"{c.dir}_specialist",
         handoff_description=f"{c.name} 运维问题（{c.coverage}）",
-        instructions=_specialist_instructions(c),
-        tools=list(DOC_TOOLS),
+        instructions=_specialist_instructions(c, has_write_tool=bool(extra_tools)),
+        tools=list(DOC_TOOLS) + list(extra_tools or []),
         model=model,
     )
 
@@ -152,23 +167,34 @@ def _triage_instructions(components: list[Component]) -> str:
 
 
 def build_triage_agent(
-    docs_root: Path, router: ModelRouter
+    docs_root: Path,
+    router: ModelRouter,
+    *,
+    input_guardrails: list | None = None,
+    specialist_extra_tools: list | None = None,
 ) -> tuple[Agent[DocsContext], list[Component]]:
     """构造分诊 agent（持有各 local 组件专家的 handoff）+ 返回解析到的组件。
 
     多模型路由（#2）：分诊用 `router.for_role("triage")`，每个专家用
     `router.for_role(component.dir)`——无覆盖时都回退到默认模型（等价单模型）。
     只为 `local` 来源的组件建专家（feishu 来源无本地文档，本核心版不支持）。
+
+    护栏（横切，与编排模式正交）：`input_guardrails` 挂在入口分诊 agent 上（输入护栏
+    只在入口 agent 对用户输入跑一次）；`specialist_extra_tools`（如写审批工具）挂到各专家。
     """
     components = parse_index_components(docs_root)
     local = [c for c in components if c.source == "local"]
-    specialists = [build_specialist_agent(c, router.for_role(c.dir)[1]) for c in local]
+    specialists = [
+        build_specialist_agent(c, router.for_role(c.dir)[1], extra_tools=specialist_extra_tools)
+        for c in local
+    ]
     triage = Agent[DocsContext](
         name="triage",
         instructions=_triage_instructions(local),
         tools=list(DOC_TOOLS),  # 仅用于"能力介绍"时读 INDEX；组件问题一律转交
         handoffs=list(specialists),
         model=router.for_role("triage")[1],
+        input_guardrails=list(input_guardrails or []),
     )
     return triage, local
 
@@ -212,6 +238,8 @@ def build_coordinator_agent(
     *,
     specialist_max_turns: int = 12,
     handoff_description: str | None = None,
+    input_guardrails: list | None = None,
+    specialist_extra_tools: list | None = None,
 ) -> tuple[Agent[DocsContext], list[Component]]:
     """构造跨组件协调者：各 local 组件专家以 `as_tool` 暴露给协调者调用。
 
@@ -221,11 +249,17 @@ def build_coordinator_agent(
 
     `handoff_description` 仅在 auto 模式下把协调者当作分诊台的 handoff 目标时用到——
     分诊台据此判断"何时转交给它"。作为独立入口（coordinator 模式）时留空即可。
+
+    护栏：`input_guardrails` 挂在入口协调者上（coordinator 模式下它是入口）；
+    `specialist_extra_tools`（写审批工具）挂到 as_tool 的专家——SDK 会把嵌套子 run 的
+    needs_approval 中断冒到顶层，由 answer_guarded 统一 approve/reject。
     """
     components = parse_index_components(docs_root)
     local = [c for c in components if c.source == "local"]
     specialist_tools = [
-        build_specialist_agent(c, router.for_role(c.dir)[1]).as_tool(
+        build_specialist_agent(
+            c, router.for_role(c.dir)[1], extra_tools=specialist_extra_tools
+        ).as_tool(
             tool_name=f"ask_{c.dir}",
             tool_description=(
                 f"就某现象咨询 {c.name} 组件专家（覆盖：{c.coverage}）。"
@@ -241,6 +275,7 @@ def build_coordinator_agent(
         instructions=_coordinator_instructions(local),
         tools=specialist_tools,
         model=router.for_role("coordinator")[1],
+        input_guardrails=list(input_guardrails or []),
     )
     return coordinator, local
 
@@ -283,21 +318,34 @@ def _auto_triage_instructions(components: list[Component]) -> str:
 
 
 def build_auto_agent(
-    docs_root: Path, router: ModelRouter, *, specialist_max_turns: int = 12
+    docs_root: Path,
+    router: ModelRouter,
+    *,
+    specialist_max_turns: int = 12,
+    input_guardrails: list | None = None,
+    specialist_extra_tools: list | None = None,
 ) -> tuple[Agent[DocsContext], list[Component]]:
     """构造自适应分诊 agent：handoffs = 各组件专家 + 跨组件协调者。
 
     分诊按问题决定转交给单个专家（常见）还是 coordinator（跨组件）。复用
     `build_specialist_agent` / `build_coordinator_agent`，不重写编排。
+
+    护栏：`input_guardrails` 只挂在入口分诊台（输入护栏在入口跑一次即可）；写审批工具
+    （`specialist_extra_tools`）挂到两条路径的专家——直接 handoff 的专家、以及 coordinator
+    逃生口内 as_tool 的专家。
     """
     components = parse_index_components(docs_root)
     local = [c for c in components if c.source == "local"]
-    specialists = [build_specialist_agent(c, router.for_role(c.dir)[1]) for c in local]
+    specialists = [
+        build_specialist_agent(c, router.for_role(c.dir)[1], extra_tools=specialist_extra_tools)
+        for c in local
+    ]
     coordinator, _ = build_coordinator_agent(
         docs_root,
         router,
         specialist_max_turns=specialist_max_turns,
         handoff_description=_AUTO_COORDINATOR_HANDOFF_DESC,
+        specialist_extra_tools=specialist_extra_tools,
     )
     triage = Agent[DocsContext](
         name="triage",
@@ -305,5 +353,6 @@ def build_auto_agent(
         tools=list(DOC_TOOLS),  # 仅用于"能力介绍"时读 INDEX；组件问题一律转交
         handoffs=[*specialists, coordinator],
         model=router.for_role("triage")[1],
+        input_guardrails=list(input_guardrails or []),
     )
     return triage, local
