@@ -208,17 +208,41 @@ def aggregate(scores: list[CaseScore]) -> dict[str, Any]:
 # 实际跑 bot（需要 API key）
 # ---------------------------------------------------------------------------
 
-# 评测轴（不同于 OpsQABot 编排模式）：structured/free 走单 agent，multi/auto 走对应编排。
-MODES = ("structured", "free", "multi", "auto")
-# 评测轴 → OpsQABot 编排模式；能路由（handoff）的轴才计路由准确率。
-_MODE_TO_BOT = {"structured": "single", "free": "single", "multi": "multi", "auto": "auto"}
-_ROUTING_MODES = {"multi", "auto"}
+# 评测轴 token：路由(single/multi/auto/coordinator) × 输出格式(自由文本/结构化) 两轴正交。
+# single 保留友好别名 free（自由文本）/ structured（结构化）；其余路由用 <routing>[+structured]。
+MODES = (
+    "free",
+    "structured",
+    "multi",
+    "multi+structured",
+    "auto",
+    "auto+structured",
+    "coordinator",
+    "coordinator+structured",
+)
+_ROUTING_MODES = {"multi", "auto"}  # 有分诊路由决策、才计路由准确率
 
 
-async def _run_case(bot: OpsQABot, mode: str, question: str, docs_root: Path) -> RunOutcome:
+def _parse_eval_mode(mode: str) -> tuple[str, bool]:
+    """把评测轴 token 解析成 (路由模式, 是否结构化)。
+
+    `free`/`structured` → single；`<routing>` / `<routing>+structured` → 对应路由 + 格式。
+    """
+    structured = mode.endswith("structured")
+    routing = mode.rsplit("+", 1)[0]
+    if routing in ("free", "structured"):
+        routing = "single"
+    return routing, structured
+
+
+async def _run_case(
+    bot: OpsQABot, routing: str, structured: bool, question: str, docs_root: Path
+) -> RunOutcome:
     bot.reset()  # 每题独立会话，避免历史串味
     t0 = time.perf_counter()
-    if mode == "structured":
+    # 仅有分诊路由决策的路由模式记路由；single/coordinator route 置 None → 不计路由准确率。
+    scored_route = routing in _ROUTING_MODES
+    if structured:
         sa = await bot.answer_structured(question)
         latency = int((time.perf_counter() - t0) * 1000)
         return RunOutcome(
@@ -229,8 +253,8 @@ async def _run_case(bot: OpsQABot, mode: str, question: str, docs_root: Path) ->
             usage=sa.usage,
             num_turns=sa.num_turns,
             latency_ms=latency,
+            route=normalize_route(sa.route) if scored_route else None,
         )
-    # free / multi / auto 都走自由文本 answer()
     r = await bot.answer(question)
     latency = int((time.perf_counter() - t0) * 1000)
     cites = extract_citations(r.text)
@@ -242,8 +266,7 @@ async def _run_case(bot: OpsQABot, mode: str, question: str, docs_root: Path) ->
         usage=r.usage,
         num_turns=r.num_turns,
         latency_ms=latency,
-        # 仅能路由的模式记路由；单 agent 模式（free/structured）route 置 None → 不计入路由准确率。
-        route=normalize_route(r.route) if mode in _ROUTING_MODES else None,
+        route=normalize_route(r.route) if scored_route else None,
     )
 
 
@@ -263,14 +286,11 @@ async def run_config(
     on_case: Any = None,
 ) -> ConfigResult:
     """在某个模式下跑完整题集并打分。`on_case(case, outcome, score)` 可选回调（进度）。"""
-    bot = OpsQABot(
-        docs_root=docs_root,
-        model_choice=model_choice,
-        mode=_MODE_TO_BOT.get(mode, "single"),
-    )
+    routing, structured = _parse_eval_mode(mode)
+    bot = OpsQABot(docs_root=docs_root, model_choice=model_choice, mode=routing)
     scores: list[CaseScore] = []
     for case in cases:
-        outcome = await _run_case(bot, mode, case.question, docs_root)
+        outcome = await _run_case(bot, routing, structured, case.question, docs_root)
         score = score_case(case, outcome)
         scores.append(score)
         if on_case is not None:

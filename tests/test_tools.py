@@ -808,6 +808,19 @@ def test_aggregate_rates():
     assert agg["avg_total_tokens"] == 200.0
 
 
+def test_parse_eval_mode():
+    from ops_qa_bot_oai.evaluate import _parse_eval_mode
+
+    # single 的友好别名
+    assert _parse_eval_mode("free") == ("single", False)
+    assert _parse_eval_mode("structured") == ("single", True)
+    # 路由 × 格式两轴
+    assert _parse_eval_mode("multi") == ("multi", False)
+    assert _parse_eval_mode("multi+structured") == ("multi", True)
+    assert _parse_eval_mode("auto+structured") == ("auto", True)
+    assert _parse_eval_mode("coordinator+structured") == ("coordinator", True)
+
+
 def test_load_cases_from_shipped_dataset():
     cases = load_cases(Path(__file__).resolve().parent.parent / "eval" / "cases.json")
     ids = {c.id for c in cases}

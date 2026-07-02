@@ -27,6 +27,7 @@ from agents import (
     Agent,
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
+    ModelBehaviorError,
     OutputGuardrailTripwireTriggered,
     Runner,
 )
@@ -132,6 +133,8 @@ class StructuredAnswer:
     subtype: str = "success"
     # 命中输出来源护栏（#4）时为拦截原因；正常为 None。
     guardrail_blocked: str | None = None
+    # 最终落点 agent 名（handoff 目标）；None 表示入口 agent 自答。评测路由准确率用。
+    route: str | None = None
 
 
 @dataclass
@@ -418,6 +421,17 @@ class OpsQABot:
                 ),
                 subtype="error_max_turns",
             )
+        except ModelBehaviorError as e:
+            # 模型多次未能产出合法契约 JSON（部分 provider 的 json_schema 实现不规范，容错
+            # 解析后仍失败）。退化成 reject 契约，别让单题掀翻批量评测。
+            logger.warning("结构化输出解析失败（ModelBehaviorError）: %s", str(e)[:200])
+            return StructuredAnswer(
+                contract=AnswerContract(
+                    decision=Decision.reject,
+                    answer="模型未能产出合法的结构化契约（provider 的 json_schema 输出不规范），已跳过本题。",  # noqa: E501
+                ),
+                subtype="error_bad_output",
+            )
         except InputGuardrailTripwireTriggered as e:
             # 差异化 #4：输入注入护栏拦截（结构化模式同样生效）。
             reason = _guardrail_reason(e)
@@ -450,6 +464,12 @@ class OpsQABot:
         except Exception:  # noqa: BLE001
             logger.debug("to_input_list() 失败，保留旧历史", exc_info=True)
 
+        # 路由：非流式没有 handoff 事件流，用 last_agent 与入口 agent 对比推断——
+        # 落点 != 入口 说明发生过 handoff（专家 / 协调者），落点 == 入口即分诊自答。
+        entry_name = getattr(agent, "name", None)
+        last_name = getattr(getattr(result, "last_agent", None), "name", None)
+        route = last_name if (last_name and last_name != entry_name) else None
+
         invalid = validate_citations(self.docs_root, contract.citations)
         if invalid:
             logger.warning("结构化答案引用了不存在/越界的来源: %s", invalid)
@@ -459,6 +479,7 @@ class OpsQABot:
             usage=_usage_dict(result),
             num_turns=_num_turns(result),
             subtype=subtype,
+            route=route,
         )
 
     async def answer_guarded(self, question: str, approver: Any = None) -> GuardedAnswer:

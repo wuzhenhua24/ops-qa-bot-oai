@@ -25,8 +25,9 @@ from pydantic import BaseModel, Field
 from .tools import _resolve_within
 
 # 有些 provider 的 json_schema 实现会把 JSON 裹在 ```json ... ``` 代码围栏里返回
-# （实测智谱 GLM 如此），SDK 直接解析会 ModelBehaviorError。这里匹配整段围栏。
-_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n(.*?)\n?\s*```\s*$", re.DOTALL | re.IGNORECASE)
+# （实测智谱 GLM 如此，有时前面还带一段前言文字），SDK 直接解析会 ModelBehaviorError。
+# 用 search（非锚定）抓第一个围栏块，兼容围栏前的前言。
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n?```", re.DOTALL | re.IGNORECASE)
 
 
 class FenceTolerantOutputSchema(AgentOutputSchema):
@@ -41,16 +42,25 @@ class FenceTolerantOutputSchema(AgentOutputSchema):
     """
 
     def validate_json(self, json_str: str):
-        m = _JSON_FENCE_RE.match(json_str)
-        text = m.group(1) if m else json_str
+        # 先按 SDK 原生严格路径试原始串：合法 JSON 直接过，也不会误伤 answer 里的内部 ``` 代码块。
         try:
-            return super().validate_json(text)
-        except Exception:
-            # 宽松兜底：① 容忍字符串内裸控制字符（strict=False）；② 把未转义的反斜杠补成
-            # `\\`（如命令 `SHOW SLAVE STATUS\G` 里的 `\G` 是非法 JSON 转义）。再按 schema 校验。
-            repaired = re.sub(r'\\(?![\\"/bfnrtu])', r"\\\\", text)
-            data = json.loads(repaired, strict=False)
-            return self._type_adapter.validate_python(data)
+            return super().validate_json(json_str)
+        except Exception as original:
+            # 失败了再容错：抓（可能带前言的）围栏块 → 严格试 → 宽松试（裸控制字符 + 补反斜杠）。
+            m = _JSON_FENCE_RE.search(json_str)
+            text = m.group(1) if m else json_str
+            if text != json_str:
+                try:
+                    return super().validate_json(text)
+                except Exception:
+                    pass
+            try:
+                repaired = re.sub(r'\\(?![\\"/bfnrtu])', r"\\\\", text)
+                return self._type_adapter.validate_python(json.loads(repaired, strict=False))
+            except Exception:
+                # 兜底也救不了 → 抛回 SDK 原始异常（通常是 ModelBehaviorError），让 SDK 按既有
+                # 逻辑重试；别抛 raw JSONDecodeError 破坏重试契约。
+                raise original from None
 
 
 class Decision(str, Enum):

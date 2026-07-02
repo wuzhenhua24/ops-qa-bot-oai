@@ -46,8 +46,12 @@ def main() -> None:
     parser.add_argument("--docs", default=str(_ROOT / "docs"), help="文档根目录")
     parser.add_argument(
         "--modes",
-        default=",".join(MODES),
-        help=f"逗号分隔的模式，可选 {'/'.join(MODES)}（默认全跑）",
+        default="free,structured,multi,auto",
+        help=(
+            "逗号分隔的评测轴。路由 × 输出格式两轴：single 用 free/structured，"
+            f"其余用 <routing>[+structured]。全部可选：{','.join(MODES)}。"
+            "默认 free,structured,multi,auto；对比结构化路由可加 multi+structured 等"
+        ),
     )
     parser.add_argument("--detail", action="store_true", help="额外打印逐题对错明细")
     args = parser.parse_args()
