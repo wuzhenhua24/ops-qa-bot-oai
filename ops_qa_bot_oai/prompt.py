@@ -144,9 +144,11 @@ def build_system_prompt(docs_root: Path) -> str:
 # AnswerContract 的字段里（schema 由 SDK 强制校验）。
 STRUCTURED_CONTRACT_SUFFIX = """
 
-# 输出方式（重要：本模式不要写任何 `<<...>>` 标记）
+# 输出格式（最高优先级，覆盖上面一切关于"分点/markdown 正文/先给结论再列证据"的表述）
 
-这一轮你必须产出一个**结构化对象**（系统会按 schema 校验），字段含义：
+**本轮只输出一个符合 schema 的 JSON 对象，除此之外不要输出任何字符**：没有前言、没有寒暄、
+没有 markdown 标题、没有 ``` 代码围栏、没有 `<<...>>` 标记。给用户看的正文（含分点、根因链等）
+一律写进 JSON 的 `answer` 字段里，而不是直接输出。系统会按 schema 校验，字段含义：
 
 - `decision`：四选一——
   - `answer`：能基于文档回答 → 正常作答。

@@ -577,6 +577,29 @@ def test_guardrails_wired_into_all_orchestration_modes(tmp_path):
     assert coord.input_guardrails == ig
 
 
+def test_fence_tolerant_output_schema():
+    """结构化输出容错：围栏 / 裸控制字符 / 非法反斜杠转义都能解析出契约。"""
+    from ops_qa_bot_oai.schema import AnswerContract, Decision, FenceTolerantOutputSchema
+
+    schema = FenceTolerantOutputSchema(AnswerContract, strict_json_schema=False)
+
+    # 1. 合法 JSON 走 SDK 原生严格路径
+    c = schema.validate_json('{"decision":"answer","answer":"hi"}')
+    assert c.decision == Decision.answer and c.answer == "hi"
+
+    # 2. ```json 代码围栏（GLM 常见）
+    c = schema.validate_json('```json\n{"decision":"answer","answer":"x"}\n```')
+    assert c.answer == "x"
+
+    # 3. 字符串里的裸换行（标准 JSON 非法，宽松兜底容忍）
+    c = schema.validate_json('{"decision":"answer","answer":"line1\nline2"}')
+    assert "line1" in c.answer and "line2" in c.answer
+
+    # 4. 非法反斜杠转义（命令 `SHOW SLAVE STATUS\\G` 里的 \\G），补成 \\\\G 后解析
+    c = schema.validate_json('{"decision":"answer","answer":"run SHOW SLAVE STATUS\\G now"}')
+    assert "STATUS" in c.answer and "now" in c.answer
+
+
 def test_structured_output_type_orthogonal_to_mode(tmp_path):
     """结构化输出与路由正交：output_type 挂到各模式的终端 agent（专家/协调者/分诊自答）。"""
     from agents import AgentOutputSchema

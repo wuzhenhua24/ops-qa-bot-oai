@@ -188,7 +188,15 @@ uv run python run.py --ask "接口偶发 502 根因？" --mode auto --structured
 - `citations`：答案依据的文档路径列表 —— 拿到后**用代码逐条核对是否真实存在**（把"必须引用真实文档"从 prompt 自律升级成硬校验，编造/越界的来源会被标 ✗ 并告警）
 - `escalate_to` / `escalate_dir` / `followups` / `confidence`
 
-用**非严格** schema 下发（`strict_json_schema=False`）放宽 OpenAI 的 strict 约束。**前提是 provider 支持 `json_schema` 的 `response_format`**——OpenAI、智谱 GLM 等支持；部分第三方端点（如火山 ark 上的 deepseek）**完全不支持** `json_schema`，此时 `--structured` 会报 `400 json_schema is not supported`，需换用支持的模型（与本模式在哪个 `--mode` 无关）。自由文本 + 标记的路径（`answer()` / 不带 `--structured`）不依赖 `json_schema`，任何 provider 都能用。
+用**非严格** schema 下发（`strict_json_schema=False`）放宽 OpenAI 的 strict 约束。第三方端点对 `json_schema` 的支持参差不齐，`FenceTolerantOutputSchema`（`schema.py`）做了容错解析尽量把契约救出来：
+
+| provider | `json_schema` 支持 | 结构化可用性 |
+|---|---|---|
+| OpenAI | 原生严格 | ✅ 直接可用 |
+| 智谱 GLM | 接受，但输出不规范（裹 ```json 围栏、字符串塞裸换行、命令里 `\G` 等非法转义） | ✅ 容错解析后可用（剥围栏 + `strict=False` 宽松解析 + 补全反斜杠，实测 single/multi/auto 均出契约）|
+| 火山 ark 的 deepseek | **完全不支持**（`400 json_schema is not supported`） | ❌ 需换支持的模型 |
+
+容错只在严格解析失败时兜底、不放宽 schema 本身（字段仍按 `AnswerContract` 校验）。自由文本 + 标记的路径（`answer()` / 不带 `--structured`）不依赖 `json_schema`，任何 provider 都能用。
 
 ## 多 agent 编排模式（差异化原型 #3）
 

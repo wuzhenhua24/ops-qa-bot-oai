@@ -25,7 +25,6 @@ from typing import Any
 
 from agents import (
     Agent,
-    AgentOutputSchema,
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
     OutputGuardrailTripwireTriggered,
@@ -46,7 +45,7 @@ from .orchestration import (
     build_triage_agent,
 )
 from .prompt import build_structured_system_prompt, build_system_prompt
-from .schema import AnswerContract, Decision, validate_citations
+from .schema import AnswerContract, Decision, FenceTolerantOutputSchema, validate_citations
 from .tools import DOC_TOOLS, DocsContext
 
 logger = logging.getLogger(__name__)
@@ -277,7 +276,9 @@ class OpsQABot:
         """
         if self._structured_agent is not None:
             return self._structured_agent
-        out = AgentOutputSchema(AnswerContract, strict_json_schema=False)
+        # 用围栏容忍版：GLM 等会把 JSON 裹在 ```json 围栏里 + 字符串里塞裸换行，剥围栏 +
+        # 宽松解析后再校验（strict=False 的 provider 常见）。
+        out = FenceTolerantOutputSchema(AnswerContract, strict_json_schema=False)
         og = [citation_output_guardrail] if self.guardrails else []
         gr: dict[str, Any] = {
             "input_guardrails": self._input_guardrails,

@@ -117,6 +117,13 @@ def _specialist_instructions(
         if has_write_tool
         else ""
     )
+    # 结构化时来源走契约的 citations 字段，正文别写行内来源——否则跟契约要求打架、把模型带偏。
+    cite_line = (
+        "- **来源**：填到契约的 `citations` 字段（`{dir}/<文件>.md` 相对路径），正文里"
+        "**不要**写 `（来源：...）`。".format(dir=c.dir)
+        if structured
+        else f"- **引用来源**：每个事实结论后附 `（来源：{c.dir}/<文件>.md）`。"
+    )
     return f"""你是 **{c.name}** 运维问答专家，只负责 {c.name} 这一个组件。它的文档全部在 `{c.dir}/` 目录下。
 
 # 工作流程
@@ -125,7 +132,7 @@ def _specialist_instructions(
 3. 基于读到的内容回答。
 
 # 回答规范
-- **引用来源**：每个事实结论后附 `（来源：{c.dir}/<文件>.md）`。
+{cite_line}
 - **找不到就说找不到**：文档没有就明说"文档中未找到相关内容"，**不要编**，并建议联系负责人（open_id: {owner}）。
 - **危险操作**（删除/重启/flush/改主库等）显式标 ⚠️ 风险，并引用文档里的对应警告。{write_block}
 - 中文、简洁、分点。
