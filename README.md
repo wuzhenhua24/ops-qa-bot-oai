@@ -307,6 +307,8 @@ glm · multi   100% (10)  50% (2)   100% (7)  100% (8)  1200     3.0  800
 glm · auto    100% (10)  100% (2)  100% (7)  100% (8)  1400     3.2  950
 ```
 
+真实跑出来的快照（含 `auto` vs `auto+structured` 的对比与结论）记录在 [`eval/RESULTS.md`](./eval/RESULTS.md)。
+
 确定性指标（**无需额外 API 调用**，跑一遍 bot 即可算）：
 
 - **决策准确率**：`decision`（answer/clarify/escalate/reject）是否符合预期。
