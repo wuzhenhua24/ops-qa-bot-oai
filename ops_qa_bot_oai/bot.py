@@ -42,7 +42,14 @@ from .guardrails import (
     injection_input_guardrail,
 )
 from .hooks import RunTelemetry
-from .model import MODES, ModelChoice, ModelRouter, build_model_router, resolve_model
+from .model import (
+    MODES,
+    ModelChoice,
+    ModelRouter,
+    build_model_router,
+    resolve_model,
+    role_model_settings,
+)
 from .orchestration import (
     Component,
     build_auto_agent,
@@ -276,6 +283,7 @@ class OpsQABot:
                 instructions=build_system_prompt(self.docs_root),
                 tools=list(DOC_TOOLS) + self._extra_tools,
                 model=self.model_choice.model,
+                model_settings=role_model_settings("single"),
                 input_guardrails=self._input_guardrails,
             )
         self._context = DocsContext(docs_root=self.docs_root)
@@ -334,6 +342,7 @@ class OpsQABot:
                 instructions=build_structured_system_prompt(self.docs_root),
                 tools=list(DOC_TOOLS),
                 model=self.model_choice.model,
+                model_settings=role_model_settings("single"),
                 output_type=out,
                 input_guardrails=self._input_guardrails,
                 output_guardrails=og,

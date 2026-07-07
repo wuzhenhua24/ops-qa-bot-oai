@@ -45,7 +45,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from agents import Model, OpenAIChatCompletionsModel, OpenAIResponsesModel
+from agents import Model, ModelSettings, OpenAIChatCompletionsModel, OpenAIResponsesModel
 
 _DEFAULT_MODEL = {
     # openai 官方默认就走 Responses API（SDK 的 _use_responses_by_default=True）。
@@ -115,6 +115,47 @@ def resolve_session_db() -> str:
     (chat, user) 的对话上下文可接着聊。
     """
     return (os.environ.get("OPS_QA_SESSION_DB") or "").strip() or ":memory:"
+
+
+# 按角色的 temperature 代码默认：分诊是纯路由角色，低温更稳定（同一问题稳定转交同一
+# 专家，路由准确率不随机抖）。其余角色不设，沿用 provider 默认。
+_ROLE_TEMPERATURE_DEFAULTS: dict[str, float] = {"triage": 0.1}
+
+
+def _env_float(name: str) -> float | None:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise ValueError(f"{name}={raw!r} 不是合法数字") from e
+
+
+def role_model_settings(role: str) -> ModelSettings:
+    """按角色构造 ModelSettings（SDK 的 per-agent 采样/工具行为配置）。
+
+    多模型路由（#2）此前只按角色换**模型名**；ModelSettings 把"每个 agent 可以有
+    不同的调用参数"补齐——分诊和专家不止可以用不同模型，还可以用不同的温度/工具
+    并发策略。None 字段不下发（沿用 provider 默认），不影响不支持该参数的端点。
+
+    - **temperature**：`OPS_QA_TEMPERATURE_<角色大写>` > `OPS_QA_TEMPERATURE`（全局）>
+      角色代码默认（triage=0.1，路由要稳）> 不设。
+    - **parallel_tool_calls**：仅 coordinator 默认 True——它的工作流程就是"对多个相关
+      组件**并行**求证"（见 orchestration 的协调者 prompt），不设则模型多半串行逐个
+      咨询专家，跨组件排查时延翻倍。`OPS_QA_PARALLEL_TOOLS=0` 可关（个别端点不认
+      该参数时用）。
+    """
+    r = role.strip().lower()
+    temp = _env_float(f"OPS_QA_TEMPERATURE_{r.upper()}")
+    if temp is None:
+        temp = _env_float("OPS_QA_TEMPERATURE")
+    if temp is None:
+        temp = _ROLE_TEMPERATURE_DEFAULTS.get(r)
+    parallel: bool | None = None
+    if r == "coordinator":
+        parallel = env_flag("OPS_QA_PARALLEL_TOOLS", default=True) or None
+    return ModelSettings(temperature=temp, parallel_tool_calls=parallel)
 
 
 @dataclass

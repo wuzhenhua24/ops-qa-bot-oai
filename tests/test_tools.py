@@ -1048,3 +1048,59 @@ def test_aggregate_sums_agent_usage():
     }
     assert agg["agent_usage"]["redis_specialist"]["input_tokens"] == 1000
     assert agg["agent_usage"]["mysql_specialist"]["requests"] == 1
+
+
+# ---------------------------------------------------------------------------
+# ModelSettings：按角色的采样/工具行为配置（temperature / parallel_tool_calls）
+# ---------------------------------------------------------------------------
+
+
+def _clear_settings_env(monkeypatch):
+    for k in list(__import__("os").environ):
+        if k.startswith("OPS_QA_TEMPERATURE") or k == "OPS_QA_PARALLEL_TOOLS":
+            monkeypatch.delenv(k, raising=False)
+
+
+def test_role_model_settings_defaults(monkeypatch):
+    from ops_qa_bot_oai.model import role_model_settings
+
+    _clear_settings_env(monkeypatch)
+    assert role_model_settings("triage").temperature == 0.1  # 路由要稳，低温
+    assert role_model_settings("triage").parallel_tool_calls is None
+    # coordinator：prompt 的"并行求证"落到调用参数
+    assert role_model_settings("coordinator").parallel_tool_calls is True
+    assert role_model_settings("coordinator").temperature is None
+    # 专家 / single：全默认，不下发任何参数
+    s = role_model_settings("redis")
+    assert s.temperature is None and s.parallel_tool_calls is None
+
+
+def test_role_model_settings_env_overrides(monkeypatch):
+    from ops_qa_bot_oai.model import role_model_settings
+
+    _clear_settings_env(monkeypatch)
+    monkeypatch.setenv("OPS_QA_TEMPERATURE", "0.7")
+    assert role_model_settings("redis").temperature == 0.7  # 全局生效
+    assert role_model_settings("triage").temperature == 0.7  # 全局盖过角色代码默认
+    monkeypatch.setenv("OPS_QA_TEMPERATURE_TRIAGE", "0.0")
+    assert role_model_settings("triage").temperature == 0.0  # 角色级最优先
+    # 关掉 coordinator 的并行工具（个别端点不认该参数）→ None（不下发，而非显式 False）
+    monkeypatch.setenv("OPS_QA_PARALLEL_TOOLS", "0")
+    assert role_model_settings("coordinator").parallel_tool_calls is None
+
+
+def test_model_settings_wired_into_orchestration(tmp_path, monkeypatch):
+    from ops_qa_bot_oai.model import ModelRouter
+    from ops_qa_bot_oai.orchestration import build_coordinator_agent, build_triage_agent
+
+    _clear_settings_env(monkeypatch)
+    root = _coord_docs(tmp_path)
+    router = ModelRouter(
+        provider="openai", default_name="gpt-5", overrides={}, _make=lambda n: (n, n)
+    )
+    triage, _ = build_triage_agent(root, router)
+    assert triage.model_settings.temperature == 0.1
+    for sp in triage.handoffs:  # 专家不设温度，沿用 provider 默认
+        assert sp.model_settings.temperature is None
+    coordinator, _ = build_coordinator_agent(root, router)
+    assert coordinator.model_settings.parallel_tool_calls is True

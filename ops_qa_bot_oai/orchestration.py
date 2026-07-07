@@ -21,7 +21,7 @@ from pathlib import Path
 from agents import Agent, Model
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
-from .model import ModelRouter
+from .model import ModelRouter, role_model_settings
 from .prompt import STRUCTURED_CONTRACT_SUFFIX
 from .tools import DOC_TOOLS, DocsContext
 
@@ -166,6 +166,7 @@ def build_specialist_agent(
         ),
         tools=list(DOC_TOOLS) + list(extra_tools or []),
         model=model,
+        model_settings=role_model_settings(c.dir),
         output_type=output_type,
         output_guardrails=list(output_guardrails or []),
     )
@@ -233,6 +234,7 @@ def build_triage_agent(
         tools=list(DOC_TOOLS),  # 仅用于"能力介绍"时读 INDEX；组件问题一律转交
         handoffs=list(specialists),
         model=router.for_role("triage")[1],
+        model_settings=role_model_settings("triage"),  # 低温：路由决策要稳定
         input_guardrails=list(input_guardrails or []),
         output_type=output_type,
         output_guardrails=list(output_guardrails or []),
@@ -331,6 +333,9 @@ def build_coordinator_agent(
         instructions=coord_instructions,
         tools=specialist_tools,
         model=router.for_role("coordinator")[1],
+        # parallel_tool_calls=True：prompt 里的"并行求证"落到调用参数上——一轮里同时
+        # 发起多个 ask_<组件>，跨组件排查不用串行等每个专家。
+        model_settings=role_model_settings("coordinator"),
         input_guardrails=list(input_guardrails or []),
         output_type=output_type,
         output_guardrails=list(output_guardrails or []),
@@ -430,6 +435,7 @@ def build_auto_agent(
         tools=list(DOC_TOOLS),  # 仅用于"能力介绍"时读 INDEX；组件问题一律转交
         handoffs=[*specialists, coordinator],
         model=router.for_role("triage")[1],
+        model_settings=role_model_settings("triage"),  # 低温：路由决策要稳定
         input_guardrails=list(input_guardrails or []),
         output_type=output_type,
         output_guardrails=list(output_guardrails or []),
