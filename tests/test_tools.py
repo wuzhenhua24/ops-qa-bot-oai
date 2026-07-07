@@ -951,3 +951,100 @@ async def test_session_manager_sessions_isolated_by_key(docs_root: Path, tmp_pat
     await a.bot._session.add_items([{"role": "user", "content": "alice 的问题"}])
     b = await sm._entry(("oc_chat", "ou_bob"))
     assert await b.bot._session.get_items() == []
+
+
+# ---------------------------------------------------------------------------
+# 运行遥测（lifecycle hooks）：转交链 / 按 agent 用量 / reset
+# ---------------------------------------------------------------------------
+
+
+def _fake_agent(name: str):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(name=name)
+
+
+def _fake_response(input_tokens: int, output_tokens: int):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens)
+    )
+
+
+async def test_run_telemetry_handoff_chain_and_route():
+    from ops_qa_bot_oai.hooks import RunTelemetry
+
+    tel = RunTelemetry()
+    assert tel.route is None  # 无 handoff = 入口自答
+    await tel.on_handoff(None, _fake_agent("triage"), _fake_agent("coordinator"))
+    await tel.on_handoff(None, _fake_agent("coordinator"), _fake_agent("redis_specialist"))
+    assert tel.handoff_chain == [
+        ("triage", "coordinator"),
+        ("coordinator", "redis_specialist"),
+    ]
+    assert tel.route == "redis_specialist"  # 最后一次 handoff 目标
+
+
+async def test_run_telemetry_agent_usage_attribution():
+    from ops_qa_bot_oai.hooks import RunTelemetry
+
+    tel = RunTelemetry()
+    await tel.on_llm_end(None, _fake_agent("triage"), _fake_response(100, 20))
+    await tel.on_llm_end(None, _fake_agent("redis_specialist"), _fake_response(800, 300))
+    await tel.on_llm_end(None, _fake_agent("redis_specialist"), _fake_response(900, 150))
+    usage = tel.agent_usage()
+    assert usage["triage"] == {"requests": 1, "input_tokens": 100, "output_tokens": 20}
+    assert usage["redis_specialist"] == {
+        "requests": 2,
+        "input_tokens": 1700,
+        "output_tokens": 450,
+    }
+
+
+async def test_run_telemetry_reset_run_clears_all():
+    from ops_qa_bot_oai.hooks import RunTelemetry
+    from ops_qa_bot_oai.tools import read_doc
+
+    tel = RunTelemetry()
+    await tel.on_handoff(None, _fake_agent("triage"), _fake_agent("redis_specialist"))
+    await tel.on_llm_end(None, _fake_agent("triage"), _fake_response(1, 1))
+    await tel.on_tool_start(None, _fake_agent("redis_specialist"), read_doc)
+    assert tel.route and tel.agent_usage() and tel.tool_calls
+    tel.reset_run()
+    assert tel.route is None
+    assert tel.agent_usage() == {}
+    assert tel.tool_calls == []
+
+
+def test_bot_wires_telemetry_into_runs(docs_root: Path):
+    """telemetry 挂进 _run_kwargs（run 级 hooks），流式/非流式共用同一实例。"""
+    from ops_qa_bot_oai.bot import OpsQABot
+
+    bot = OpsQABot(docs_root=docs_root, model_choice=_model_choice(), mode="multi")
+    assert bot._run_kwargs()["hooks"] is bot._telemetry
+
+
+def test_aggregate_sums_agent_usage():
+    """聚合按 agent 名跨题求和——多模型路由的成本拆分数据源。"""
+    au1 = {
+        "triage": {"requests": 1, "input_tokens": 100, "output_tokens": 20},
+        "redis_specialist": {"requests": 2, "input_tokens": 1000, "output_tokens": 300},
+    }
+    au2 = {
+        "triage": {"requests": 1, "input_tokens": 120, "output_tokens": 25},
+        "mysql_specialist": {"requests": 1, "input_tokens": 700, "output_tokens": 200},
+    }
+    cases = [EvalCase(id="a", question="q"), EvalCase(id="b", question="q")]
+    outcomes = [_outcome("answer", []), _outcome("answer", [])]
+    outcomes[0].agent_usage = au1
+    outcomes[1].agent_usage = au2
+    scores = [score_case(c, o) for c, o in zip(cases, outcomes)]
+    agg = aggregate(scores)
+    assert agg["agent_usage"]["triage"] == {
+        "requests": 2,
+        "input_tokens": 220,
+        "output_tokens": 45,
+    }
+    assert agg["agent_usage"]["redis_specialist"]["input_tokens"] == 1000
+    assert agg["agent_usage"]["mysql_specialist"]["requests"] == 1

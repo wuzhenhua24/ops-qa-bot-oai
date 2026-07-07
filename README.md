@@ -29,6 +29,7 @@ ops-qa-bot-openai/
 │   ├── evaluate.py           # 离线评测 harness：题集 × 多模式打分出对比报告（差异化 #5）
 │   ├── guardrails.py         # 输入注入护栏 + 输出来源护栏（差异化 #4）
 │   ├── actions.py            # 写操作审批工具（needs_approval HITL）（差异化 #4）
+│   ├── hooks.py              # 运行遥测 RunHooks：精确转交链 + 按 agent token 归账（#2 量化）
 │   ├── bot.py                # OpsQABot：Agent + Runner，answer()/answer_structured()/answer_guarded()
 │   ├── cli.py                # 交互式 REPL + --ask/--structured/--mode/--guardrails
 │   └── feishu/               # 飞书长连接接入：render（渲染纯逻辑）/ session / runner
@@ -262,7 +263,9 @@ uv run python run.py --mode multi
 #   分诊用 gpt-5-mini，redis 专家用 gpt-5-pro，mysql/kafka 专家回退 gpt-5
 ```
 
-无任何覆盖时所有角色都用 `OPS_QA_MODEL`，等价单模型。实现见 `ModelRouter` / `build_model_router`（`ops_qa_bot_oai/model.py`）。配合评测台（#5）可量化「分层路由省了多少 token、准确率有没有掉」。当前覆盖只换模型名（同一 provider）；按角色换**不同 provider**（如某组件走本地模型）是顺手能加的下一步。
+无任何覆盖时所有角色都用 `OPS_QA_MODEL`，等价单模型。实现见 `ModelRouter` / `build_model_router`（`ops_qa_bot_oai/model.py`）。当前覆盖只换模型名（同一 provider）；按角色换**不同 provider**（如某组件走本地模型）是顺手能加的下一步。
+
+**分层成本可量化（lifecycle hooks）**：每轮答题经 SDK 的 `RunHooks` 做运行遥测（`ops_qa_bot_oai/hooks.py`）——`on_handoff` 给出精确转交链（取代此前"跳过首个流事件 / last_agent 反推"的两处手搓推断，流式与非流式统一）、`on_llm_end` 把每次 LLM 调用的 token 归到发起的 agent 名下（coordinator 模式下 `as_tool` 专家子 run 也归账——SDK 的 `as_tool(hooks=...)` 是构建期参数，构图时注入同一实例）。CLI 多 agent 模式会打印 `[按agent] triage in=… | redis_specialist in=…`；评测报告（#5）自动附「按 agent 的 token 用量」拆分，直接回答"分诊便宜模型 vs 专家强模型各花多少"。
 
 ## 护栏 + 写操作审批（差异化原型 #4）
 
@@ -316,7 +319,7 @@ glm · auto    100% (10)  100% (2)  100% (7)  100% (8)  1400     3.2  950
 - **转交准确率**：`multi`/`auto` 下分诊台是否转交给了正确处理者（组件专家 / 跨组件协调者 / 分诊自答）。**量化 auto 自适应路由准不准**——`expected_route` 标注单组件题的目标组件、跨组件题标 `coordinator`、问候/拒绝标 `self`。
 - **组件命中率**：是否引用了期望组件目录下的文档。
 - **来源真实率**：引用路径是否真实存在（复用 `validate_citations`）。
-- **成本/时延**：token、轮数、耗时。
+- **成本/时延**：token、轮数、耗时；多 agent 配置额外附**按 agent 的 token 拆分**（lifecycle hooks 归账，见「多模型路由」），量化分层路由的成本结构。
 
 评分与聚合是**纯函数**（`score_case` / `aggregate`，已单测，无需 LLM）；只有实际跑 bot 需要 key。结构化模式下 `decision`/`citations` 是类型字段直接可评，自由文本模式靠 markers + 正则抽取（decision 是启发式）——这本身印证了 #1：**结构化输出更可评测**。
 

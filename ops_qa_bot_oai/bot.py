@@ -41,6 +41,7 @@ from .guardrails import (
     citation_output_guardrail,
     injection_input_guardrail,
 )
+from .hooks import RunTelemetry
 from .model import MODES, ModelChoice, ModelRouter, build_model_router, resolve_model
 from .orchestration import (
     Component,
@@ -120,8 +121,11 @@ class AnswerResult:
     # "success" 正常；"error_max_turns" 撞了 max_turns 保险丝（答案可能不完整）。
     subtype: str = "success"
     # 最终处理该问题的落点 agent 名（最后一次 handoff 目标）；None 表示入口 agent 自答
-    # （auto 模式下即分诊台自答）。用于评测路由准确率。
+    # （auto 模式下即分诊台自答）。用于评测路由准确率。来自 lifecycle hooks 的精确转交链。
     route: str | None = None
+    # 按 agent 名的 token 用量（lifecycle hooks 归账），如 {"triage": {...}, "redis_specialist":
+    # {...}}。多模型路由（#2）下可拆分"分诊便宜模型 vs 专家强模型"各花多少。
+    agent_usage: dict[str, dict[str, int]] | None = None
 
 
 @dataclass
@@ -137,7 +141,10 @@ class StructuredAnswer:
     # 命中输出来源护栏（#4）时为拦截原因；正常为 None。
     guardrail_blocked: str | None = None
     # 最终落点 agent 名（handoff 目标）；None 表示入口 agent 自答。评测路由准确率用。
+    # 来自 lifecycle hooks 的精确转交链（不再用 last_agent 推断）。
     route: str | None = None
+    # 按 agent 名的 token 用量（lifecycle hooks 归账）。
+    agent_usage: dict[str, dict[str, int]] | None = None
 
 
 @dataclass
@@ -162,6 +169,8 @@ class GuardedAnswer:
     usage: dict[str, Any] | None = None
     num_turns: int | None = None
     subtype: str = "success"
+    # 按 agent 名的 token 用量（lifecycle hooks 归账）。
+    agent_usage: dict[str, dict[str, int]] | None = None
 
 
 def format_tool_call(name: str, args: dict) -> str:
@@ -228,6 +237,11 @@ class OpsQABot:
         self._input_guardrails = [injection_input_guardrail] if guardrails else []
         self._extra_tools = [make_write_command_tool(self.write_log)] if guardrails else []
 
+        # 运行遥测（lifecycle hooks）：精确转交链 + 按 agent 的 token 归账。挂在 bot 上
+        # 跨 run 复用（coordinator 的 as_tool 子 run 需要构建期注入同一实例），每次答题
+        # reset_run() 清零。见 hooks.py。
+        self._telemetry = RunTelemetry()
+
         self._agent: Agent[DocsContext]
         self.components: list[Component]
         self.model_router: ModelRouter | None = None
@@ -240,12 +254,14 @@ class OpsQABot:
             # 跨组件协作：协调者把各组件专家当工具（agents-as-tools）调用、综合根因。
             self.model_router = model_router or build_model_router()
             self._agent, self.components = build_coordinator_agent(
-                self.docs_root, self.model_router, **gr
+                self.docs_root, self.model_router, agent_tool_hooks=self._telemetry, **gr
             )
         elif mode == "auto":
             # 自适应默认：分诊台 handoff 给单专家（常见）或跨组件协调者（少数）。
             self.model_router = model_router or build_model_router()
-            self._agent, self.components = build_auto_agent(self.docs_root, self.model_router, **gr)
+            self._agent, self.components = build_auto_agent(
+                self.docs_root, self.model_router, agent_tool_hooks=self._telemetry, **gr
+            )
         elif mode == "multi":
             # 差异化 #3：入口换成分诊 agent，handoff 给从 INDEX.md 动态生成的组件专家。
             # 差异化 #2：用 ModelRouter 按角色/组件分配模型（分诊便宜、专家强）。
@@ -296,11 +312,17 @@ class OpsQABot:
         }
         if self.mode == "coordinator":
             agent, _ = build_coordinator_agent(
-                self.docs_root, self.model_router or build_model_router(), **gr
+                self.docs_root,
+                self.model_router or build_model_router(),
+                agent_tool_hooks=self._telemetry,
+                **gr,
             )
         elif self.mode == "auto":
             agent, _ = build_auto_agent(
-                self.docs_root, self.model_router or build_model_router(), **gr
+                self.docs_root,
+                self.model_router or build_model_router(),
+                agent_tool_hooks=self._telemetry,
+                **gr,
             )
         elif self.mode == "multi":
             agent, _ = build_triage_agent(
@@ -321,7 +343,12 @@ class OpsQABot:
 
     def _run_kwargs(self) -> dict[str, Any]:
         # session：SDK 自动做多轮历史的读取与落盘（run 前取历史拼 input、run 后存新 items）。
-        kwargs: dict[str, Any] = {"context": self._context, "session": self._session}
+        # hooks：运行遥测（转交链 / 按 agent 用量），调用方在 run 前 reset_run()。
+        kwargs: dict[str, Any] = {
+            "context": self._context,
+            "session": self._session,
+            "hooks": self._telemetry,
+        }
         if self.max_turns is not None:
             kwargs["max_turns"] = self.max_turns
         return kwargs
@@ -331,9 +358,12 @@ class OpsQABot:
 
         - {"type": "tool", "name": str, "input": dict}  —— agent 调用的工具
         - {"type": "text", "text": str}                 —— 回答文本片段
-        - {"type": "done", "usage": dict | None,
-           "num_turns": int | None, "subtype": str}     —— 本轮结束
+        - {"type": "handoff", "agent": str}             —— 转交给某 agent（实时展示用）
+        - {"type": "done", "usage": dict | None, "num_turns": int | None,
+           "subtype": str, "route": str | None,
+           "agent_usage": dict}                          —— 本轮结束（含遥测）
         """
+        self._telemetry.reset_run()
         result = Runner.run_streamed(self._agent, input=question, **self._run_kwargs())
 
         subtype = "success"
@@ -363,6 +393,9 @@ class OpsQABot:
             "usage": _usage_dict(result),
             "num_turns": _num_turns(result),
             "subtype": subtype,
+            # 遥测（lifecycle hooks）：精确路由 + 按 agent 用量。
+            "route": self._telemetry.route,
+            "agent_usage": self._telemetry.agent_usage(),
         }
 
     async def answer(self, question: str) -> AnswerResult:
@@ -372,12 +405,12 @@ class OpsQABot:
         usage: dict | None = None
         num_turns: int | None = None
         subtype = "success"
-        route: str | None = None  # 最后一次 handoff 目标 = 最终落点 agent
+        route: str | None = None
+        agent_usage: dict[str, dict[str, int]] | None = None
         async for event in self.ask(question):
             if event["type"] == "tool":
                 logger.info("  tool: %s", format_tool_call(event["name"], event["input"]))
             elif event["type"] == "handoff":
-                route = event["agent"]
                 logger.info("  → 转交给 %s", event["agent"])
             elif event["type"] == "text":
                 chunks.append(event["text"])
@@ -385,6 +418,9 @@ class OpsQABot:
                 usage = event.get("usage")
                 num_turns = event.get("num_turns")
                 subtype = event.get("subtype", "success")
+                # 路由 / 按 agent 用量取自 done 事件里的遥测（lifecycle hooks，精确）。
+                route = event.get("route")
+                agent_usage = event.get("agent_usage") or None
         cleaned, markers = parse_markers("".join(chunks))
         return AnswerResult(
             text=cleaned,
@@ -393,6 +429,7 @@ class OpsQABot:
             num_turns=num_turns,
             subtype=subtype,
             route=route,
+            agent_usage=agent_usage,
         )
 
     async def answer_structured(self, question: str) -> StructuredAnswer:
@@ -409,6 +446,7 @@ class OpsQABot:
         logger.info("question (structured): %s", question)
         agent = self._get_structured_agent()
         subtype = "success"
+        self._telemetry.reset_run()
         try:
             result = await Runner.run(agent, input=question, **self._run_kwargs())
         except MaxTurnsExceeded:
@@ -459,12 +497,6 @@ class OpsQABot:
         contract = result.final_output  # 已被 SDK 按 schema 校验
         assert isinstance(contract, AnswerContract)
 
-        # 路由：非流式没有 handoff 事件流，用 last_agent 与入口 agent 对比推断——
-        # 落点 != 入口 说明发生过 handoff（专家 / 协调者），落点 == 入口即分诊自答。
-        entry_name = getattr(agent, "name", None)
-        last_name = getattr(getattr(result, "last_agent", None), "name", None)
-        route = last_name if (last_name and last_name != entry_name) else None
-
         invalid = validate_citations(self.docs_root, contract.citations)
         if invalid:
             logger.warning("结构化答案引用了不存在/越界的来源: %s", invalid)
@@ -474,7 +506,10 @@ class OpsQABot:
             usage=_usage_dict(result),
             num_turns=_num_turns(result),
             subtype=subtype,
-            route=route,
+            # 路由取自 lifecycle hooks 的精确转交链（此前非流式只能用 last_agent !=
+            # 入口 agent 反推，hooks 让流式/非流式统一走同一来源）。
+            route=self._telemetry.route,
+            agent_usage=self._telemetry.agent_usage() or None,
         )
 
     async def answer_guarded(self, question: str, approver: Any = None) -> GuardedAnswer:
@@ -492,6 +527,8 @@ class OpsQABot:
             raise RuntimeError("answer_guarded 需要以 guardrails=True 构造 OpsQABot")
         logger.info("question (guarded): %s", question)
         approvals: list[tuple[ApprovalRequest, bool]] = []
+        # reset 只在整轮开始时做一次：审批后的续跑属于同一轮，遥测继续累计。
+        self._telemetry.reset_run()
         try:
             result = await Runner.run(self._agent, input=question, **self._run_kwargs())
             # 处理写操作审批中断，直到没有待批项。
@@ -537,6 +574,7 @@ class OpsQABot:
             approved_writes=approved_writes,
             usage=_usage_dict(result),
             num_turns=_num_turns(result),
+            agent_usage=self._telemetry.agent_usage() or None,
         )
 
 

@@ -63,6 +63,8 @@ class RunOutcome:
     latency_ms: int
     # 归一化后的实际路由（组件名 / "coordinator" / "self"）；None 表示该模式不计路由。
     route: str | None = None
+    # 按 agent 名的 token 用量（lifecycle hooks 归账）；量化多模型路由的分层成本。
+    agent_usage: dict[str, dict[str, int]] | None = None
 
 
 @dataclass
@@ -81,6 +83,8 @@ class CaseScore:
     total_tokens: int
     num_turns: int | None
     latency_ms: int
+    # 按 agent 的用量（聚合时按 agent 名求和，得到"分诊 vs 各专家"的成本拆分）。
+    agent_usage: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 def load_cases(path: Path) -> list[EvalCase]:
@@ -170,6 +174,7 @@ def score_case(case: EvalCase, outcome: RunOutcome) -> CaseScore:
         total_tokens=int(usage.get("total_tokens", 0) or 0),
         num_turns=outcome.num_turns,
         latency_ms=outcome.latency_ms,
+        agent_usage=outcome.agent_usage or {},
     )
 
 
@@ -184,6 +189,16 @@ def aggregate(scores: list[CaseScore]) -> dict[str, Any]:
     comp_scored = [s for s in scores if s.component_cited is not None]
     route_scored = [s for s in scores if s.route_correct is not None]
     cited = [s for s in scores if s.num_citations > 0]
+    # 按 agent 名跨题求和（lifecycle hooks 归账）——多模型路由下"分诊便宜模型 vs
+    # 专家强模型"各花多少，直接从这里读。
+    agent_usage: dict[str, dict[str, int]] = {}
+    for s in scores:
+        for name, u in s.agent_usage.items():
+            acc = agent_usage.setdefault(
+                name, {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+            )
+            for k in acc:
+                acc[k] += int(u.get(k, 0) or 0)
     return {
         "n": n,
         "decision_accuracy": _rate(
@@ -201,6 +216,7 @@ def aggregate(scores: list[CaseScore]) -> dict[str, Any]:
         "avg_total_tokens": _rate(sum(s.total_tokens for s in scores), n),
         "avg_latency_ms": _rate(sum(s.latency_ms for s in scores), n),
         "avg_turns": _rate(sum(s.num_turns or 0 for s in scores), n),
+        "agent_usage": agent_usage,
     }
 
 
@@ -254,6 +270,7 @@ async def _run_case(
             num_turns=sa.num_turns,
             latency_ms=latency,
             route=normalize_route(sa.route) if scored_route else None,
+            agent_usage=sa.agent_usage,
         )
     r = await bot.answer(question)
     latency = int((time.perf_counter() - t0) * 1000)
@@ -267,6 +284,7 @@ async def _run_case(
         num_turns=r.num_turns,
         latency_ms=latency,
         route=normalize_route(r.route) if scored_route else None,
+        agent_usage=r.agent_usage,
     )
 
 
@@ -324,6 +342,22 @@ def render_report(results: list[ConfigResult]) -> str:
         lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
         if ri == 0:
             lines.append("  ".join("-" * widths[i] for i in range(len(row))))
+
+    # 按 agent 的 token 拆分（lifecycle hooks 归账）：多模型路由下量化"分诊便宜模型
+    # vs 专家强模型"各花多少。只有多 agent 配置（>1 个 agent 发过言）才有拆分意义。
+    breakdown: list[str] = []
+    for r in results:
+        au = r.summary.get("agent_usage") or {}
+        if len(au) > 1:
+            parts = [
+                f"{name} in={u['input_tokens']} out={u['output_tokens']} reqs={u['requests']}"
+                for name, u in au.items()
+            ]
+            breakdown.append(f"  {r.label}: " + " | ".join(parts))
+    if breakdown:
+        lines.append("")
+        lines.append("按 agent 的 token 用量（多模型路由成本拆分）：")
+        lines.extend(breakdown)
     return "\n".join(lines)
 
 

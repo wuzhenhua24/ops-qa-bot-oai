@@ -19,6 +19,18 @@ from .model import MODE_LABELS, MODES, resolve_mode, resolve_model
 _RESET_WORDS = {"/reset", "/new", "新对话", "重置"}
 
 
+def _format_agent_usage(agent_usage: dict | None) -> str | None:
+    """按 agent 的 token 用量一行展示（lifecycle hooks 归账）；单 agent 时不显示。"""
+    if not agent_usage or len(agent_usage) < 2:
+        return None
+    parts = [
+        f"{name} in={u.get('input_tokens', 0)} out={u.get('output_tokens', 0)} "
+        f"reqs={u.get('requests', 0)}"
+        for name, u in agent_usage.items()
+    ]
+    return "[按agent] " + " | ".join(parts)
+
+
 def _print_structured(sa: StructuredAnswer) -> None:
     """渲染结构化契约：决策 + 正文 + 来源（带真实性校验）+ 追问 + 置信度。"""
     c = sa.contract
@@ -123,6 +135,8 @@ async def run_once(
                 f"out={ga.usage.get('output_tokens', 0)} "
                 f"reqs={ga.usage.get('requests', 0)}]"
             )
+        if show_tools and (line := _format_agent_usage(ga.agent_usage)):
+            print(line)
         return
 
     if structured:
@@ -136,6 +150,8 @@ async def run_once(
                 f"out={sa.usage.get('output_tokens', 0)} "
                 f"reqs={sa.usage.get('requests', 0)}]"
             )
+        if show_tools and (line := _format_agent_usage(sa.agent_usage)):
+            print(line)
         return
 
     result = await bot.answer(question)
@@ -157,6 +173,8 @@ async def run_once(
             f"out={result.usage.get('output_tokens', 0)} "
             f"reqs={result.usage.get('requests', 0)}]"
         )
+    if show_tools and (line := _format_agent_usage(result.agent_usage)):
+        print(line)
     if result.subtype == "error_max_turns":
         print("⚠️ 撞到 max_turns 上限，结论可能不完整。")
 
@@ -254,6 +272,8 @@ async def run_repl(
                             f"out={usage.get('output_tokens', 0)} "
                             f"reqs={usage.get('requests', 0)}]"
                         )
+                    if show_tools and (line := _format_agent_usage(event.get("agent_usage"))):
+                        print(f"  {line}")
                     if event.get("subtype") == "error_max_turns":
                         print("  ⚠️ 撞到 max_turns 上限，结论可能不完整。")
                     print()

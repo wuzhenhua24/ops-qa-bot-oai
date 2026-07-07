@@ -283,6 +283,7 @@ def build_coordinator_agent(
     specialist_extra_tools: list | None = None,
     output_type: object | None = None,
     output_guardrails: list | None = None,
+    agent_tool_hooks: object | None = None,
 ) -> tuple[Agent[DocsContext], list[Component]]:
     """构造跨组件协调者：各 local 组件专家以 `as_tool` 暴露给协调者调用。
 
@@ -299,6 +300,10 @@ def build_coordinator_agent(
 
     结构化输出：`output_type` 非空时**只有协调者**（终端、负责综合）产出契约并挂
     `output_guardrails`；as_tool 专家仍返回文字喂给协调者，不套 output_type。
+
+    遥测：`agent_tool_hooks`（RunHooks 实例）注入 as_tool 的嵌套子 run——SDK 的
+    `as_tool(hooks=...)` 是构建期参数，run 级 hooks 不会自动透传到子 run；构图时
+    注入同一实例，专家子 run 的 LLM 调用才能按 agent 归账（见 hooks.py）。
     """
     structured = output_type is not None
     components = parse_index_components(docs_root)
@@ -313,6 +318,7 @@ def build_coordinator_agent(
                 f"传一个自包含的子问题；返回该组件文档依据下的发现。"
             ),
             max_turns=specialist_max_turns,
+            hooks=agent_tool_hooks,  # type: ignore[arg-type]
         )
         for c in local
     ]
@@ -378,6 +384,7 @@ def build_auto_agent(
     specialist_extra_tools: list | None = None,
     output_type: object | None = None,
     output_guardrails: list | None = None,
+    agent_tool_hooks: object | None = None,
 ) -> tuple[Agent[DocsContext], list[Component]]:
     """构造自适应分诊 agent：handoffs = 各组件专家 + 跨组件协调者。
 
@@ -412,6 +419,7 @@ def build_auto_agent(
         specialist_extra_tools=specialist_extra_tools,
         output_type=output_type,
         output_guardrails=output_guardrails,
+        agent_tool_hooks=agent_tool_hooks,
     )
     instructions = _auto_triage_instructions(local)
     if structured:
