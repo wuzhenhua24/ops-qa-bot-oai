@@ -868,3 +868,86 @@ def test_aggregate_route_accuracy():
     agg = aggregate(scores)
     assert agg["route_scored"] == 2  # 只有前两题记了路由
     assert agg["route_accuracy"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# 会话记忆（SDK Session）：reset 清空 / 注入持久化 session / 回收后可恢复
+# ---------------------------------------------------------------------------
+
+
+def _model_choice():
+    from ops_qa_bot_oai.model import ModelChoice
+
+    # openai provider 的模型就是字符串名，构造 bot 不触网。
+    return ModelChoice(provider="openai", model_name="gpt-5", model="gpt-5")
+
+
+async def test_bot_reset_clears_session(docs_root: Path):
+    from ops_qa_bot_oai.bot import OpsQABot
+
+    bot = OpsQABot(docs_root=docs_root, model_choice=_model_choice(), mode="single")
+    await bot._session.add_items([{"role": "user", "content": "redis 内存告警怎么处理？"}])
+    assert await bot._session.get_items()
+    await bot.reset()
+    assert await bot._session.get_items() == []
+
+
+async def test_bot_accepts_injected_persistent_session(docs_root: Path, tmp_path: Path):
+    """注入落盘 SQLiteSession：同 session_id + 同 db 的新实例能读到历史（重启恢复）。"""
+    from agents import SQLiteSession
+
+    from ops_qa_bot_oai.bot import OpsQABot
+
+    db = tmp_path / "sessions.db"
+    bot = OpsQABot(
+        docs_root=docs_root,
+        model_choice=_model_choice(),
+        mode="single",
+        session=SQLiteSession("chat:user", db),
+    )
+    await bot._session.add_items([{"role": "user", "content": "上一轮的问题"}])
+    # 模拟重启：新 session 实例、同 id 同 db。
+    revived = SQLiteSession("chat:user", db)
+    items = await revived.get_items()
+    assert items and items[0]["content"] == "上一轮的问题"
+
+
+async def test_session_manager_history_survives_eviction(docs_root: Path, tmp_path: Path):
+    """落盘模式下空闲回收只丢 bot 实例，同一 (chat,user) 再来时历史从 db 恢复。"""
+    from ops_qa_bot_oai.feishu.session import SessionManager
+
+    sm = SessionManager(
+        docs_root,
+        model_choice=_model_choice(),
+        session_db=tmp_path / "feishu.db",
+    )
+    key = ("oc_chat", "ou_user")
+    entry = await sm._entry(key)
+    await entry.bot._session.add_items([{"role": "user", "content": "第一轮"}])
+
+    sm._entries.clear()  # 模拟空闲回收
+    entry2 = await sm._entry(key)
+    assert entry2.bot is not entry.bot
+    items = await entry2.bot._session.get_items()
+    assert items and items[0]["content"] == "第一轮"
+
+    # /reset 在回收后依然要能清掉 db 里的历史。
+    sm._entries.clear()
+    assert await sm.reset(key)
+    entry3 = await sm._entry(key)
+    assert await entry3.bot._session.get_items() == []
+
+
+async def test_session_manager_sessions_isolated_by_key(docs_root: Path, tmp_path: Path):
+    """不同 (chat,user) 的历史互不可见（session_id 隔离）。"""
+    from ops_qa_bot_oai.feishu.session import SessionManager
+
+    sm = SessionManager(
+        docs_root,
+        model_choice=_model_choice(),
+        session_db=tmp_path / "feishu.db",
+    )
+    a = await sm._entry(("oc_chat", "ou_alice"))
+    await a.bot._session.add_items([{"role": "user", "content": "alice 的问题"}])
+    b = await sm._entry(("oc_chat", "ou_bob"))
+    assert await b.bot._session.get_items() == []

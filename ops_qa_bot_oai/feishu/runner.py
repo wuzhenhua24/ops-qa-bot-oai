@@ -118,6 +118,12 @@ class WsRunner:
             MODE_LABELS.get(self._session.mode, self._session.mode),
             self._session.model_choice.description,
         )
+        logger.info(
+            "会话历史：%s",
+            "内存（重启即丢；设 OPS_QA_SESSION_DB 可落盘）"
+            if self._session.session_db == ":memory:"
+            else f"落盘 {self._session.session_db}（重启/回收后可恢复上下文）",
+        )
         self._channel.on("message", self._on_inbound)
         self._channel.on("reconnecting", lambda: logger.warning("ws reconnecting ..."))
         self._channel.on("reconnected", lambda: logger.info("ws reconnected"))

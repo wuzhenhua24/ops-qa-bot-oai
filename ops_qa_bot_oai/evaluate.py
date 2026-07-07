@@ -238,7 +238,7 @@ def _parse_eval_mode(mode: str) -> tuple[str, bool]:
 async def _run_case(
     bot: OpsQABot, routing: str, structured: bool, question: str, docs_root: Path
 ) -> RunOutcome:
-    bot.reset()  # 每题独立会话，避免历史串味
+    await bot.reset()  # 每题独立会话，避免历史串味
     t0 = time.perf_counter()
     # 仅有分诊路由决策的路由模式记路由；single/coordinator route 置 None → 不计路由准确率。
     scored_route = routing in _ROUTING_MODES

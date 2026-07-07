@@ -107,6 +107,16 @@ def resolve_mode(default: str = "auto") -> str:
     return raw
 
 
+def resolve_session_db() -> str:
+    """从环境变量 OPS_QA_SESSION_DB 解析会话历史的 SQLite 落盘路径。
+
+    缺省 ":memory:"（进程内、重启即丢，与旧行为一致）。设成文件路径（如
+    `.sessions.db`）后会话历史持久化：飞书 bot 重启 / 空闲回收后，同一
+    (chat, user) 的对话上下文可接着聊。
+    """
+    return (os.environ.get("OPS_QA_SESSION_DB") or "").strip() or ":memory:"
+
+
 @dataclass
 class ModelChoice:
     """解析后的模型选择：交给 Agent 的 model（字符串或 Model 实例）+ 给人看的描述。"""

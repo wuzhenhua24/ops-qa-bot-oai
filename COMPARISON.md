@@ -4,7 +4,7 @@
 |---|---|---|
 | Agent SDK | Claude Agent SDK | OpenAI Agents SDK |
 | 文档检索工具 | **内置** `Read` / `Glob` / `Grep` | **自实现** `read_doc` / `glob_docs` / `grep_docs`（`@function_tool`） |
-| 会话状态 | 常驻 `ClaudeSDKClient` 子进程持有历史 | 无状态 `Runner` + 自己持有 `input` 历史列表 |
+| 会话状态 | 常驻 `ClaudeSDKClient` 子进程持有历史 | 无状态 `Runner` + SDK `Session`（`SQLiteSession`，可落盘持久化） |
 | 流式输出 | `receive_response()` 吐 AssistantMessage / ResultMessage | `Runner.run_streamed().stream_events()` |
 | 步数保险丝 | `ClaudeAgentOptions(max_turns=...)`，撞上 `ResultMessage.subtype="error_max_turns"` | `Runner.run(max_turns=...)`，撞上抛 `MaxTurnsExceeded` |
 | 用量 | `ResultMessage.usage`（含 cache_read/creation、官方 cost_usd） | `result.context_wrapper.usage`（input/output/total、requests、cached、reasoning） |
@@ -19,9 +19,9 @@
 
 代价是多写了一个 `tools.py`；收益是工具行为完全可控、可单测（`tests/test_tools.py` 不需要 LLM 就能锁住沙箱与检索语义）。
 
-### 2. 会话状态：子进程 vs 输入列表
+### 2. 会话状态：子进程 vs Session
 
-Claude SDK 用一个常驻子进程维护对话，`interrupt()` 能打断在途答题。OpenAI SDK 是无状态的：每轮 `Runner.run` 传入完整历史、返回新历史（`result.to_input_list()`）。本项目把历史存在 `OpsQABot._history`，`reset()` 清空。更轻量，但"打断在途"需要自己用 task cancel 实现（核心版未做）。
+Claude SDK 用一个常驻子进程维护对话，`interrupt()` 能打断在途答题。OpenAI SDK 的 `Runner` 是无状态的，多轮历史交给一等公民 **Session**（`Runner.run(..., session=...)` 自动读写）：本项目用 `SQLiteSession`，缺省内存态，设 `OPS_QA_SESSION_DB` 即落盘——重启 / 空闲回收后同一会话可恢复上下文，这是子进程持有历史给不了的。`reset()` 即 `clear_session()`。"打断在途"仍需自己用 task cancel 实现（核心版未做）。
 
 ### 3. provider 灵活性
 

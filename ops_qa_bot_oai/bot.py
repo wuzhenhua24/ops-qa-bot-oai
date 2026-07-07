@@ -5,13 +5,14 @@
 
 - `ask(question)`：流式异步生成器，逐段吐 {type: tool|text|done} 事件（适合 CLI）。
 - `answer(question)`：一次性返回完整答案 + 用量元数据（适合接入层）。
-- 多轮对话：内部维护输入历史，`reset()` 清空开新会话。
+- 多轮对话：交给 SDK 的 **Session**（`Runner.run(..., session=...)` 自动读写历史），
+  `reset()` 清空开新会话。默认进程内 SQLiteSession；接入层可注入持久化 session
+  （如飞书按 (chat,user) 一个 session_id + 落盘 db，重启不丢上下文）。
 - `max_turns`：单轮答题步数保险丝，撞上时 subtype 标 "error_max_turns"。
 - 解析 `<<ESCALATE>>`/`<<CLARIFY>>`/`<<FOLLOWUPS>>` 标记（与 ops-qa-bot markers 对齐）。
 
 与 Claude 版的结构差异：Claude SDK 用常驻 `ClaudeSDKClient` 子进程维护会话；这里用
-无状态的 `Runner` + 自己持有的 `input` 历史列表实现多轮，更轻、也更贴近 OpenAI SDK
-的惯用法。
+无状态的 `Runner` + SDK Session 实现多轮，更轻、也更贴近 OpenAI SDK 的惯用法。
 """
 
 from __future__ import annotations
@@ -30,7 +31,9 @@ from agents import (
     ModelBehaviorError,
     OutputGuardrailTripwireTriggered,
     Runner,
+    SQLiteSession,
 )
+from agents.memory import Session
 from openai.types.responses import ResponseTextDeltaEvent
 
 from .actions import WriteCommandLog, make_write_command_tool
@@ -202,6 +205,7 @@ class OpsQABot:
         mode: str = "single",
         model_router: ModelRouter | None = None,
         guardrails: bool = False,
+        session: Session | None = None,
     ):
         if mode not in MODES:
             raise ValueError(f"未知 mode={mode!r}，可选：{' / '.join(MODES)}")
@@ -259,14 +263,16 @@ class OpsQABot:
                 input_guardrails=self._input_guardrails,
             )
         self._context = DocsContext(docs_root=self.docs_root)
-        # 多轮对话历史（OpenAI SDK 的 input 列表形态）；reset() 清空。
-        self._history: list[Any] = []
+        # 多轮对话历史交给 SDK Session（Runner 自动读写）。默认进程内 SQLiteSession；
+        # 接入层（如飞书）可注入带 session_id + 落盘 db 的持久化 session。
+        # 流式 ask() 与结构化 answer_structured() 共享同一 session（同一段对话）。
+        self._session: Session = session or SQLiteSession("default")
         # 结构化输出 agent 懒构造（仅 answer_structured 用到时才建）。
         self._structured_agent: Agent[DocsContext] | None = None
 
-    def reset(self) -> None:
+    async def reset(self) -> None:
         """清空会话上下文，开始新对话。"""
-        self._history = []
+        await self._session.clear_session()
 
     def _get_structured_agent(self) -> Agent[DocsContext]:
         """懒构造结构化输出图：结构化输出与路由**正交**——按 self.mode 复用同一套编排图，
@@ -314,7 +320,8 @@ class OpsQABot:
         return agent
 
     def _run_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"context": self._context}
+        # session：SDK 自动做多轮历史的读取与落盘（run 前取历史拼 input、run 后存新 items）。
+        kwargs: dict[str, Any] = {"context": self._context, "session": self._session}
         if self.max_turns is not None:
             kwargs["max_turns"] = self.max_turns
         return kwargs
@@ -327,8 +334,7 @@ class OpsQABot:
         - {"type": "done", "usage": dict | None,
            "num_turns": int | None, "subtype": str}     —— 本轮结束
         """
-        input_items = self._history + [{"role": "user", "content": question}]
-        result = Runner.run_streamed(self._agent, input=input_items, **self._run_kwargs())
+        result = Runner.run_streamed(self._agent, input=question, **self._run_kwargs())
 
         subtype = "success"
         seen_first_agent = False
@@ -348,15 +354,9 @@ class OpsQABot:
                         yield {"type": "handoff", "agent": event.new_agent.name}
                     seen_first_agent = True
         except MaxTurnsExceeded:
+            # 历史落盘由 session 负责：已完成的 turns 在流式过程中逐轮持久化，撞上限
+            # 也保留已产出的部分上下文（与 ops-qa-bot 保留上下文的做法一致）。
             subtype = "error_max_turns"
-
-        if subtype == "success":
-            # 正常收尾时把完整历史接上，供下一轮追问；撞 max_turns 时历史可能不完整，
-            # 保守起见也接上已产出的部分（与 ops-qa-bot 一样保留上下文）。
-            try:
-                self._history = result.to_input_list()
-            except Exception:  # noqa: BLE001 —— 极端情况下拿不到就保留旧历史
-                logger.debug("to_input_list() 失败，保留旧历史", exc_info=True)
 
         yield {
             "type": "done",
@@ -404,14 +404,13 @@ class OpsQABot:
         是否指向真实存在的文档——把"答案必须引用真实文档"从 prompt 自律变成硬校验。
 
         注意：结构化输出不便逐 token 流式，这里走非流式 `Runner.run`。多轮历史与
-        流式 `ask()` 共享 `self._history`。
+        流式 `ask()` 共享同一 `self._session`。
         """
         logger.info("question (structured): %s", question)
         agent = self._get_structured_agent()
-        input_items = self._history + [{"role": "user", "content": question}]
         subtype = "success"
         try:
-            result = await Runner.run(agent, input=input_items, **self._run_kwargs())
+            result = await Runner.run(agent, input=question, **self._run_kwargs())
         except MaxTurnsExceeded:
             # 撞上限时没有合法契约可返回，退化成一个 reject 契约并标记 subtype。
             return StructuredAnswer(
@@ -459,10 +458,6 @@ class OpsQABot:
 
         contract = result.final_output  # 已被 SDK 按 schema 校验
         assert isinstance(contract, AnswerContract)
-        try:
-            self._history = result.to_input_list()
-        except Exception:  # noqa: BLE001
-            logger.debug("to_input_list() 失败，保留旧历史", exc_info=True)
 
         # 路由：非流式没有 handoff 事件流，用 last_agent 与入口 agent 对比推断——
         # 落点 != 入口 说明发生过 handoff（专家 / 协调者），落点 == 入口即分诊自答。
@@ -496,10 +491,9 @@ class OpsQABot:
         if not self.guardrails:
             raise RuntimeError("answer_guarded 需要以 guardrails=True 构造 OpsQABot")
         logger.info("question (guarded): %s", question)
-        input_items = self._history + [{"role": "user", "content": question}]
         approvals: list[tuple[ApprovalRequest, bool]] = []
         try:
-            result = await Runner.run(self._agent, input=input_items, **self._run_kwargs())
+            result = await Runner.run(self._agent, input=question, **self._run_kwargs())
             # 处理写操作审批中断，直到没有待批项。
             while result.interruptions:
                 state = result.to_state()
@@ -514,7 +508,8 @@ class OpsQABot:
                         state.approve(itr)
                     else:
                         state.reject(itr)
-                result = await Runner.run(self._agent, state, max_turns=self.max_turns)
+                # 续跑：带上与首跑相同的 context/session（max_turns 以 state 里记录的为准）。
+                result = await Runner.run(self._agent, state, **self._run_kwargs())
         except InputGuardrailTripwireTriggered as e:
             reason = _guardrail_reason(e)
             return GuardedAnswer(
@@ -528,11 +523,6 @@ class OpsQABot:
                 approvals=approvals,
                 subtype="error_max_turns",
             )
-
-        try:
-            self._history = result.to_input_list()
-        except Exception:  # noqa: BLE001
-            logger.debug("to_input_list() 失败，保留旧历史", exc_info=True)
 
         text = (
             result.final_output

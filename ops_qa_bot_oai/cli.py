@@ -203,7 +203,7 @@ async def run_repl(
             print("再见。")
             return
         if question in _RESET_WORDS:
-            bot.reset()
+            await bot.reset()
             print("（已开启新会话）\n")
             continue
 
