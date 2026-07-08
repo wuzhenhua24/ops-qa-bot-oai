@@ -59,6 +59,10 @@ def _print_guarded(ga: GuardedAnswer) -> None:
         print(f"🛡️ bot> 已被输入护栏拦截（{ga.blocked}）：{ga.text}")
         return
     print(f"bot> {ga.text}")
+    for req, reason in ga.blacklist_rejections:
+        cmd = req.arguments.get("command", req.arguments)
+        target = req.arguments.get("target", "?")
+        print(f"  ⛔ 禁止清单自动驳回（{reason}）：在 {target} 执行 `{cmd}`（未进人工审批）")
     for req, approved in ga.approvals:
         mark = "✅ 已批准" if approved else "🚫 已驳回"
         cmd = req.arguments.get("command", req.arguments)

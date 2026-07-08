@@ -39,6 +39,7 @@ from openai.types.responses import ResponseTextDeltaEvent
 from .actions import WriteCommandLog, make_write_command_tool
 from .guardrails import (
     citation_output_guardrail,
+    detect_forbidden_command,
     injection_input_guardrail,
 )
 from .hooks import RunTelemetry
@@ -65,6 +66,22 @@ logger = logging.getLogger(__name__)
 # 单轮答题步数上限：防 agent 在文档里迷路 / 反复检索时无限烧 token。默认 30 与
 # ops-qa-bot 对齐（典型问答 turns 在个位数）。<=0 视作不限。
 DEFAULT_MAX_TURNS = 30
+
+# answer_guarded 审批循环的轮次保险丝：写提议被驳回后模型可能反复重新提议同一命令
+# （resume 不计入 max_turns，会无限循环——实测 GLM 撞上过），超过即终止本轮。
+MAX_APPROVAL_ROUNDS = 5
+
+# 驳回时回给模型的解释（rejection_message）。SDK 默认消息只说"被拒绝"不说原因，
+# 模型容易换个姿势重试；说清"别再提交、改文字建议"才能让循环自然收敛。
+_BLACKLIST_REJECTION_MSG = (
+    "该命令命中禁止清单（{label}），属毁灭性操作，**永远不会被批准**。"
+    "不要再次提交该命令或其变体；请在最终回答里说明为何拒绝、"
+    "给出更安全的替代方案，并标注 ⚠️ 风险。"
+)
+_HUMAN_REJECTION_MSG = (
+    "运维值班人已驳回该写操作提议。不要重复提交；"
+    "请在最终回答里给出文字操作建议（含步骤与 ⚠️ 风险），由人工执行。"
+)
 
 _ESCALATE_RE = re.compile(r"<<ESCALATE:([^>]*)>>")
 _CLARIFY_RE = re.compile(r"<<CLARIFY>>")
@@ -167,8 +184,10 @@ class GuardedAnswer:
     """`OpsQABot.answer_guarded()` 的返回值：答案 + 审批记录 + 护栏拦截信息。"""
 
     text: str
-    # 本轮经过审批的请求及其结果（approved=True/False）。
+    # 本轮经过**人工**审批的请求及其结果（approved=True/False）。
     approvals: list[tuple[ApprovalRequest, bool]] = field(default_factory=list)
+    # 命中禁止命令清单、审批前被自动驳回的请求及原因（没走到人工审批）。
+    blacklist_rejections: list[tuple[ApprovalRequest, str]] = field(default_factory=list)
     # 被批准并登记执行的写命令（target/command/reason）。
     approved_writes: list[Any] = field(default_factory=list)
     # 命中输入注入护栏时为拦截原因；正常为 None。
@@ -528,6 +547,9 @@ class OpsQABot:
         - agent 想调写操作工具 → run 暂停抛 interruption；用 `approver(req)->bool`
           决定批准/驳回，再 `Runner.run(agent, state)` 续跑。approver 为 None 时一律
           驳回（安全默认：无人值守不放行写操作）。
+        - **禁止命令短路**：命令命中禁止清单（`detect_forbidden_command`）时不打扰
+          审批人、直接驳回并记入 `blacklist_rejections`。工具自身还挂了 tool-level
+          guardrail 兜底（即使误批也执行不到），见 guardrails.py 的三层分级。
 
         这套 pause→approve→resume 走 SDK 的 RunState，是 ops-qa-bot 用 hook + 飞书
         回调拼出来那套 HITL 的一等公民替代。
@@ -536,24 +558,49 @@ class OpsQABot:
             raise RuntimeError("answer_guarded 需要以 guardrails=True 构造 OpsQABot")
         logger.info("question (guarded): %s", question)
         approvals: list[tuple[ApprovalRequest, bool]] = []
+        blacklist_rejections: list[tuple[ApprovalRequest, str]] = []
         # reset 只在整轮开始时做一次：审批后的续跑属于同一轮，遥测继续累计。
         self._telemetry.reset_run()
         try:
             result = await Runner.run(self._agent, input=question, **self._run_kwargs())
-            # 处理写操作审批中断，直到没有待批项。
+            # 处理写操作审批中断，直到没有待批项（轮次保险丝防模型驳回后无限重提议）。
+            rounds = 0
             while result.interruptions:
+                if rounds >= MAX_APPROVAL_ROUNDS:
+                    logger.warning("审批循环达 %d 轮仍有待批项，终止本轮", rounds)
+                    return GuardedAnswer(
+                        text=(
+                            "写操作提议被驳回后模型反复重试，本轮已终止。"
+                            "请把诉求改成咨询处理方案，或联系运维人工执行。"
+                        ),
+                        approvals=approvals,
+                        blacklist_rejections=blacklist_rejections,
+                        subtype="error_approval_loop",
+                        agent_usage=self._telemetry.agent_usage() or None,
+                    )
+                rounds += 1
                 state = result.to_state()
                 for itr in result.interruptions:
                     req = ApprovalRequest(
                         tool_name=getattr(itr, "name", "?"),
                         arguments=_interruption_args(itr),
                     )
+                    # 禁止清单短路：毁灭性命令不进人工审批，直接驳回并记录原因。
+                    # rejection_message 明确告知"永不批准、别重试"，让模型收敛到文字建议。
+                    forbidden = detect_forbidden_command(str(req.arguments.get("command", "")))
+                    if forbidden:
+                        logger.warning("写命令命中禁止清单（%s），审批前自动驳回", forbidden)
+                        blacklist_rejections.append((req, forbidden))
+                        state.reject(
+                            itr, rejection_message=_BLACKLIST_REJECTION_MSG.format(label=forbidden)
+                        )
+                        continue
                     approved = bool(approver(req)) if approver is not None else False
                     approvals.append((req, approved))
                     if approved:
                         state.approve(itr)
                     else:
-                        state.reject(itr)
+                        state.reject(itr, rejection_message=_HUMAN_REJECTION_MSG)
                 # 续跑：带上与首跑相同的 context/session（max_turns 以 state 里记录的为准）。
                 result = await Runner.run(self._agent, state, **self._run_kwargs())
         except InputGuardrailTripwireTriggered as e:
@@ -567,6 +614,7 @@ class OpsQABot:
             return GuardedAnswer(
                 text="本轮检索步数过多被中断（max_turns），结论可能不完整。",
                 approvals=approvals,
+                blacklist_rejections=blacklist_rejections,
                 subtype="error_max_turns",
             )
 
@@ -580,6 +628,7 @@ class OpsQABot:
         return GuardedAnswer(
             text=cleaned,
             approvals=approvals,
+            blacklist_rejections=blacklist_rejections,
             approved_writes=approved_writes,
             usage=_usage_dict(result),
             num_turns=_num_turns(result),

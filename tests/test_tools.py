@@ -1104,3 +1104,62 @@ def test_model_settings_wired_into_orchestration(tmp_path, monkeypatch):
         assert sp.model_settings.temperature is None
     coordinator, _ = build_coordinator_agent(root, router)
     assert coordinator.model_settings.parallel_tool_calls is True
+
+
+# ---------------------------------------------------------------------------
+# 禁止命令分层（tool-level guardrail + 审批前短路）
+# ---------------------------------------------------------------------------
+
+
+def test_detect_forbidden_command_hits():
+    from ops_qa_bot_oai.guardrails import detect_forbidden_command
+
+    assert detect_forbidden_command("rm -rf /") == "整机删除(rm 根目录)"
+    assert detect_forbidden_command("rm -rf /*") == "整机删除(rm 根目录)"
+    assert detect_forbidden_command("rm -rf --no-preserve-root /") is not None
+    assert detect_forbidden_command("redis-cli FLUSHALL") == "清空 Redis 数据(FLUSH)"
+    assert detect_forbidden_command("redis-cli -n 3 flushdb") == "清空 Redis 数据(FLUSH)"
+    assert detect_forbidden_command("mysql -e 'DROP DATABASE prod'") == "删除库/表(DROP)"
+    assert detect_forbidden_command("mkfs.ext4 /dev/sdb1") == "格式化文件系统(mkfs)"
+    assert detect_forbidden_command("dd if=/dev/zero of=/dev/sda bs=1M") == "直写块设备(dd)"
+
+
+def test_detect_forbidden_command_misses_legit_writes():
+    """一般写命令（有风险但可能合理）不在禁止清单——它们走人工审批。"""
+    from ops_qa_bot_oai.guardrails import detect_forbidden_command
+
+    assert detect_forbidden_command("systemctl restart redis") is None
+    assert detect_forbidden_command("redis-cli config set maxmemory 8gb") is None
+    assert detect_forbidden_command("rm -rf /tmp/app-cache") is None  # 删子目录 ≠ 删根
+    assert detect_forbidden_command("kafka-consumer-groups --reset-offsets ...") is None
+    assert detect_forbidden_command("dd if=/dev/sda of=/backup/disk.img") is None  # 读盘做备份
+
+
+def _tool_guardrail_data(command: str):
+    from types import SimpleNamespace
+
+    args = __import__("json").dumps({"command": command, "target": "10.0.0.1", "reason": "test"})
+    return SimpleNamespace(context=SimpleNamespace(tool_arguments=args), agent=None)
+
+
+async def test_forbidden_tool_guardrail_rejects_and_allows():
+    from ops_qa_bot_oai.guardrails import forbidden_write_command_guardrail
+
+    out = await forbidden_write_command_guardrail.run(_tool_guardrail_data("redis-cli flushall"))
+    assert out.behavior["type"] == "reject_content"
+    assert "禁止清单" in out.behavior["message"]
+    assert out.output_info["matched"] == "清空 Redis 数据(FLUSH)"
+
+    out2 = await forbidden_write_command_guardrail.run(
+        _tool_guardrail_data("systemctl restart redis")
+    )
+    assert out2.behavior["type"] == "allow"
+
+
+def test_write_command_tool_carries_forbidden_guardrail():
+    """护栏挂在工具对象上、随工具走：任何 agent 挂此工具即自带禁止清单防线。"""
+    from ops_qa_bot_oai.actions import WriteCommandLog, make_write_command_tool
+    from ops_qa_bot_oai.guardrails import forbidden_write_command_guardrail
+
+    tool = make_write_command_tool(WriteCommandLog())
+    assert forbidden_write_command_guardrail in (tool.tool_input_guardrails or [])

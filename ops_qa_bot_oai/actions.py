@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from agents import RunContextWrapper, function_tool
 
+from .guardrails import forbidden_write_command_guardrail
 from .tools import DocsContext
 
 
@@ -47,9 +48,18 @@ def make_write_command_tool(log: WriteCommandLog):
 
     用闭包捕获 log，工具被实际执行（= 已通过审批）时往 log 追加一条 approved 记录。
     被驳回时工具根本不执行，log 不会有这条——审批结果如实反映在 log 上。
+
+    写操作三层分级（禁止清单见 guardrails.py）：
+    - 只读工具（read_doc 等）：直接执行。
+    - 一般写命令：本工具 needs_approval 挂起等人批。
+    - 禁止清单（毁灭性命令）：tool-level guardrail 即使被误批也拒执行（兜底）；
+      正常流程里在 answer_guarded 的审批前短路就拦掉了，不打扰审批人。
     """
 
-    @function_tool(needs_approval=True)
+    @function_tool(
+        needs_approval=True,
+        tool_input_guardrails=[forbidden_write_command_guardrail],
+    )
     def request_write_command(
         ctx: RunContextWrapper[DocsContext], command: str, target: str, reason: str
     ) -> str:
