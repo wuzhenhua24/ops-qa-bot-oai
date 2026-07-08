@@ -1334,7 +1334,7 @@ wheels = [
 
 [[package]]
 name = "openai-agents"
-version = "0.17.5"
+version = "0.18.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "griffelib" },
@@ -1342,13 +1342,12 @@ dependencies = [
     { name = "openai" },
     { name = "pydantic" },
     { name = "requests" },
-    { name = "types-requests" },
     { name = "typing-extensions" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/72/fe/ef185f2a21f2fba1b0b107f72a7646bb51369d4c4025e2ab4d1ec65764f3/openai_agents-0.17.5.tar.gz", hash = "sha256:5dd46943b993e1a68a78acd254fc6a00cf0455fc3dcc802078ea26964b14278c", size = 5420036, upload-time = "2026-06-11T04:12:35.775Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e2/53/80500b9001a9cd06bd1f648b0e8ad074abc41899dce35810dce33dccd519/openai_agents-0.18.0.tar.gz", hash = "sha256:7971c7d2c3f4a1e14f552b288d83c24cca33f45cafa5821b2aaa12b77dbe24d9", size = 5509908, upload-time = "2026-07-07T06:02:35.583Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b9/f0/9184cd6d3d089a568fc544f1c7f0965d63818fa310c912b30abd333ea138/openai_agents-0.17.5-py3-none-any.whl", hash = "sha256:9afa8a67f0b9fbcdfd2d1545b38d3c52d47e4182921cb79952ad61580d950973", size = 846844, upload-time = "2026-06-11T04:12:32.485Z" },
+    { url = "https://files.pythonhosted.org/packages/04/c4/02a294f7511df2b110368ce36cb1c9132c542e446f04e8d0fde5db35fe53/openai_agents-0.18.0-py3-none-any.whl", hash = "sha256:4126b982b23598073e6e15305c4e515a80c0073e7beeb0895cd43611ea86f1b2", size = 859699, upload-time = "2026-07-07T06:02:33.706Z" },
 ]
 
 [package.optional-dependencies]
@@ -1383,8 +1382,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "lark-oapi", marker = "extra == 'feishu'", specifier = ">=1.6.6" },
-    { name = "openai-agents", specifier = ">=0.17.5" },
-    { name = "openai-agents", extras = ["litellm"], marker = "extra == 'litellm'", specifier = ">=0.17.5" },
+    { name = "openai-agents", specifier = ">=0.18.0" },
+    { name = "openai-agents", extras = ["litellm"], marker = "extra == 'litellm'", specifier = ">=0.18.0" },
     { name = "python-dotenv", specifier = ">=1.0" },
 ]
 provides-extras = ["litellm", "feishu"]
@@ -2577,18 +2576,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e4/51/9aed62104cea109b820bbd6c14245af756112017d309da813ef107d42e7e/typer-0.25.1.tar.gz", hash = "sha256:9616eb8853a09ffeabab1698952f33c6f29ffdbceb4eaeecf571880e8d7664cc", size = 122276, upload-time = "2026-04-30T19:32:16.964Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3f/f9/2b3ff4e56e5fa7debfaf9eb135d0da96f3e9a1d5b27222223c7296336e5f/typer-0.25.1-py3-none-any.whl", hash = "sha256:75caa44ed46a03fb2dab8808753ffacdbfea88495e74c85a28c5eefcf5f39c89", size = 58409, upload-time = "2026-04-30T19:32:18.271Z" },
-]
-
-[[package]]
-name = "types-requests"
-version = "2.33.0.20260518"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "urllib3" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e0/01/c5a19253fe1ac159159ddf9a3a07cec8bb5e486ec4d9002ad2821da0e5d2/types_requests-2.33.0.20260518.tar.gz", hash = "sha256:df7bd3bfe0ca8402dfb841e7d9be714bb5578203283d66d7dc4ef69343449a5e", size = 24752, upload-time = "2026-05-18T06:07:37.966Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1c/bc/b139710a3b6018f7fb2b9508b35c8af564e61bf2bf4fa619d088f3e16f85/types_requests-2.33.0.20260518-py3-none-any.whl", hash = "sha256:626d697d1adaaff76e2044dc8c5c051d8f21abc157bdfe204a75558076fe0bf0", size = 21391, upload-time = "2026-05-18T06:07:37.044Z" },
 ]
 
 [[package]]
