@@ -1,11 +1,11 @@
-# ops-qa-bot-openai
+# ops-qa-bot-oai
 
 基于 [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) 的内部运维文档问答机器人。
 
 本项目与姊妹项目 [`ops-qa-bot`](../ops-qa-bot)（用 **Claude Agent SDK** 构建）是**互补的两种方案**，不是竞品：
 
 - **`ops-qa-bot`（Claude Agent SDK）**：基于 CLI、开箱即用、上手快，作为内部运维问答的成熟方案已经跑得很好。
-- **`ops-qa-bot-openai`（OpenAI Agents SDK，本项目）**：进程内、provider 可换、每个原语（工具 / 输出契约 / handoffs / guardrails / HITL）都可组合可替换——**自由度更大**，定位是承接原项目"够不着"的场景与全新场景。
+- **`ops-qa-bot-oai`（OpenAI Agents SDK，本项目）**：进程内、provider 可换、每个原语（工具 / 输出契约 / handoffs / guardrails / HITL）都可组合可替换——**自由度更大**，定位是承接原项目"够不着"的场景与全新场景。
 
 > 项目早期做过两者的并排对比（保留在 [`COMPARISON.md`](./COMPARISON.md) 和评测台里供参考），现已转向"发挥 OpenAI SDK 自由度、面向新场景"的推进方向。
 
@@ -16,7 +16,7 @@
 ## 目录结构
 
 ```
-ops-qa-bot-openai/
+ops-qa-bot-oai/
 ├── docs/                     # 运维文档根目录（复用 ops-qa-bot 的同一份文档素材）
 │   ├── INDEX.md              # 路由表：组件 / 目录 / 负责人 open_id
 │   └── redis|mysql|kafka|gateway|container/  # 各组件本地 markdown

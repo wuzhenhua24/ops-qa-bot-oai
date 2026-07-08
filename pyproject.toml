@@ -1,5 +1,5 @@
 [project]
-name = "ops-qa-bot-openai"
+name = "ops-qa-bot-oai"
 version = "0.1.0"
 description = "基于 OpenAI Agents SDK 的内部运维文档问答机器人（对标 Claude Agent SDK 版 ops-qa-bot）"
 readme = "README.md"

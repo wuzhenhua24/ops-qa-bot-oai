@@ -1,5 +1,5 @@
 {
-  "description": "ops-qa-bot-openai 评测题集。映射到项目自带 docs/（redis/mysql/kafka/gateway/container）。expected_decision 为 null 表示不评分该项（如问候）。expected_component 是期望被引用的组件目录名。expected_route 是期望路由（仅 multi/auto 模式评分）：组件目录名 / \"coordinator\"（跨组件）/ \"self\"（分诊自答）/ null（不评分）。",
+  "description": "ops-qa-bot-oai 评测题集。映射到项目自带 docs/（redis/mysql/kafka/gateway/container）。expected_decision 为 null 表示不评分该项（如问候）。expected_component 是期望被引用的组件目录名。expected_route 是期望路由（仅 multi/auto 模式评分）：组件目录名 / \"coordinator\"（跨组件）/ \"self\"（分诊自答）/ null（不评分）。",
   "cases": [
     {
       "id": "redis-oom",

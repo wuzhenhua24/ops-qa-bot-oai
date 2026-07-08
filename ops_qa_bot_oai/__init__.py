@@ -1,4 +1,4 @@
-"""ops-qa-bot-openai：基于 OpenAI Agents SDK 的运维文档问答机器人。
+"""ops-qa-bot-oai：基于 OpenAI Agents SDK 的运维文档问答机器人。
 
 与 ops-qa-bot（Claude Agent SDK 版）功能对标，用于在真实场景里对比两个 agent SDK。
 """

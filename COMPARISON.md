@@ -1,6 +1,6 @@
 # 两个 SDK 实现的对比笔记
 
-| | `ops-qa-bot` | `ops-qa-bot-openai`（本项目） |
+| | `ops-qa-bot` | `ops-qa-bot-oai`（本项目） |
 |---|---|---|
 | Agent SDK | Claude Agent SDK | OpenAI Agents SDK |
 | 文档检索工具 | **内置** `Read` / `Glob` / `Grep` | **自实现** `read_doc` / `glob_docs` / `grep_docs`（`@function_tool`） |

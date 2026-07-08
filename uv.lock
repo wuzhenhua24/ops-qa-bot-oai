@@ -1357,7 +1357,7 @@ litellm = [
 ]
 
 [[package]]
-name = "ops-qa-bot-openai"
+name = "ops-qa-bot-oai"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
