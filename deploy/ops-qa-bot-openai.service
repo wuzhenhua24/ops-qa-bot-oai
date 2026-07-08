@@ -1,0 +1,61 @@
+# systemd unit — ops-qa-bot-openai（飞书长连接模式）
+#
+# 默认假设：
+#   - 项目装在 /opt/ops-qa-bot-openai
+#   - 配置（含 secret）在 /etc/ops-qa-bot-openai/ops-qa-bot-openai.env
+#   - 运行用户/组 ops-bot（非 root，需预先 useradd）
+#   - 用 uv 管理虚拟环境，解释器在 .venv/bin/python
+#   - 会话 DB / 其它运行期写入落在 /opt/ops-qa-bot-openai/data
+# 路径不一致时改 ExecStart / WorkingDirectory / EnvironmentFile / User / Group /
+# ReadWritePaths 即可（见 deploy/README.md 末节）。
+#
+# 安装：见 deploy/README.md。
+
+[Unit]
+Description=Ops QA Bot (OpenAI Agents SDK, Feishu long-connection)
+Documentation=https://github.com/<your-org>/ops-qa-bot-openai
+After=network-online.target
+Wants=network-online.target
+# 崩溃自动重启，但 60s 内连续失败 5 次就停手，避免鉴权错/配置错时无限重启刷日志。
+# （StartLimit* 自 systemd 230 起属于 [Unit]，不是 [Service]。）
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ops-bot
+Group=ops-bot
+WorkingDirectory=/opt/ops-qa-bot-openai
+
+# 配置走 EnvironmentFile：FEISHU_APP_ID/SECRET、OPENAI_API_KEY / OPS_QA_* 等全放这里。
+# 注意：run_ws.py 里的 load_dotenv 默认不覆盖已存在的环境变量，所以这里设的值优先于
+# 仓库内可能残留的 .env（建议部署目录别放 .env，配置只留在本文件一处）。
+EnvironmentFile=/etc/ops-qa-bot-openai/ops-qa-bot-openai.env
+# 日志实时刷进 journald；ProtectSystem=strict 下不往包目录写 .pyc。
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# 用 venv 里的 python 直接跑，绕开宿主机 uv/PATH。docs 默认取项目内 ./docs，换目录
+# 加 --docs /path/to/docs；也可加 --idle-ttl / --max-turns（见 run_ws.py -h）。
+ExecStart=/opt/ops-qa-bot-openai/.venv/bin/python run_ws.py
+
+Restart=on-failure
+RestartSec=10
+
+# 优雅停机：SIGTERM 让 WsRunner 收尾（停 sweeper、断开 channel），30s 后再 SIGKILL。
+KillSignal=SIGTERM
+TimeoutStopSec=30
+KillMode=mixed
+
+LimitNOFILE=65535
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# 只允许写 data 目录（会话 SQLite DB 落在这里）。OPS_QA_SESSION_DB 指向别处时同步改。
+ReadWritePaths=/opt/ops-qa-bot-openai/data
+
+[Install]
+WantedBy=multi-user.target
