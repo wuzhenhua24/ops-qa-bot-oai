@@ -30,9 +30,11 @@ from agents import (
     MaxTurnsExceeded,
     ModelBehaviorError,
     OutputGuardrailTripwireTriggered,
+    RunConfig,
     Runner,
     SQLiteSession,
 )
+from agents.extensions.handoff_filters import remove_all_tools
 from agents.memory import Session
 from openai.types.responses import ResponseTextDeltaEvent
 
@@ -48,6 +50,7 @@ from .model import (
     ModelChoice,
     ModelRouter,
     build_model_router,
+    env_flag,
     resolve_model,
     role_model_settings,
 )
@@ -268,6 +271,19 @@ class OpsQABot:
         # reset_run() 清零。见 hooks.py。
         self._telemetry = RunTelemetry()
 
+        # 转交剥噪音（run 级 handoff input_filter）：分诊 → 专家/协调者转交时，把对话里
+        # 的工具调用/输出项（历史轮次专家 read_doc 的整篇文档 dump、分诊自己的检索）从
+        # 新 agent 可见的输入里剥掉——多轮对话下这些是转交后最大的 token 负担；专家的
+        # 正式来源在答案文本里保留，需要时它自己会重新 read_doc。只影响模型可见输入，
+        # session 落盘的历史不动（SDK 语义）。所有 handoff 想要同一策略，故用 run 级
+        # RunConfig.handoff_input_filter（未设 per-handoff filter 时全局生效）；
+        # OPS_QA_HANDOFF_STRIP_TOOLS=0 可关（调试/评测 A/B 用）。
+        self._run_config: RunConfig | None = (
+            RunConfig(handoff_input_filter=remove_all_tools)
+            if env_flag("OPS_QA_HANDOFF_STRIP_TOOLS", default=True)
+            else None
+        )
+
         self._agent: Agent[DocsContext]
         self.components: list[Component]
         self.model_router: ModelRouter | None = None
@@ -372,11 +388,14 @@ class OpsQABot:
     def _run_kwargs(self) -> dict[str, Any]:
         # session：SDK 自动做多轮历史的读取与落盘（run 前取历史拼 input、run 后存新 items）。
         # hooks：运行遥测（转交链 / 按 agent 用量），调用方在 run 前 reset_run()。
+        # run_config：转交剥噪音的 handoff input_filter（见 __init__）。
         kwargs: dict[str, Any] = {
             "context": self._context,
             "session": self._session,
             "hooks": self._telemetry,
         }
+        if self._run_config is not None:
+            kwargs["run_config"] = self._run_config
         if self.max_turns is not None:
             kwargs["max_turns"] = self.max_turns
         return kwargs

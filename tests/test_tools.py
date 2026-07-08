@@ -1163,3 +1163,29 @@ def test_write_command_tool_carries_forbidden_guardrail():
 
     tool = make_write_command_tool(WriteCommandLog())
     assert forbidden_write_command_guardrail in (tool.tool_input_guardrails or [])
+
+
+# ---------------------------------------------------------------------------
+# 转交剥噪音（run 级 handoff input_filter）
+# ---------------------------------------------------------------------------
+
+
+def test_handoff_strip_tools_wired_by_default(docs_root: Path, monkeypatch):
+    """缺省开启：run_config 带 remove_all_tools，转交时剥工具项。"""
+    from agents.extensions.handoff_filters import remove_all_tools
+
+    from ops_qa_bot_oai.bot import OpsQABot
+
+    monkeypatch.delenv("OPS_QA_HANDOFF_STRIP_TOOLS", raising=False)
+    bot = OpsQABot(docs_root=docs_root, model_choice=_model_choice(), mode="multi")
+    rc = bot._run_kwargs().get("run_config")
+    assert rc is not None and rc.handoff_input_filter is remove_all_tools
+
+
+def test_handoff_strip_tools_env_off(docs_root: Path, monkeypatch):
+    """OPS_QA_HANDOFF_STRIP_TOOLS=0 关闭：不带 run_config（SDK 默认行为，转交看全量历史）。"""
+    from ops_qa_bot_oai.bot import OpsQABot
+
+    monkeypatch.setenv("OPS_QA_HANDOFF_STRIP_TOOLS", "0")
+    bot = OpsQABot(docs_root=docs_root, model_choice=_model_choice(), mode="multi")
+    assert "run_config" not in bot._run_kwargs()
