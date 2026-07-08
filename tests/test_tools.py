@@ -1339,3 +1339,105 @@ async def test_answer_guarded_accepts_async_approver(docs_root: Path):
     entry = await sm._entry(("c", "u"))
     assert entry.bot.guardrails is True
     await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# 飞书 runner 错误兜底（P0-1）：answer() 抛异常时占位消息要被编辑成错误提示，
+# 而不是永远卡在"🔍 翻文档中"。直接驱动 WsRunner._handle，用假件不建真 channel。
+# ---------------------------------------------------------------------------
+
+
+class _FakePostClient:
+    """假 FeishuClient：记录发出/更新的 post 与文本。"""
+
+    def __init__(self):
+        self.sent_posts: list[tuple[str, dict]] = []
+        self.updated_posts: list[tuple[str, dict]] = []
+        self.sent_texts: list[tuple[str, str]] = []
+
+    async def send_post(self, chat_id, post, *, parent_id=None):
+        self.sent_posts.append((chat_id, post))
+        return "ph1"  # 占位消息 id
+
+    async def update_post(self, message_id, post):
+        self.updated_posts.append((message_id, post))
+        return True
+
+    async def send_text(self, chat_id, text, *, parent_id=None):
+        self.sent_texts.append((chat_id, text))
+        return "t1"
+
+
+def _post_text(post: dict) -> str:
+    return "".join(
+        seg.get("text", "") for para in post["zh_cn"]["content"] for seg in para
+    )
+
+
+def _text_inbound(question: str = "redis 内存告警怎么处理"):
+    from types import SimpleNamespace
+
+    from lark_oapi.channel.types import TextContent
+
+    return SimpleNamespace(
+        sender=SimpleNamespace(is_bot=False),
+        chat_id="oc_chat",
+        sender_id="ou_user",
+        message_id="om_msg",
+        content=TextContent(raw={"text": question}, text=question),
+        mentions=[],
+    )
+
+
+def _bare_runner(session):
+    from types import SimpleNamespace
+
+    from ops_qa_bot_oai.feishu.runner import WsRunner
+
+    r = WsRunner.__new__(WsRunner)  # 跳过 __init__，不建真 channel
+    r._client = _FakePostClient()
+    r._session = session
+    r._approvals = SimpleNamespace()  # guardrails 关，用不到
+    return r
+
+
+async def test_runner_answer_error_edits_placeholder_to_error():
+    """answer() 抛异常 → 占位被编辑成错误提示（不抛、不卡死）。"""
+    from ops_qa_bot_oai.feishu.runner import _ERROR_TEXT
+
+    class FailingSession:
+        guardrails = False
+
+        async def answer(self, key, question, approver=None):
+            raise RuntimeError("provider 500 / 超时（模拟）")
+
+    r = _bare_runner(FailingSession())
+    await r._handle(_text_inbound())  # 不应抛出
+    assert r._client.updated_posts, "占位未被编辑——会卡在'翻文档中'，兜底失效"
+    _, err_post = r._client.updated_posts[-1]
+    assert _ERROR_TEXT in _post_text(err_post)
+    # 兜底走 @提问者 的答案 post 通道
+    assert any(seg.get("tag") == "at" for para in err_post["zh_cn"]["content"] for seg in para)
+
+
+async def test_runner_answer_ok_edits_placeholder_to_answer():
+    """成功路径不受兜底影响：答案仍正常编辑回占位。"""
+    from types import SimpleNamespace
+
+    class OkSession:
+        guardrails = False
+
+        async def answer(self, key, question, approver=None):
+            return SimpleNamespace(
+                text="先看 maxmemory 与淘汰策略。",
+                markers=SimpleNamespace(escalate=None),
+                usage={"input_tokens": 1, "output_tokens": 2},
+                num_turns=1,
+                subtype="success",
+            )
+
+    r = _bare_runner(OkSession())
+    await r._handle(_text_inbound())
+    assert r._client.updated_posts, "成功路径未落地答案"
+    _, ans_post = r._client.updated_posts[-1]
+    assert "maxmemory" in _post_text(ans_post)

@@ -45,6 +45,12 @@ from .session import SessionManager
 logger = logging.getLogger("ops_qa_bot_oai.feishu")
 
 _UNSUPPORTED = "目前只支持文字提问，关键报错请用文字描述。"
+# 兜底错误文案：answer() 抛出非预期异常（模型服务异常/超时、provider 5xx、网络抖动）
+# 时编辑进占位消息，避免用户对着"🔍 翻文档中"干等。
+_ERROR_TEXT = (
+    "⚠️ 处理这条问题时出错了（模型服务异常/超时或网络抖动），请稍后重试。"
+    "若持续失败，请联系管理员查看服务日志。"
+)
 
 
 class FeishuClient:
@@ -230,7 +236,19 @@ class WsRunner:
                     parent_id=msg_id,
                 )
 
-        result = await self._session.answer(key, question, approver=approver)
+        try:
+            result = await self._session.answer(key, question, approver=approver)
+        except Exception:
+            # answer() 内部只兜了 max_turns / 护栏，其余异常（provider 5xx、鉴权失败、
+            # 超时、网络抖动、ModelBehaviorError…）会抛到这里。不接住的话占位消息会永远
+            # 停在"🔍 翻文档中"，用户干等还不知道出错——把占位编辑成错误提示兜底。
+            # 用 Exception（非 BaseException）：不吞 asyncio.CancelledError，优雅停机不受影响。
+            logger.exception(
+                "answer failed chat=%s user=%s q=%r", chat_id, sender_id, question[:80]
+            )
+            err_post = build_answer_post(_ERROR_TEXT, asker_id=sender_id)
+            await self._deliver(chat_id, ph_id, err_post, parent_id=msg_id)
+            return
         esc = escalate_open_id(result.markers.escalate)
         final_post = build_answer_post(result.text, asker_id=sender_id, escalate_to=esc)
         # 审批轨迹（仅 GuardedAnswer 有这些字段）：黑名单自动驳回 / 人工拍板结果。
@@ -250,10 +268,7 @@ class WsRunner:
                 [{"tag": "text", "text": "⚠️ 检索步数过多被中断，结论可能不完整。"}]
             )
 
-        edited = await self._client.update_post(ph_id, final_post) if ph_id else False
-        if not edited:
-            # 占位发送/编辑失败，兜底发新消息。
-            await self._client.send_post(chat_id, final_post, parent_id=msg_id)
+        await self._deliver(chat_id, ph_id, final_post, parent_id=msg_id)
 
         u = result.usage or {}
         logger.info(
@@ -264,6 +279,15 @@ class WsRunner:
             u.get("input_tokens"),
             u.get("output_tokens"),
         )
+
+    async def _deliver(
+        self, chat_id: str, ph_id: str | None, post: dict, *, parent_id: str | None = None
+    ) -> None:
+        """最终 post 落地：优先编辑占位消息；没有占位或编辑失败则发新消息兜底。
+        成功答案与错误提示走同一条落地路径。"""
+        edited = await self._client.update_post(ph_id, post) if ph_id else False
+        if not edited:
+            await self._client.send_post(chat_id, post, parent_id=parent_id)
 
     async def _bootstrap(self) -> None:
         await self._session.start()
