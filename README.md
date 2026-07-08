@@ -356,9 +356,17 @@ uv run python run_ws.py                # 群里 @机器人 提问即可
 
 **核心问答闭环**（当前范围）：群里 @机器人 → 立即发占位消息 → 跑 `OpsQABot.answer()` → 把占位**编辑**成最终答案（头部 @ 提问者；命中 `<<ESCALATE>>` 时末尾 @ 负责人）。会话按 `(chat_id, user_id)` 隔离、`/reset` 开新会话、非文字消息回友好提示。实现见 `ops_qa_bot_oai/feishu/`，渲染纯逻辑（问题清洗 / 升级 open_id 解析 / @ 段拼装）已单测；真机运行需你的飞书凭证。
 
+**写操作审批闭环（HITL，`OPS_QA_GUARDRAILS=1` 开启）**：这是把 CLI 的 y/n 审批（`answer_guarded`）落成生产可用 HITL 的一步，也是 OpenAI SDK 的 `needs_approval` + RunState 相对 hook 方案最能打的地方。开启后飞书侧走 `answer_guarded`，写命令的处置：
+
+- agent 提议写命令 → run 在 interruption 处挂起 → 群里发**审批卡片**（命令 / 目标 / 理由 + 批准/驳回按钮）→ 占位消息改成"⏳ 等待审批"；
+- 值班人点按钮（飞书 `cardAction` 回调）→ resolve 挂起的 approver → `Runner.run(agent, state)` 续跑 → 批准则登记"待人工执行"、驳回则模型回退文字建议 → 答案编辑回占位消息；卡片原地换成结果卡（按钮移除，防重复点击）。
+- **审批人白名单** `OPS_QA_APPROVERS`（逗号分隔 open_id，不设则群内任何人可拍板）；**超时** `OPS_QA_APPROVAL_TIMEOUT` 秒（缺省 600）无人拍板自动驳回。毁灭性命令（禁止清单）在审批前短路就驳回、根本不发卡片，不打扰审批人。
+
+审批 approver 是**异步**的（`answer_guarded` 支持 awaitable approver），run 就挂在 await 上等飞书回调——不用像 ops-qa-bot 那样手工拼卡片回调链路。卡片构造 / 按钮解析 / `ApprovalCenter` 状态机（批准 / 驳回 / 白名单 / 超时 / 发卡失败）已全部单测，闭环走真模型 + 假 channel 实测通过。实现见 `feishu/approvals.py` + `feishu/render.py`。
+
 **会话历史持久化**：多轮历史走 SDK 的 **Session**（`SQLiteSession`，session_id = `chat_id:user_id`）。缺省内存态（与旧行为一致）；`.env` 里设 `OPS_QA_SESSION_DB=.sessions.db` 即落盘——bot 重启 / 会话空闲回收后，同一用户再提问时从 db 恢复上下文接着聊，`/reset` 也会清掉 db 里的历史。
 
-> 当前是核心问答闭环；反馈卡 / 追问卡 / 问答归档等产品壳层尚未做，按新场景需要再扩展。
+> 当前是核心问答闭环 + 写操作审批闭环；反馈卡 / 追问卡 / 问答归档等产品壳层尚未做，按新场景需要再扩展。
 
 **答题模式**：飞书没有命令行开关，默认 `auto`（自适应分诊，见上「答题模式」）。要固定成别的模式，在 `.env` 里设 `OPS_QA_MODE=single|multi|coordinator` 即可；启动日志会回显当前模式（`答题模式：自适应分诊（单专家 / 跨组件协调）（模型 …）`）。
 
@@ -372,6 +380,6 @@ uv run ruff format .     # 格式化
 
 ## 范围说明
 
-当前已落地：文档问答核心主线 + 五项能力（结构化契约 / 多模型路由 / 多 agent 编排 / 护栏+审批 / 评测台）+ 飞书长连接核心问答闭环。这些都建立在 OpenAI Agents SDK 的自由度之上，作为承接新场景的基座。尚未做（按新场景需要再扩展）：SSH 实时诊断、数据库只读分析、参数变更审批落地、定时跟进、飞书反馈卡 / 追问卡 / 问答归档。
+当前已落地：文档问答核心主线 + 五项能力（结构化契约 / 多模型路由 / 多 agent 编排 / 护栏+审批 / 评测台）+ 飞书长连接核心问答闭环 + 飞书写操作审批闭环（HITL 卡片）。这些都建立在 OpenAI Agents SDK 的自由度之上（Session 会话记忆、lifecycle hooks 遥测、按角色 ModelSettings、tool-level guardrails 分层、handoff input_filter），作为承接新场景的基座。尚未做（按新场景需要再扩展）：SSH 实时诊断、数据库只读分析、定时跟进、飞书反馈卡 / 追问卡 / 问答归档。
 
 > 后续方向：本项目不再以"对比 ops-qa-bot"为目标——两者是互补方案（Claude SDK 上手快、OpenAI SDK 自由度大）。重心转向**承接原项目够不着的场景与全新场景**，例如非 markdown / 向量检索的大规模知识库、跨组件协作型复杂任务、结构化数据对外接入自动化流程等。

@@ -78,3 +78,103 @@ def placeholder_text(question: str, *, clarifying: bool = False) -> str:
     if len(snippet) > 24:
         snippet = snippet[:24] + "…"
     return f"🔍 翻文档中：'{snippet}'"
+
+
+# ---------------------------------------------------------------------------
+# 写操作审批卡片（HITL）：提议 → 待批卡片（带按钮）→ 拍板后改成结果卡片
+# ---------------------------------------------------------------------------
+
+
+def _approval_fields(command: str, target: str, reason: str) -> dict[str, Any]:
+    md = f"**目标**：{target}\n**命令**：`{command}`\n**理由**：{reason}"
+    return {"tag": "div", "text": {"tag": "lark_md", "content": md}}
+
+
+def build_approval_card(
+    *, approval_id: str, command: str, target: str, reason: str, asker_id: str | None = None
+) -> dict[str, Any]:
+    """待批卡片：命令详情 + 批准/驳回按钮。按钮 value 带 approval_id + decision，
+    cardAction 回调据此定位待批项。纯函数，可单测。"""
+    elements: list[dict[str, Any]] = []
+    if asker_id:
+        elements.append(
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"提问者：<at id={asker_id}></at>"},
+            }
+        )
+    elements.append(_approval_fields(command, target, reason))
+    elements.append(
+        {
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "✅ 批准"},
+                    "type": "primary",
+                    "value": {"aid": approval_id, "decision": "approve"},
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🚫 驳回"},
+                    "type": "danger",
+                    "value": {"aid": approval_id, "decision": "reject"},
+                },
+            ],
+        }
+    )
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": "⚠️ 写操作审批：agent 提议执行变更"},
+        },
+        "elements": elements,
+    }
+
+
+def build_approval_result_card(
+    *,
+    command: str,
+    target: str,
+    reason: str,
+    approved: bool,
+    operator_name: str = "",
+    note: str = "",
+) -> dict[str, Any]:
+    """结果卡片：拍板/超时后替换待批卡片（按钮移除，防重复点击）。纯函数，可单测。"""
+    verdict = "✅ 已批准（登记为待人工执行）" if approved else "🚫 已驳回"
+    who = f"，由 {operator_name} 拍板" if operator_name else ""
+    lines = f"{verdict}{who}。" + (f"\n{note}" if note else "")
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "green" if approved else "red",
+            "title": {"tag": "plain_text", "content": "写操作审批结果"},
+        },
+        "elements": [
+            _approval_fields(command, target, reason),
+            {"tag": "div", "text": {"tag": "lark_md", "content": lines}},
+        ],
+    }
+
+
+def parse_card_action_value(value: Any) -> tuple[str, bool] | None:
+    """从 cardAction 的按钮 value 解析 (approval_id, 是否批准)；不是审批按钮返回 None。
+
+    飞书可能把 value 原样回传 dict，也可能是 JSON 字符串——两种都容。纯函数，可单测。
+    """
+    if isinstance(value, str):
+        try:
+            import json
+
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(value, dict):
+        return None
+    aid = value.get("aid")
+    decision = value.get("decision")
+    if not aid or decision not in ("approve", "reject"):
+        return None
+    return str(aid), decision == "approve"

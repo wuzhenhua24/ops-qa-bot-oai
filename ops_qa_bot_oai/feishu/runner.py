@@ -32,6 +32,7 @@ from lark_oapi.channel.config import (
 from lark_oapi.channel.types import InboundMessage, TextContent
 
 from ..model import MODE_LABELS
+from .approvals import ApprovalCenter
 from .render import (
     RESET_WORDS,
     build_answer_post,
@@ -85,6 +86,24 @@ class FeishuClient:
             return False
         return bool(getattr(r, "success", False))
 
+    async def send_card(
+        self, chat_id: str, card: dict, *, parent_id: str | None = None
+    ) -> str | None:
+        try:
+            r = await self._channel.send(chat_id, {"card": card}, self._reply_opts(parent_id))
+        except Exception:
+            logger.exception("send_card failed chat=%s", chat_id)
+            return None
+        return r.message_id if r.success else None
+
+    async def update_card(self, message_id: str, card: dict) -> bool:
+        try:
+            r = await self._channel.update_card(message_id, card)
+        except Exception:
+            logger.exception("update_card failed msg=%s", message_id)
+            return False
+        return bool(getattr(r, "success", False))
+
 
 class WsRunner:
     """长连接运行主体：建 channel、注册 message handler、跑核心问答闭环。"""
@@ -113,6 +132,9 @@ class WsRunner:
         )
         self._client = FeishuClient(self._channel)
         self._session = SessionManager(docs_root, idle_ttl=idle_ttl, max_turns=max_turns)
+        # 写操作审批闭环（HITL）：guardrails 开启时生效。cardAction 回调常驻注册（无
+        # 在途审批时回调是 no-op），审批人白名单 / 超时由 ApprovalCenter 读环境变量。
+        self._approvals = ApprovalCenter(self._client)
         logger.info(
             "答题模式：%s（模型 %s）",
             MODE_LABELS.get(self._session.mode, self._session.mode),
@@ -124,7 +146,18 @@ class WsRunner:
             if self._session.session_db == ":memory:"
             else f"落盘 {self._session.session_db}（重启/回收后可恢复上下文）",
         )
+        if self._session.guardrails:
+            who = (
+                "、".join(sorted(self._approvals.approvers))
+                or "群内任何人（未设 OPS_QA_APPROVERS）"
+            )
+            logger.info(
+                "护栏 + 写审批：开（审批人：%s；超时 %.0fs 自动驳回）",
+                who,
+                self._approvals.timeout,
+            )
         self._channel.on("message", self._on_inbound)
+        self._channel.on("cardAction", self._approvals.on_card_action)
         self._channel.on("reconnecting", lambda: logger.warning("ws reconnecting ..."))
         self._channel.on("reconnected", lambda: logger.info("ws reconnected"))
 
@@ -171,9 +204,47 @@ class WsRunner:
         }
         ph_id = await self._client.send_post(chat_id, ph_post, parent_id=msg_id)
 
-        result = await self._session.answer(key, question)
+        # 写审批 approver（guardrails 开启时用）：占位改成等待提示 → 发审批卡片 →
+        # 等值班人点按钮（超时驳回）。run 在 answer_guarded 的中断循环里挂起等它返回。
+        approver = None
+        if self._session.guardrails:
+
+            async def approver(req):
+                args = req.arguments
+                if ph_id:
+                    wait_post = {
+                        "zh_cn": {
+                            "title": "",
+                            "content": [
+                                [{"tag": "text", "text": "⏳ agent 提议了写操作，等待审批…"}]
+                            ],
+                        }
+                    }
+                    await self._client.update_post(ph_id, wait_post)
+                return await self._approvals.request(
+                    chat_id,
+                    command=str(args.get("command", "?")),
+                    target=str(args.get("target", "?")),
+                    reason=str(args.get("reason", "")),
+                    asker_id=sender_id,
+                    parent_id=msg_id,
+                )
+
+        result = await self._session.answer(key, question, approver=approver)
         esc = escalate_open_id(result.markers.escalate)
         final_post = build_answer_post(result.text, asker_id=sender_id, escalate_to=esc)
+        # 审批轨迹（仅 GuardedAnswer 有这些字段）：黑名单自动驳回 / 人工拍板结果。
+        for req, reason in getattr(result, "blacklist_rejections", None) or []:
+            cmd = req.arguments.get("command", "?")
+            final_post["zh_cn"]["content"].append(
+                [{"tag": "text", "text": f"⛔ 命令 `{cmd}` 命中禁止清单（{reason}），已自动驳回。"}]
+            )
+        for req, ok in getattr(result, "approvals", None) or []:
+            cmd = req.arguments.get("command", "?")
+            mark = "✅ 已批准（待人工执行）" if ok else "🚫 已驳回"
+            final_post["zh_cn"]["content"].append(
+                [{"tag": "text", "text": f"审批：`{cmd}` → {mark}"}]
+            )
         if result.subtype == "error_max_turns":
             final_post["zh_cn"]["content"].append(
                 [{"tag": "text", "text": "⚠️ 检索步数过多被中断，结论可能不完整。"}]

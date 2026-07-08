@@ -21,7 +21,7 @@ from pathlib import Path
 from agents import SQLiteSession
 
 from ..bot import OpsQABot
-from ..model import ModelChoice, resolve_mode, resolve_model, resolve_session_db
+from ..model import ModelChoice, env_flag, resolve_mode, resolve_model, resolve_session_db
 
 SessionKey = tuple[str, str]  # (chat_id, user_id)
 
@@ -47,6 +47,7 @@ class SessionManager:
         model_choice: ModelChoice | None = None,
         mode: str | None = None,
         session_db: str | Path | None = None,
+        guardrails: bool | None = None,
     ):
         self.docs_root = docs_root
         self.idle_ttl = idle_ttl
@@ -57,6 +58,11 @@ class SessionManager:
         self.mode = resolve_mode() if mode is None else mode
         # 会话历史库：param 显式传入优先，否则读 OPS_QA_SESSION_DB（缺省 :memory:）。
         self.session_db = str(session_db) if session_db is not None else resolve_session_db()
+        # 护栏 + 写审批（HITL）：OPS_QA_GUARDRAILS=1 开启（对应终端 --guardrails）。
+        # 开启后 answer() 走 answer_guarded，写提议经审批卡片闭环（见 approvals.py）。
+        self.guardrails = (
+            env_flag("OPS_QA_GUARDRAILS", default=False) if guardrails is None else guardrails
+        )
         self._entries: dict[SessionKey, _Entry] = {}
         self._guard = asyncio.Lock()  # 保护 _entries 结构
         self._sweeper: asyncio.Task | None = None
@@ -78,17 +84,26 @@ class SessionManager:
                     max_turns=self.max_turns,
                     mode=self.mode,
                     session=self._make_session(key),
+                    guardrails=self.guardrails,
                 )
                 entry = _Entry(bot)
                 self._entries[key] = entry
             return entry
 
-    async def answer(self, key: SessionKey, question: str):
-        """在该会话上答一题（per-key 锁内串行），返回 AnswerResult。"""
+    async def answer(self, key: SessionKey, question: str, approver=None):
+        """在该会话上答一题（per-key 锁内串行）。
+
+        guardrails 关（默认）→ `bot.answer()` 返回 AnswerResult；
+        guardrails 开 → `bot.answer_guarded(approver=...)` 返回 GuardedAnswer（approver
+        可为异步，如飞书审批卡片闭环）。两者都有 text/markers/usage/subtype，渲染层通用。
+        """
         entry = await self._entry(key)
         async with entry.lock:
             entry.last_used = time.time()
-            result = await entry.bot.answer(question)
+            if self.guardrails:
+                result = await entry.bot.answer_guarded(question, approver=approver)
+            else:
+                result = await entry.bot.answer(question)
             entry.last_used = time.time()
             return result
 

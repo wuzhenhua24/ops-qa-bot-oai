@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 from collections.abc import AsyncIterator
@@ -187,6 +188,8 @@ class GuardedAnswer:
     """`OpsQABot.answer_guarded()` 的返回值：答案 + 审批记录 + 护栏拦截信息。"""
 
     text: str
+    # 从答案里解析出的标记（escalate/clarify/followups），接入层渲染用（如飞书 @负责人）。
+    markers: Markers = field(default_factory=Markers)
     # 本轮经过**人工**审批的请求及其结果（approved=True/False）。
     approvals: list[tuple[ApprovalRequest, bool]] = field(default_factory=list)
     # 命中禁止命令清单、审批前被自动驳回的请求及原因（没走到人工审批）。
@@ -400,6 +403,19 @@ class OpsQABot:
             kwargs["max_turns"] = self.max_turns
         return kwargs
 
+    def _resume_kwargs(self) -> dict[str, Any]:
+        """审批中断续跑（`Runner.run(agent, state)`）用的 kwargs：同 `_run_kwargs` 但
+        **不传 context**。
+
+        关键：RunState 自带 context（含 DocsContext 与 `state.approve()/reject()` 记的
+        审批决定）。若 resume 再传 `context=`，SDK 的 `resolve_resumed_context` 会用一个
+        新 RunContextWrapper 覆盖 `run_state._context`——审批决定被冲掉，工具永远得不到
+        批准、模型反复重提议直到撞轮次保险丝。session/hooks/run_config 仍要保留。
+        """
+        kwargs = self._run_kwargs()
+        kwargs.pop("context", None)
+        return kwargs
+
     async def ask(self, question: str) -> AsyncIterator[dict]:
         """向 bot 提问，流式返回事件字典：
 
@@ -566,6 +582,9 @@ class OpsQABot:
         - agent 想调写操作工具 → run 暂停抛 interruption；用 `approver(req)->bool`
           决定批准/驳回，再 `Runner.run(agent, state)` 续跑。approver 为 None 时一律
           驳回（安全默认：无人值守不放行写操作）。
+        - **approver 可以是异步的**（返回 awaitable 即 await）：run 挂起在中断循环里等
+          远端拍板——飞书接入用它实现"发审批卡片 → 等值班人点按钮 → 续跑"的 HITL
+          闭环（超时/白名单在接入层的 approver 里处理，见 feishu/approvals.py）。
         - **禁止命令短路**：命令命中禁止清单（`detect_forbidden_command`）时不打扰
           审批人、直接驳回并记入 `blacklist_rejections`。工具自身还挂了 tool-level
           guardrail 兜底（即使误批也执行不到），见 guardrails.py 的三层分级。
@@ -614,14 +633,21 @@ class OpsQABot:
                             itr, rejection_message=_BLACKLIST_REJECTION_MSG.format(label=forbidden)
                         )
                         continue
-                    approved = bool(approver(req)) if approver is not None else False
+                    if approver is None:
+                        approved = False
+                    else:
+                        decision = approver(req)
+                        if inspect.isawaitable(decision):
+                            decision = await decision  # 异步 approver：挂起等远端拍板
+                        approved = bool(decision)
                     approvals.append((req, approved))
                     if approved:
                         state.approve(itr)
                     else:
                         state.reject(itr, rejection_message=_HUMAN_REJECTION_MSG)
-                # 续跑：带上与首跑相同的 context/session（max_turns 以 state 里记录的为准）。
-                result = await Runner.run(self._agent, state, **self._run_kwargs())
+                # 续跑：RunState 已携带 context（含审批决定），不能再传 context 覆盖它
+                # （见 _resume_kwargs）；session/hooks/filter 保留，max_turns 以 state 为准。
+                result = await Runner.run(self._agent, state, **self._resume_kwargs())
         except InputGuardrailTripwireTriggered as e:
             reason = _guardrail_reason(e)
             return GuardedAnswer(
@@ -642,10 +668,11 @@ class OpsQABot:
             if isinstance(result.final_output, str)
             else str(result.final_output or "")
         )
-        cleaned, _ = parse_markers(text)
+        cleaned, markers = parse_markers(text)
         approved_writes = [r for r in self.write_log.requests if r.approved]
         return GuardedAnswer(
             text=cleaned,
+            markers=markers,
             approvals=approvals,
             blacklist_rejections=blacklist_rejections,
             approved_writes=approved_writes,

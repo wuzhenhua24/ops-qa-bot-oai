@@ -1189,3 +1189,153 @@ def test_handoff_strip_tools_env_off(docs_root: Path, monkeypatch):
     monkeypatch.setenv("OPS_QA_HANDOFF_STRIP_TOOLS", "0")
     bot = OpsQABot(docs_root=docs_root, model_choice=_model_choice(), mode="multi")
     assert "run_config" not in bot._run_kwargs()
+
+
+# ---------------------------------------------------------------------------
+# 飞书写操作审批闭环（HITL）：卡片构造 / 按钮解析 / ApprovalCenter 状态机
+# ---------------------------------------------------------------------------
+
+
+def test_approval_card_builders():
+    from ops_qa_bot_oai.feishu.render import build_approval_card, build_approval_result_card
+
+    card = build_approval_card(
+        approval_id="abc123",
+        command="systemctl restart redis",
+        target="10.1.2.3",
+        reason="内存告警",
+        asker_id="ou_asker",
+    )
+    # 按钮 value 带 approval_id + decision，卡片体含命令与目标
+    actions = next(e for e in card["elements"] if e["tag"] == "action")["actions"]
+    assert {a["value"]["decision"] for a in actions} == {"approve", "reject"}
+    assert all(a["value"]["aid"] == "abc123" for a in actions)
+    body = str(card["elements"])
+    assert "systemctl restart redis" in body and "10.1.2.3" in body and "ou_asker" in body
+
+    done = build_approval_result_card(
+        command="c", target="t", reason="r", approved=True, operator_name="张三"
+    )
+    assert done["header"]["template"] == "green"
+    assert not any(e.get("tag") == "action" for e in done["elements"])  # 按钮已移除
+    assert "张三" in str(done["elements"])
+
+
+def test_parse_card_action_value():
+    from ops_qa_bot_oai.feishu.render import parse_card_action_value
+
+    assert parse_card_action_value({"aid": "x1", "decision": "approve"}) == ("x1", True)
+    assert parse_card_action_value('{"aid": "x2", "decision": "reject"}') == ("x2", False)
+    assert parse_card_action_value({"aid": "x3", "decision": "hack"}) is None
+    assert parse_card_action_value({"other": 1}) is None
+    assert parse_card_action_value("not json") is None
+    assert parse_card_action_value(None) is None
+
+
+class _FakeCardClient:
+    """假 FeishuClient：记录发出的卡片与更新。"""
+
+    def __init__(self, fail_send: bool = False):
+        self.fail_send = fail_send
+        self.sent: list[dict] = []
+        self.updated: list[tuple[str, dict]] = []
+
+    async def send_card(self, chat_id, card, *, parent_id=None):
+        if self.fail_send:
+            return None
+        self.sent.append(card)
+        return f"msg_{len(self.sent)}"
+
+    async def update_card(self, message_id, card):
+        self.updated.append((message_id, card))
+        return True
+
+
+def _card_event(aid: str, decision: str, open_id: str = "ou_boss", name: str = "值班人"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        action=SimpleNamespace(value={"aid": aid, "decision": decision}),
+        operator=SimpleNamespace(open_id=open_id, name=name),
+    )
+
+
+def _sent_aid(client: _FakeCardClient) -> str:
+    actions = next(e for e in client.sent[-1]["elements"] if e["tag"] == "action")["actions"]
+    return actions[0]["value"]["aid"]
+
+
+async def test_approval_center_approve_flow():
+    import asyncio
+
+    from ops_qa_bot_oai.feishu.approvals import ApprovalCenter
+
+    client = _FakeCardClient()
+    center = ApprovalCenter(client, approvers=frozenset(), timeout=5.0)
+    task = asyncio.ensure_future(
+        center.request("oc_chat", command="restart", target="host", reason="r")
+    )
+    await asyncio.sleep(0)  # 让 request 发出卡片并挂起
+    assert center.pending_count() == 1
+    await center.on_card_action(_card_event(_sent_aid(client), "approve"))
+    assert await task is True
+    assert center.pending_count() == 0
+    # 卡片被替换成结果卡（绿色、无按钮、带拍板人）
+    _, done = client.updated[-1]
+    assert done["header"]["template"] == "green" and "值班人" in str(done["elements"])
+
+
+async def test_approval_center_allowlist_and_reject():
+    import asyncio
+
+    from ops_qa_bot_oai.feishu.approvals import ApprovalCenter
+
+    client = _FakeCardClient()
+    center = ApprovalCenter(client, approvers=frozenset({"ou_boss"}), timeout=5.0)
+    task = asyncio.ensure_future(
+        center.request("oc_chat", command="restart", target="host", reason="r")
+    )
+    await asyncio.sleep(0)
+    aid = _sent_aid(client)
+    # 白名单外的人点击 → 忽略，仍在等
+    await center.on_card_action(_card_event(aid, "approve", open_id="ou_random"))
+    assert not task.done() and center.pending_count() == 1
+    # 白名单内的人驳回 → 生效
+    await center.on_card_action(_card_event(aid, "reject", open_id="ou_boss"))
+    assert await task is False
+    assert client.updated[-1][1]["header"]["template"] == "red"
+
+
+async def test_approval_center_timeout_and_send_failure():
+    from ops_qa_bot_oai.feishu.approvals import ApprovalCenter
+
+    # 超时自动驳回 + 结果卡标注超时
+    client = _FakeCardClient()
+    center = ApprovalCenter(client, approvers=frozenset(), timeout=0.05)
+    assert await center.request("oc_chat", command="c", target="t", reason="r") is False
+    assert "超时" in str(client.updated[-1][1]["elements"])
+    # 发卡失败 → 驳回（安全默认）
+    center2 = ApprovalCenter(_FakeCardClient(fail_send=True), approvers=frozenset(), timeout=5.0)
+    assert await center2.request("oc_chat", command="c", target="t", reason="r") is False
+
+
+async def test_answer_guarded_accepts_async_approver(docs_root: Path):
+    """approver 返回 awaitable 时被 await（飞书审批闭环的 bot 层接口契约）。"""
+    import asyncio
+    import inspect
+
+    from ops_qa_bot_oai.bot import OpsQABot
+
+    bot = OpsQABot(
+        docs_root=docs_root, model_choice=_model_choice(), mode="single", guardrails=True
+    )
+    # 不跑真模型：只验证 answer_guarded 源码里的 awaitable 分支存在且可静态确认。
+    src = inspect.getsource(bot.answer_guarded.__func__)
+    assert "isawaitable" in src and "await decision" in src
+    # 以及 SessionManager 的 guardrails 透传
+    from ops_qa_bot_oai.feishu.session import SessionManager
+
+    sm = SessionManager(docs_root, model_choice=_model_choice(), guardrails=True)
+    entry = await sm._entry(("c", "u"))
+    assert entry.bot.guardrails is True
+    await asyncio.sleep(0)
