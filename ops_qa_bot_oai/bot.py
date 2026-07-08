@@ -63,6 +63,18 @@ from .orchestration import (
     build_triage_agent,
 )
 from .prompt import build_structured_system_prompt, build_system_prompt
+from .review import (
+    REVIEWER_ROLE,
+    Draft,
+    ReviewConfig,
+    ReviewOutcome,
+    build_reviewer_agent,
+    extract_citations,
+    format_findings,
+    gather_evidence,
+    is_review_eligible,
+    review_and_revise,
+)
 from .schema import AnswerContract, Decision, FenceTolerantOutputSchema, validate_citations
 from .tools import DOC_TOOLS, DocsContext
 
@@ -155,6 +167,10 @@ class AnswerResult:
     # 按 agent 名的 token 用量（lifecycle hooks 归账），如 {"triage": {...}, "redis_specialist":
     # {...}}。多模型路由（#2）下可拆分"分诊便宜模型 vs 专家强模型"各花多少。
     agent_usage: dict[str, dict[str, int]] | None = None
+    # 二次复核（#7）元信息：是否复核过 / 是否触发了重答 / 是否标记需人工复核（B 兜底）。
+    reviewed: bool = False
+    revised: bool = False
+    needs_human_review: bool = False
 
 
 @dataclass
@@ -174,6 +190,10 @@ class StructuredAnswer:
     route: str | None = None
     # 按 agent 名的 token 用量（lifecycle hooks 归账）。
     agent_usage: dict[str, dict[str, int]] | None = None
+    # 二次复核（#7）元信息。
+    reviewed: bool = False
+    revised: bool = False
+    needs_human_review: bool = False
 
 
 @dataclass
@@ -204,6 +224,10 @@ class GuardedAnswer:
     subtype: str = "success"
     # 按 agent 名的 token 用量（lifecycle hooks 归账）。
     agent_usage: dict[str, dict[str, int]] | None = None
+    # 二次复核（#7）元信息。
+    reviewed: bool = False
+    revised: bool = False
+    needs_human_review: bool = False
 
 
 def format_tool_call(name: str, args: dict) -> str:
@@ -253,6 +277,7 @@ class OpsQABot:
         guardrails: bool = False,
         session: Session | None = None,
         diag_config: DiagConfig | None = None,
+        review_config: ReviewConfig | None = None,
     ):
         if mode not in MODES:
             raise ValueError(f"未知 mode={mode!r}，可选：{' / '.join(MODES)}")
@@ -352,9 +377,102 @@ class OpsQABot:
         # 结构化输出 agent 懒构造（仅 answer_structured 用到时才建）。
         self._structured_agent: Agent[DocsContext] | None = None
 
+        # 二次复核（#7）：另一个模型对答案做证据核对，revise-once 后交付。缺省从环境读。
+        # reviewer 用 model router 的 reviewer 角色（OPS_QA_REVIEWER_MODEL 可指到不同模型，
+        # 降低同错同漏）；single 模式没有 router 时按需建一个（仅在开启复核时）。懒构造。
+        self.review_config = review_config or ReviewConfig.from_env()
+        self.review = self.review_config.enabled
+        self._review_router: ModelRouter | None = (
+            (self.model_router or build_model_router()) if self.review else None
+        )
+        self._reviewer_agent: Agent | None = None
+
     async def reset(self) -> None:
         """清空会话上下文，开始新对话。"""
         await self._session.clear_session()
+
+    # ------------------------------------------------------------------
+    # 二次复核（#7）：另一个模型证据核对 + revise-once。见 review.py。
+    # ------------------------------------------------------------------
+
+    def _get_reviewer_agent(self) -> Agent:
+        """懒构造复核者 agent（reviewer 角色的模型，无工具、typed ReviewVerdict）。"""
+        if self._reviewer_agent is None:
+            assert self._review_router is not None
+            model = self._review_router.for_role(REVIEWER_ROLE)[1]
+            self._reviewer_agent = build_reviewer_agent(model)
+        return self._reviewer_agent
+
+    async def _review(
+        self, question: str, draft1: Draft, reanswer: Any, diag_since: int
+    ) -> ReviewOutcome:
+        """对一版答案跑 revise-once 复核。不合格（反问/无可核对证据）时原样返回。
+
+        证据 = 引用文档实际内容 + **本轮**（diag_since 之后）的诊断输出，reviewer 只在此
+        范围内核对（见 review.gather_evidence）。
+        """
+        if not is_review_eligible(draft1.citations, draft1.risky, draft1.clarify):
+            return ReviewOutcome(final=draft1)
+
+        def evidence_fn(d: Draft) -> str:
+            outs = [r.output for r in self.diag_log.results[diag_since:] if r.output]
+            return gather_evidence(
+                self.docs_root,
+                d.citations,
+                outs,
+                max_chars=self.review_config.max_evidence_chars,
+            )
+
+        outcome = await review_and_revise(
+            agent=self._get_reviewer_agent(),
+            question=question,
+            draft1=draft1,
+            evidence_fn=evidence_fn,
+            reanswer=reanswer,
+        )
+        if outcome.reviewed:
+            logger.info(
+                "review: verdict1=%s revised=%s verdict2=%s escalate=%s caveat=%s",
+                getattr(outcome.verdict1, "verdict", None),
+                outcome.revised,
+                getattr(outcome.verdict2, "verdict", None),
+                outcome.escalate,
+                bool(outcome.caveat),
+            )
+        return outcome
+
+    def _apply_review_outcome(self, outcome: ReviewOutcome) -> Any:
+        """把复核结果落到最终结果对象上：附注解（A）/ 标记需人工复核（B）/ 记元信息。"""
+        payload = outcome.final.payload
+        if not outcome.reviewed:
+            return payload
+        payload.reviewed = True
+        payload.revised = outcome.revised
+        if outcome.caveat:  # A：低风险，带注解交付，把判断交回给人。
+            self._append_answer_text(
+                payload,
+                "⚠️ **复核提示**：以下几点经二次复核后仍存疑，请留意核对：\n" + outcome.caveat,
+            )
+        if outcome.escalate:  # B：涉及诊断/写，复核仍不过 → 标记需人工复核。
+            payload.needs_human_review = True
+            v2 = outcome.verdict2
+            findings = format_findings(v2.findings) if v2 else ""
+            self._append_answer_text(
+                payload,
+                "⚠️ **二次复核未通过（涉及实时诊断/写操作）**：\n"
+                + findings
+                + "\n\n**建议人工复核确认后再执行相关操作。**",
+            )
+        return payload
+
+    @staticmethod
+    def _append_answer_text(payload: Any, note: str) -> None:
+        """把复核注解追加到答案正文：结构化写进 contract.answer，其余写进 text。"""
+        block = f"\n\n---\n{note}"
+        if isinstance(payload, StructuredAnswer):
+            payload.contract.answer = (payload.contract.answer or "") + block
+        else:
+            payload.text = (payload.text or "") + block
 
     def _get_structured_agent(self) -> Agent[DocsContext]:
         """懒构造结构化输出图：结构化输出与路由**正交**——按 self.mode 复用同一套编排图，
@@ -482,7 +600,29 @@ class OpsQABot:
         }
 
     async def answer(self, question: str) -> AnswerResult:
-        """一次性返回完整答案 + 用量 + 解析出的标记。"""
+        """一次性返回完整答案 + 用量 + 解析出的标记。开启复核（#7）时叠加 revise-once 核对。"""
+        if not self.review:
+            return await self._answer_once(question)
+        diag_since = len(self.diag_log.results)
+        r1 = await self._answer_once(question)
+
+        def to_draft(r: AnswerResult) -> Draft:
+            return Draft(
+                text=r.text,
+                citations=extract_citations(r.text),
+                risky=len(self.diag_log.results) > diag_since,
+                clarify=r.markers.clarify,
+                payload=r,
+            )
+
+        async def reanswer(note: str) -> Draft:
+            return to_draft(await self._answer_once(note))
+
+        outcome = await self._review(question, to_draft(r1), reanswer, diag_since)
+        return self._apply_review_outcome(outcome)
+
+    async def _answer_once(self, question: str) -> AnswerResult:
+        """产出一版自由文本答案（不含复核）。复核开启时被 answer() 调用两次（原答 + 重答）。"""
         logger.info("question: %s", question)
         chunks: list[str] = []
         usage: dict | None = None
@@ -516,6 +656,30 @@ class OpsQABot:
         )
 
     async def answer_structured(self, question: str) -> StructuredAnswer:
+        """结构化输出模式（差异化 #1）。开启复核（#7）时叠加 revise-once 核对。"""
+        if not self.review:
+            return await self._answer_structured_once(question)
+        diag_since = len(self.diag_log.results)
+        r1 = await self._answer_structured_once(question)
+
+        def to_draft(r: StructuredAnswer) -> Draft:
+            c = r.contract
+            return Draft(
+                text=c.answer,
+                citations=list(c.citations),
+                risky=len(self.diag_log.results) > diag_since,
+                # 只复核真答题（decision=answer）；反问/拒绝/升级不下事实结论，clarify=True 跳过。
+                clarify=c.decision != Decision.answer,
+                payload=r,
+            )
+
+        async def reanswer(note: str) -> Draft:
+            return to_draft(await self._answer_structured_once(note))
+
+        outcome = await self._review(question, to_draft(r1), reanswer, diag_since)
+        return self._apply_review_outcome(outcome)
+
+    async def _answer_structured_once(self, question: str) -> StructuredAnswer:
         """结构化输出模式（差异化 #1）：返回强类型 AnswerContract + 来源真实性校验。
 
         与 `answer()` 不同，这里 agent 的 `output_type=AnswerContract`，SDK 强制模型
@@ -596,6 +760,32 @@ class OpsQABot:
         )
 
     async def answer_guarded(self, question: str, approver: Any = None) -> GuardedAnswer:
+        """带护栏 + 写审批（#4）的问答；开启复核（#7）时叠加 revise-once 核对。"""
+        if not self.guardrails:
+            raise RuntimeError("answer_guarded 需要以 guardrails=True 构造 OpsQABot")
+        if not self.review:
+            return await self._answer_guarded_once(question, approver)
+        diag_since = len(self.diag_log.results)
+        r1 = await self._answer_guarded_once(question, approver)
+
+        def to_draft(r: GuardedAnswer) -> Draft:
+            # risky：跑了实时诊断，或提议过写命令（审批/黑名单驳回/已登记任一非空）。
+            write_proposed = bool(r.approvals or r.blacklist_rejections or r.approved_writes)
+            return Draft(
+                text=r.text,
+                citations=extract_citations(r.text),
+                risky=(len(self.diag_log.results) > diag_since) or write_proposed,
+                clarify=r.markers.clarify,
+                payload=r,
+            )
+
+        async def reanswer(note: str) -> Draft:
+            return to_draft(await self._answer_guarded_once(note, approver))
+
+        outcome = await self._review(question, to_draft(r1), reanswer, diag_since)
+        return self._apply_review_outcome(outcome)
+
+    async def _answer_guarded_once(self, question: str, approver: Any = None) -> GuardedAnswer:
         """带护栏 + 写操作审批（HITL）的问答（差异化 #4，需 guardrails=True）。
 
         - 输入注入护栏命中 → 直接返回拦截结果（blocked）。

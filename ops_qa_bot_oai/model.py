@@ -118,8 +118,9 @@ def resolve_session_db() -> str:
 
 
 # 按角色的 temperature 代码默认：分诊是纯路由角色，低温更稳定（同一问题稳定转交同一
-# 专家，路由准确率不随机抖）。其余角色不设，沿用 provider 默认。
-_ROLE_TEMPERATURE_DEFAULTS: dict[str, float] = {"triage": 0.1}
+# 专家，路由准确率不随机抖）。复核者是判定角色（对证据核对、出 typed verdict），同样低温
+# 让"过/需改"的判定稳定、可复现。其余角色不设，沿用 provider 默认。
+_ROLE_TEMPERATURE_DEFAULTS: dict[str, float] = {"triage": 0.1, "reviewer": 0.0}
 
 
 def _env_float(name: str) -> float | None:
@@ -307,6 +308,11 @@ def build_model_router() -> ModelRouter:
     triage = (os.environ.get("OPS_QA_TRIAGE_MODEL") or "").strip()
     if triage:
         overrides["triage"] = triage
+    # 二次复核者角色：另一个模型对答案做证据核对（差异化 #7）。建议指到与答题不同的模型，
+    # 降低同错同漏；缺省回退默认模型。
+    reviewer = (os.environ.get("OPS_QA_REVIEWER_MODEL") or "").strip()
+    if reviewer:
+        overrides["reviewer"] = reviewer
     # 扫描 OPS_QA_MODEL_<DIR> 形式的按组件覆盖。
     for key, val in os.environ.items():
         if key.startswith(_OVERRIDE_PREFIX) and val.strip():

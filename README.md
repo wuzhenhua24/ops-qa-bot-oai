@@ -30,6 +30,7 @@ ops-qa-bot-oai/
 │   ├── guardrails.py         # 输入注入护栏 + 输出来源护栏（差异化 #4）
 │   ├── actions.py            # 写操作审批工具（needs_approval HITL）（差异化 #4）
 │   ├── diagnostics.py        # 实时诊断：run_diagnostic（测试环境只读 ssh，白名单+写路由审批）（差异化 #6）
+│   ├── review.py             # 二次复核：另一模型证据核对 + revise-once（差异化 #7）
 │   ├── hooks.py              # 运行遥测 RunHooks：精确转交链 + 按 agent token 归账（#2 量化）
 │   ├── bot.py                # OpsQABot：Agent + Runner，answer()/answer_structured()/answer_guarded()
 │   ├── cli.py                # 交互式 REPL + --ask/--structured/--mode/--guardrails
@@ -342,6 +343,55 @@ OPS_QA_DIAG=1 OPS_QA_DIAG_JUMPHOST=jumphost OPS_QA_DIAG_ALLOWED_HOSTS='10.1.*,*-
 
 **与编排模式正交**：`run_diagnostic` 挂在真正答题的 agent 上（single 的单 agent、multi/auto 的各组件专家、coordinator 的 as_tool 专家），各模式下都能在答题时按需跑实时诊断；护栏 / 写审批开着时，写命令的识别与路由自动接上上一节的 HITL 闭环。
 
+## 二次复核（差异化原型 #7）
+
+在文档问答 / 实时诊断的基础上，再配一个**复核者**（reviewer，**另一个模型**）对答案做证据核对，**revise-once 后交付**。ops-qa-bot（Claude SDK 版）没有这层；这里把它做成有界、不发散的验证闸，正好补上现有 grounding 防线（`citation_output_guardrail` 只验"引用路径存在"）够不着的那块——**引用的内容是否真的支撑结论、诊断结论是否与实时数据自相矛盾**。
+
+**为什么不会"复核没完没了"**：发散是设计问题，不是固有属性。三条纪律根除它：
+
+1. **锚定不变的证据**：reviewer 判的是"答案结论是否被它**引用文档的实际内容 / `run_diagnostic` 的实际输出**支持"。证据两轮之间不变，球门不会移动——这跟"能不能更好"这种无 ground truth 的主观标准有本质区别，天然收敛。
+2. **结构化裁决，不是对话**：reviewer 只出 typed `ReviewVerdict{verdict, findings, grounded}`，不写反驳段落；"是否通过"是字段、gate 是确定的代码。
+3. **硬上限 + 明确兜底**：最多 **revise 一次**。重答后仍不满意时，**默认不是再来一轮**，而是按风险兜底（见下）。
+
+**控制流**：
+
+```
+answer1 → 该复核？(有引用 / 跑了诊断 / 提议了写；非反问)
+  ├─ 否 → 直接发 answer1（问候/反问/纯拒绝不复核）
+  └─ 是 → verdict1 = reviewer(answer1, 证据)
+          ├─ approve → 发 answer1
+          └─ revise  → answer2 = 重答(注入 findings)
+                      verdict2 = reviewer(answer2, 证据)   # 只判收尾，绝不触发第三轮
+                      ├─ approve → 发 answer2
+                      └─ 仍 revise:
+                         ├─ 低风险        → A：发 answer2 + ⚠️ 复核提示（把判断交回给人）
+                         └─ 涉及诊断/写   → B：标记「需人工复核」（needs_human_review）
+```
+
+最坏 2 次作答 + 2 次复核，**硬收敛，没有第三轮的可能**。
+
+**关键纪律 precision > recall**：干净的本地文档量不出它的增益（happy path 本来就不会错），所以 reviewer 必须**几乎不误伤**——只在能**指出具体证据矛盾**时才 revise（引用文档没这句 / 结论和诊断输出打架 / 编造实时数据 / 写命令没走审批），主观表达（文风、详略、"能更清楚"）一律放行，拿不准 → approve。复核者自己挂了（provider 异常）时 **fail-open**（视作 approve）——安全网不该把好答案也挡下。
+
+```bash
+# 缺省关；--review 临时开（等价 OPS_QA_REVIEW=1）。开启后走非流式路径。
+uv run python run.py --review --ask "Redis 内存告警的阈值是多少？"
+#   [二次复核：另一模型证据核对，revise-once 后交付]
+#   bot> …（来源：redis/troubleshooting.md）
+#   🔎 已二次复核                       # 正确答案被 approve，不churn（precision）
+
+# 和实时诊断组合：reviewer 会拿到诊断 stdout 核对"结论 vs 实时数据"是否一致：
+OPS_QA_DIAG=1 uv run python run.py --diagnostics --review \
+  --ask "10.1.2.3 现在 redis 淘汰策略是什么？内存到顶会怎样？"
+
+# 复核用另一个模型（降低同错同漏），走 model router 的 reviewer 角色：
+OPS_QA_MODEL=glm-4.6 OPS_QA_REVIEWER_MODEL=gpt-5 \
+  uv run python run.py --review
+```
+
+环境变量：`OPS_QA_REVIEW`（开关）/ `OPS_QA_REVIEWER_MODEL`（复核者模型，建议与答题不同）/ `OPS_QA_REVIEW_MAX_EVIDENCE`（证据截断上限）。终端 `--review`，飞书认 `OPS_QA_REVIEW=1`。**与编排/输出/护栏/诊断正交**：在 `answer()` / `answer_guarded()` / `answer_structured()` 三条非流式路径收尾处叠加（流式 REPL 开 `--review` 时自动切非流式，因为答案要先成型才能核对）。实现见 `ops_qa_bot_oai/review.py`；四条终态（approve / revise→approve / 仍不过→A / 仍不过→B）+ fail-open 由 `tests/test_review.py` 的桩化用例锁住。
+
+> **关于"收益量不量得出"**：干净文档上 reviewer 无错可抓，聚合评测量不出增益是正常的——安全网要在"它该拦的失败"上量，不在 happy path 量。落地上靠**可观测**取信号：每次复核落日志（`review: verdict1=… revised=… escalate=…`），答案带 `reviewed/revised/needs_human_review` 元信息，肉眼翻 trace 就能判断"重答是修了真问题还是把好答案改花了"。要量化 catch rate，可往 `eval/cases.json` 加对抗性 fixture（文档说 X 诱导说非 X、诊断 94% 却说正常、引用存在但不支撑）——在它该拦的失败上量，而非正常题。
+
 ## 离线评测 harness（差异化原型 #5）
 
 进程内库 + provider 可换 + 模式可换，天然适合搭评测台：**同一题集 × 多个配置**跑一遍、打分、出报告——把"换模型 / 单 agent vs 多 agent / 改 prompt"的效果变成可量化数字，用于回归与选型（改了检索策略或 prompt 后，跑一遍看决策/转交/来源真实率有没有掉）。
@@ -413,6 +463,6 @@ uv run ruff format .     # 格式化
 
 ## 范围说明
 
-当前已落地：文档问答核心主线 + 六项能力（结构化契约 / 多模型路由 / 多 agent 编排 / 护栏+审批 / 评测台 / 实时诊断）+ 飞书长连接核心问答闭环 + 飞书写操作审批闭环（HITL 卡片）。这些都建立在 OpenAI Agents SDK 的自由度之上（Session 会话记忆、lifecycle hooks 遥测、按角色 ModelSettings、tool-level guardrails 分层、handoff input_filter），作为承接新场景的基座。尚未做（按新场景需要再扩展）：数据库只读分析、定时跟进、飞书反馈卡 / 追问卡 / 问答归档。
+当前已落地：文档问答核心主线 + 七项能力（结构化契约 / 多模型路由 / 多 agent 编排 / 护栏+审批 / 评测台 / 实时诊断 / 二次复核）+ 飞书长连接核心问答闭环 + 飞书写操作审批闭环（HITL 卡片）。这些都建立在 OpenAI Agents SDK 的自由度之上（Session 会话记忆、lifecycle hooks 遥测、按角色 ModelSettings、tool-level guardrails 分层、handoff input_filter），作为承接新场景的基座。尚未做（按新场景需要再扩展）：数据库只读分析、定时跟进、飞书反馈卡 / 追问卡 / 问答归档。
 
 > 后续方向：本项目不再以"对比 ops-qa-bot"为目标——两者是互补方案（Claude SDK 上手快、OpenAI SDK 自由度大）。重心转向**承接原项目够不着的场景与全新场景**，例如非 markdown / 向量检索的大规模知识库、跨组件协作型复杂任务、结构化数据对外接入自动化流程等。

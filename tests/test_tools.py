@@ -1329,8 +1329,9 @@ async def test_answer_guarded_accepts_async_approver(docs_root: Path):
     bot = OpsQABot(
         docs_root=docs_root, model_choice=_model_choice(), mode="single", guardrails=True
     )
-    # 不跑真模型：只验证 answer_guarded 源码里的 awaitable 分支存在且可静态确认。
-    src = inspect.getsource(bot.answer_guarded.__func__)
+    # 不跑真模型：只验证审批核心里的 awaitable 分支存在且可静态确认。
+    # 审批中断循环在 _answer_guarded_once（复核 #7 把 answer_guarded 拆成"核心 + 复核包装"）。
+    src = inspect.getsource(bot._answer_guarded_once.__func__)
     assert "isawaitable" in src and "await decision" in src
     # 以及 SessionManager 的 guardrails 透传
     from ops_qa_bot_oai.feishu.session import SessionManager

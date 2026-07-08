@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from .bot import GuardedAnswer, OpsQABot, StructuredAnswer, format_tool_call
 from .diagnostics import DiagConfig
 from .model import MODE_LABELS, MODES, resolve_mode, resolve_model
+from .review import ReviewConfig
 
 _RESET_WORDS = {"/reset", "/new", "新对话", "重置"}
 
@@ -108,6 +109,26 @@ def _diag_line(cfg: DiagConfig) -> str | None:
     return f"实时诊断：测试环境只读 · {how} · 目标白名单：{hosts}"
 
 
+def _resolve_review_config(force_on: bool) -> ReviewConfig:
+    """解析二次复核配置：读 OPS_QA_REVIEW*；--review 可强制开启。"""
+    cfg = ReviewConfig.from_env()
+    if force_on and not cfg.enabled:
+        cfg = replace(cfg, enabled=True)
+    return cfg
+
+
+def _review_note(result: object) -> str | None:
+    """一行展示复核元信息（是否重答 / 是否需人工复核）；未复核返回 None。"""
+    if not getattr(result, "reviewed", False):
+        return None
+    bits = ["已二次复核"]
+    if getattr(result, "revised", False):
+        bits.append("触发过重答")
+    if getattr(result, "needs_human_review", False):
+        bits.append("⚠️ 需人工复核")
+    return "🔎 " + "、".join(bits)
+
+
 def _orchestration_lines(mode: str, bot: OpsQABot) -> list[str]:
     """编排模式的横幅细节（组件专家名单 + 模型路由）；single 模式返回空。"""
     if mode == "single":
@@ -132,17 +153,20 @@ async def run_once(
     mode: str = "single",
     guardrails: bool = False,
     diagnostics: bool = False,
+    review: bool = False,
 ) -> None:
     """一次性问一个问题就退出（适合脚本调用 / 批量跑题）。"""
     model_choice = resolve_model()
     diag_config = _resolve_diag_config(diagnostics)
-    # 路由(mode) × 输出(structured) × 护栏(guardrails) × 诊断(diagnostics) 正交，可任意组合。
+    review_config = _resolve_review_config(review)
+    # 路由 × 输出 × 护栏 × 诊断 × 复核 正交，可任意组合。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
         mode=mode,
         guardrails=guardrails,
         diag_config=diag_config,
+        review_config=review_config,
     )
     if show_tools:
         if mode != "single":
@@ -150,7 +174,9 @@ async def run_once(
                 print(f"[{ln}]")
         if line := _diag_line(diag_config):
             print(f"[{line}]")
-        if mode != "single" or diag_config.enabled:
+        if review_config.enabled:
+            print("[二次复核：另一模型证据核对，revise-once 后交付]")
+        if mode != "single" or diag_config.enabled or review_config.enabled:
             print()
 
     if guardrails and not structured:
@@ -159,6 +185,8 @@ async def run_once(
             print("[护栏：输入注入检测 + 写操作审批；一次性模式下写操作默认驳回]\n")
         ga = await bot.answer_guarded(question, approver=None)
         _print_guarded(ga)
+        if rn := _review_note(ga):
+            print(rn)
         if ga.usage:
             print(
                 f"\n[in={ga.usage.get('input_tokens', 0)} "
@@ -174,6 +202,8 @@ async def run_once(
         if show_tools and sa.num_turns is not None:
             print(f"[模型 {model_choice.description} · {sa.num_turns} 次模型调用 · 结构化输出]\n")
         _print_structured(sa)
+        if rn := _review_note(sa):
+            print(rn)
         if sa.usage:
             print(
                 f"\n[in={sa.usage.get('input_tokens', 0)} "
@@ -188,6 +218,8 @@ async def run_once(
     if show_tools and result.num_turns is not None:
         print(f"[模型 {model_choice.description} · {result.num_turns} 次模型调用]\n")
     print(result.text)
+    if rn := _review_note(result):
+        print(rn)
     notes = []
     if result.markers.clarify:
         notes.append("这是一轮反问（CLARIFY）")
@@ -216,16 +248,19 @@ async def run_repl(
     mode: str = "single",
     guardrails: bool = False,
     diagnostics: bool = False,
+    review: bool = False,
 ) -> None:
     model_choice = resolve_model()
     diag_config = _resolve_diag_config(diagnostics)
-    # 路由(mode) × 输出(structured) × 护栏(guardrails) × 诊断(diagnostics) 正交，可任意组合。
+    review_config = _resolve_review_config(review)
+    # 路由 × 输出 × 护栏 × 诊断 × 复核 正交，可任意组合。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
         mode=mode,
         guardrails=guardrails,
         diag_config=diag_config,
+        review_config=review_config,
     )
     approver = _make_approver(interactive=True) if guardrails else None
     parts = []
@@ -237,6 +272,8 @@ async def run_repl(
         parts.append("护栏 + 写操作审批")
     if diag_config.enabled:
         parts.append("实时诊断")
+    if review_config.enabled:
+        parts.append("二次复核")
     print("运维文档问答机器人（OpenAI Agents SDK）")
     print(f"文档根目录：{docs_root}")
     print(f"模型：{model_choice.description}" + (f"（{'；'.join(parts)}）" if parts else ""))
@@ -244,6 +281,8 @@ async def run_repl(
         print(ln)
     if line := _diag_line(diag_config):
         print(line)
+    if review_config.enabled:
+        print("二次复核：另一模型证据核对，revise-once 后交付（低风险带注解、诊断/写不过转人工）")
     print("输入问题后回车提问；/reset 开新会话；空行或 Ctrl+C 退出。\n")
 
     while True:
@@ -278,6 +317,28 @@ async def run_repl(
             try:
                 sa = await bot.answer_structured(question)
                 _print_structured(sa)
+                if rn := _review_note(sa):
+                    print(rn)
+                print()
+            except KeyboardInterrupt:
+                print("\n（已中断本次回答）\n")
+            except Exception as e:  # noqa: BLE001
+                print(f"\n[出错] {type(e).__name__}: {e}\n")
+            continue
+
+        if review_config.enabled:
+            # 复核走非流式 answer()：答案要先成型才能核对，没法边流式边改（与 --guardrails 同理）。
+            try:
+                result = await bot.answer(question)
+                print(f"bot> {result.text}")
+                if rn := _review_note(result):
+                    print(rn)
+                if result.usage:
+                    print(
+                        f"  [in={result.usage.get('input_tokens', 0)} "
+                        f"out={result.usage.get('output_tokens', 0)} "
+                        f"reqs={result.usage.get('requests', 0)}]"
+                    )
                 print()
             except KeyboardInterrupt:
                 print("\n（已中断本次回答）\n")
@@ -365,6 +426,12 @@ def main() -> None:
         help="开启实时诊断（测试环境只读 run_diagnostic），等价 OPS_QA_DIAG=1；"
         "未配 OPS_QA_DIAG_JUMPHOST 时自动降级为模拟执行。配合 --guardrails 时写命令走审批",
     )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="开启二次复核（等价 OPS_QA_REVIEW=1）：另一模型对答案做证据核对，revise-once 后交付。"
+        "OPS_QA_REVIEWER_MODEL 可指到不同模型。开启后走非流式路径",
+    )
     args = parser.parse_args()
     docs_root = Path(args.docs).resolve()
     show_tools = not args.hide_tools
@@ -378,6 +445,7 @@ def main() -> None:
                 mode=args.mode,
                 guardrails=args.guardrails,
                 diagnostics=args.diagnostics,
+                review=args.review,
             )
         )
     else:
@@ -389,6 +457,7 @@ def main() -> None:
                 mode=args.mode,
                 guardrails=args.guardrails,
                 diagnostics=args.diagnostics,
+                review=args.review,
             )
         )
 

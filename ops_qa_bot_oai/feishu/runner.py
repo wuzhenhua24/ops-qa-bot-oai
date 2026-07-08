@@ -33,6 +33,7 @@ from lark_oapi.channel.types import InboundMessage, TextContent
 
 from ..diagnostics import DiagConfig
 from ..model import MODE_LABELS
+from ..review import ReviewConfig
 from .approvals import ApprovalCenter
 from .render import (
     RESET_WORDS,
@@ -174,6 +175,9 @@ class WsRunner:
             )
             hosts = "、".join(diag.allowed_hosts) if diag.allowed_hosts else "不限（仍拒生产）"
             logger.info("实时诊断：开（测试环境只读；%s；目标白名单：%s）", how, hosts)
+        # 二次复核（OPS_QA_REVIEW=1）：各会话 bot 自己从环境读配置，这里只做启动日志回显。
+        if ReviewConfig.from_env().enabled:
+            logger.info("二次复核：开（另一模型证据核对，revise-once 后交付；诊断/写不过转人工）")
         self._channel.on("message", self._on_inbound)
         self._channel.on("cardAction", self._approvals.on_card_action)
         self._channel.on("reconnecting", lambda: logger.warning("ws reconnecting ..."))

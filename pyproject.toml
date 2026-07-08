@@ -46,3 +46,4 @@ select = ["E", "F", "I"]
 # 可读性，豁免行长。
 "ops_qa_bot_oai/prompt.py" = ["E501"]
 "ops_qa_bot_oai/orchestration.py" = ["E501"]
+"ops_qa_bot_oai/review.py" = ["E501"]
