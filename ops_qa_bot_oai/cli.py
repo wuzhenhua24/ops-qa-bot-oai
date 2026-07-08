@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from .bot import GuardedAnswer, OpsQABot, StructuredAnswer, format_tool_call
+from .diagnostics import DiagConfig
 from .model import MODE_LABELS, MODES, resolve_mode, resolve_model
 
 _RESET_WORDS = {"/reset", "/new", "新对话", "重置"}
@@ -89,6 +91,23 @@ def _make_approver(interactive: bool):
     return approver
 
 
+def _resolve_diag_config(force_on: bool) -> DiagConfig:
+    """解析实时诊断配置：读 OPS_QA_DIAG*；--diagnostics 可强制开启。"""
+    cfg = DiagConfig.from_env()
+    if force_on and not cfg.enabled:
+        cfg = replace(cfg, enabled=True)
+    return cfg
+
+
+def _diag_line(cfg: DiagConfig) -> str | None:
+    """实时诊断的横幅细节；未开启返回 None。"""
+    if not cfg.enabled:
+        return None
+    how = "模拟执行（未配 jumphost）" if cfg.use_mock else f"真实 ssh 经跳板机 {cfg.jumphost}"
+    hosts = "、".join(cfg.allowed_hosts) if cfg.allowed_hosts else "不限（仍拒生产）"
+    return f"实时诊断：测试环境只读 · {how} · 目标白名单：{hosts}"
+
+
 def _orchestration_lines(mode: str, bot: OpsQABot) -> list[str]:
     """编排模式的横幅细节（组件专家名单 + 模型路由）；single 模式返回空。"""
     if mode == "single":
@@ -112,20 +131,27 @@ async def run_once(
     structured: bool = False,
     mode: str = "single",
     guardrails: bool = False,
+    diagnostics: bool = False,
 ) -> None:
     """一次性问一个问题就退出（适合脚本调用 / 批量跑题）。"""
     model_choice = resolve_model()
-    # 路由(mode) × 输出格式(structured) × 护栏(guardrails) 三者正交，可任意组合。
+    diag_config = _resolve_diag_config(diagnostics)
+    # 路由(mode) × 输出(structured) × 护栏(guardrails) × 诊断(diagnostics) 正交，可任意组合。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
         mode=mode,
         guardrails=guardrails,
+        diag_config=diag_config,
     )
-    if mode != "single" and show_tools:
-        for ln in _orchestration_lines(mode, bot):
-            print(f"[{ln}]")
-        print()
+    if show_tools:
+        if mode != "single":
+            for ln in _orchestration_lines(mode, bot):
+                print(f"[{ln}]")
+        if line := _diag_line(diag_config):
+            print(f"[{line}]")
+        if mode != "single" or diag_config.enabled:
+            print()
 
     if guardrails and not structured:
         # 一次性模式无人值守：approver=None → 写操作一律驳回（安全默认）。
@@ -189,14 +215,17 @@ async def run_repl(
     structured: bool = False,
     mode: str = "single",
     guardrails: bool = False,
+    diagnostics: bool = False,
 ) -> None:
     model_choice = resolve_model()
-    # 路由(mode) × 输出格式(structured) × 护栏(guardrails) 三者正交，可任意组合。
+    diag_config = _resolve_diag_config(diagnostics)
+    # 路由(mode) × 输出(structured) × 护栏(guardrails) × 诊断(diagnostics) 正交，可任意组合。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
         mode=mode,
         guardrails=guardrails,
+        diag_config=diag_config,
     )
     approver = _make_approver(interactive=True) if guardrails else None
     parts = []
@@ -206,11 +235,15 @@ async def run_repl(
         parts.append("结构化输出")
     if guardrails:
         parts.append("护栏 + 写操作审批")
+    if diag_config.enabled:
+        parts.append("实时诊断")
     print("运维文档问答机器人（OpenAI Agents SDK）")
     print(f"文档根目录：{docs_root}")
     print(f"模型：{model_choice.description}" + (f"（{'；'.join(parts)}）" if parts else ""))
     for ln in _orchestration_lines(mode, bot):
         print(ln)
+    if line := _diag_line(diag_config):
+        print(line)
     print("输入问题后回车提问；/reset 开新会话；空行或 Ctrl+C 退出。\n")
 
     while True:
@@ -326,6 +359,12 @@ def main() -> None:
         help="开启输入注入护栏 + 写操作审批（HITL），与任何 --mode 并存；"
         "结构化模式下额外加输出来源护栏。开启后走非流式审批路径",
     )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="开启实时诊断（测试环境只读 run_diagnostic），等价 OPS_QA_DIAG=1；"
+        "未配 OPS_QA_DIAG_JUMPHOST 时自动降级为模拟执行。配合 --guardrails 时写命令走审批",
+    )
     args = parser.parse_args()
     docs_root = Path(args.docs).resolve()
     show_tools = not args.hide_tools
@@ -338,6 +377,7 @@ def main() -> None:
                 structured=args.structured,
                 mode=args.mode,
                 guardrails=args.guardrails,
+                diagnostics=args.diagnostics,
             )
         )
     else:
@@ -348,6 +388,7 @@ def main() -> None:
                 structured=args.structured,
                 mode=args.mode,
                 guardrails=args.guardrails,
+                diagnostics=args.diagnostics,
             )
         )
 

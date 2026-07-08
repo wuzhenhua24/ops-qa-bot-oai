@@ -21,9 +21,18 @@ from pathlib import Path
 from agents import Agent, Model
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
+from .diagnostics import DIAG_TOOL_NAME
 from .model import ModelRouter, role_model_settings
-from .prompt import STRUCTURED_CONTRACT_SUFFIX
+from .prompt import STRUCTURED_CONTRACT_SUFFIX, diagnostics_prompt_section
 from .tools import DOC_TOOLS, DocsContext
+
+# 写审批工具名（actions.make_write_command_tool 产出）。orchestration 按名字判断专家挂了
+# 哪些横切工具，从而决定 prompt 加哪段——避免把布尔标志一路穿过 4 个 build 函数。
+_WRITE_TOOL_NAME = "request_write_command"
+
+
+def _tool_names(tools: list | None) -> set[str]:
+    return {getattr(t, "name", "") for t in (tools or [])}
 
 
 @dataclass
@@ -105,7 +114,11 @@ def parse_index_components(docs_root: Path) -> list[Component]:
 
 
 def _specialist_instructions(
-    c: Component, *, has_write_tool: bool = False, structured: bool = False
+    c: Component,
+    *,
+    has_write_tool: bool = False,
+    has_diag_tool: bool = False,
+    structured: bool = False,
 ) -> str:
     owner = c.open_id or "（INDEX.md 未登记 open_id）"
     # 带写审批工具时，明确引导专家把"写/变更"走 request_write_command（挂起等人批），而不是
@@ -116,6 +129,10 @@ def _specialist_instructions(
         "它会挂起等人工审批，批准后才登记执行；只读诊断 / 纯知识问答不要用它。"
         if has_write_tool
         else ""
+    )
+    # 带实时诊断工具时，追加「实时诊断」章节（与 single 模式同款，has_write_tool 决定写命令去处）。
+    diag_section = (
+        diagnostics_prompt_section(has_write_tool=has_write_tool) if has_diag_tool else ""
     )
     # 结构化时来源走契约的 citations 字段，正文别写行内来源——否则跟契约要求打架、把模型带偏。
     cite_line = (
@@ -137,7 +154,7 @@ def _specialist_instructions(
 - **危险操作**（删除/重启/flush/改主库等）显式标 ⚠️ 风险，并引用文档里的对应警告。{write_block}
 - 中文、简洁、分点。
 - 信息不足以准确回答（缺版本/环境/报错码且会让答案分叉）时，先反问 1-2 个关键点，不要硬答。
-{STRUCTURED_CONTRACT_SUFFIX if structured else ""}"""
+{diag_section}{STRUCTURED_CONTRACT_SUFFIX if structured else ""}"""
 
 
 def build_specialist_agent(
@@ -158,11 +175,15 @@ def build_specialist_agent(
     专家是被 as_tool 调用、返回文字喂协调者，不传 output_type。
     """
     structured = output_type is not None
+    names = _tool_names(extra_tools)
     return Agent[DocsContext](
         name=f"{c.dir}_specialist",
         handoff_description=f"{c.name} 运维问题（{c.coverage}）",
         instructions=_specialist_instructions(
-            c, has_write_tool=bool(extra_tools), structured=structured
+            c,
+            has_write_tool=_WRITE_TOOL_NAME in names,
+            has_diag_tool=DIAG_TOOL_NAME in names,
+            structured=structured,
         ),
         tools=list(DOC_TOOLS) + list(extra_tools or []),
         model=model,

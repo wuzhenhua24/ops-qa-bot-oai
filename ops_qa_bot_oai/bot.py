@@ -40,6 +40,7 @@ from agents.memory import Session
 from openai.types.responses import ResponseTextDeltaEvent
 
 from .actions import WriteCommandLog, make_write_command_tool
+from .diagnostics import DiagConfig, DiagnosticLog, make_diagnostic_tool
 from .guardrails import (
     citation_output_guardrail,
     detect_forbidden_command,
@@ -215,6 +216,10 @@ def format_tool_call(name: str, args: dict) -> str:
         pattern = args.get("pattern", "?")
         path = args.get("path") or ""
         return f"grep_docs '{pattern}'" + (f" in {path}" if path else "")
+    if name == "run_diagnostic":
+        return f"run_diagnostic {args.get('host', '?')}: {args.get('command', '?')}"
+    if name == "request_write_command":
+        return f"request_write_command {args.get('target', '?')}: {args.get('command', '?')}"
     if name.startswith("ask_"):
         # 协调者调用组件专家（agents-as-tools）；子问题可能很长，截断展示。
         q = str(args.get("input") or args.get("question") or args.get("query") or args)
@@ -247,6 +252,7 @@ class OpsQABot:
         model_router: ModelRouter | None = None,
         guardrails: bool = False,
         session: Session | None = None,
+        diag_config: DiagConfig | None = None,
     ):
         if mode not in MODES:
             raise ValueError(f"未知 mode={mode!r}，可选：{' / '.join(MODES)}")
@@ -268,6 +274,18 @@ class OpsQABot:
         self.write_log = WriteCommandLog()
         self._input_guardrails = [injection_input_guardrail] if guardrails else []
         self._extra_tools = [make_write_command_tool(self.write_log)] if guardrails else []
+
+        # 实时诊断（测试环境只读，OPS_QA_DIAG=1 开启）：缺省从环境读，None → from_env。
+        # 开启时把 run_diagnostic 工具挂到答题 agent（single 的单 agent / 多 agent 的各专家），
+        # 与写审批工具并列进 _extra_tools；关闭时零感知。写命令在诊断里被识别后会引导模型改走
+        # request_write_command（需 guardrails 开），两者正交组合。见 diagnostics.py。
+        self.diag_config = diag_config or DiagConfig.from_env()
+        self.diagnostics = self.diag_config.enabled
+        self.diag_log = DiagnosticLog()
+        if self.diagnostics:
+            self._extra_tools = self._extra_tools + [
+                make_diagnostic_tool(self.diag_config, self.diag_log)
+            ]
 
         # 运行遥测（lifecycle hooks）：精确转交链 + 按 agent 的 token 归账。挂在 bot 上
         # 跨 run 复用（coordinator 的 as_tool 子 run 需要构建期注入同一实例），每次答题
@@ -318,7 +336,9 @@ class OpsQABot:
             self.components = []
             self._agent = Agent(
                 name="ops-qa-bot",
-                instructions=build_system_prompt(self.docs_root),
+                instructions=build_system_prompt(
+                    self.docs_root, diagnostics=self.diagnostics, has_write_tool=guardrails
+                ),
                 tools=list(DOC_TOOLS) + self._extra_tools,
                 model=self.model_choice.model,
                 model_settings=role_model_settings("single"),

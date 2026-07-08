@@ -29,6 +29,7 @@ ops-qa-bot-oai/
 │   ├── evaluate.py           # 离线评测 harness：题集 × 多模式打分出对比报告（差异化 #5）
 │   ├── guardrails.py         # 输入注入护栏 + 输出来源护栏（差异化 #4）
 │   ├── actions.py            # 写操作审批工具（needs_approval HITL）（差异化 #4）
+│   ├── diagnostics.py        # 实时诊断：run_diagnostic（测试环境只读 ssh，白名单+写路由审批）（差异化 #6）
 │   ├── hooks.py              # 运行遥测 RunHooks：精确转交链 + 按 agent token 归账（#2 量化）
 │   ├── bot.py                # OpsQABot：Agent + Runner，answer()/answer_structured()/answer_guarded()
 │   ├── cli.py                # 交互式 REPL + --ask/--structured/--mode/--guardrails
@@ -309,6 +310,38 @@ REPL 交互式按 y/n 审批；一次性 `--ask` 模式无人值守，写操作*
 
 > 相比 hook：hook 是"事后硬拦 + 退化文字建议"，这里是"事前挂起 + 人来定夺"，approve/reject 与审计天然落在 RunState 上，不用自己拼回调链路。
 
+## 实时诊断（测试环境只读，差异化原型 #6）
+
+ops-qa-bot（Claude SDK 版）的「实时诊断」：暴露 Claude 内置的 `Bash` 工具，让模型自己写 `ssh jumphost "ssh <target> '<cmd>'"`，再靠一个只看命令字符串的 PreToolUse hook（`_block_write_bash_hook`）用**黑名单**兜底拦写命令；只读命令直接跑。这套在原项目跑得很好，但有三处结构性弱点是本项目的原语能补上的。本项目把同一能力（`run_diagnostic(host, command)`，见 `diagnostics.py`）做得更稳、更安全：
+
+| ops-qa-bot（Claude SDK） | 本项目（OpenAI SDK）做得更好 |
+|---|---|
+| **自由 Bash + prompt 硬性要求嵌套 ssh 写法** | **结构化工具参数**：模型只传 `host` + 要跑的**只读命令**，跳板机 / 嵌套 ssh 由代码在底层拼（`ssh_executor`）——模型写不错两跳、也无法改用 `ssh -J` 绕过认证拓扑 |
+| **黑名单**（`_WRITE_PATTERNS`）：枚举坏命令，漏一个就放行 | **白名单优先（默认拒绝）**：只放行已知只读命令（系统 free/df/ss、日志 tail/grep、redis-cli 只读、mysql SELECT/SHOW/DESC/EXPLAIN），未知即拒；毁灭性禁止清单作**第二层兜底** |
+| **写命令只有"deny → 退化文字建议"一条死路** | **三分层**：只读→执行；识别到的写（重启 / CONFIG SET / 改库参数）→ 路由到 `request_write_command` 审批（HITL，见上节）；毁灭性→直接拒 |
+| 生产 / 目标机限制**只靠 prompt 自律** | **代码强制**：生产机（名字带 prod/production/正式）工具直接拒；可选 `allowed_hosts` glob 白名单收敛可诊断目标 |
+| 正则扫裸命令串（`awk '$3 > 100'`、`grep set` 都踩过误杀坑） | **quote-aware 分词**（`shlex` punctuation_chars）：引号内的 `>` `;` 不误判，`free; rm` 的 `;` 会被切成独立 token 拦下——注入面从解析层就切干净 |
+
+判定是**纯函数** `classify_diagnostic_command`（四态 allow / write / forbidden / reject），复用 guardrails 的 `detect_forbidden_command` 作毁灭性兜底，并给 `run_diagnostic` 叠挂了和写审批工具同源的 tool-level guardrail（误判也执行不到）。覆盖面由 `tests/test_diagnostics.py` 的"必须放行 / 写→审批 / 毁灭性拒 / 默认拒"四向用例锁住（对齐参考项目 `test_write_block.py` 的双向用例思路，升级为白名单四态）。
+
+```bash
+# 缺省关；--diagnostics 临时开（等价 OPS_QA_DIAG=1）。未配 jumphost 时自动降级为「模拟执行」，
+# 返回示例数据、不碰真实机器，方便本地先跑通链路：
+uv run python run.py --diagnostics \
+  --ask "redis 10.1.2.3 内存是不是快满了？看下现在的实时情况"
+#   [实时诊断：测试环境只读 · 模拟执行（未配 jumphost） · 目标白名单：不限（仍拒生产）]
+#   bot> ⚠️ 内存确实快满了……当前已用 14.20G / 上限 15.00G（实时数据：10.1.2.3）
+#        结合文档处置流程（来源：redis/troubleshooting.md）：1. 先跑 --bigkeys……
+
+# 配上真实基建走真 ssh（经跳板机）；配合 --guardrails 时写命令走审批闭环：
+OPS_QA_DIAG=1 OPS_QA_DIAG_JUMPHOST=jumphost OPS_QA_DIAG_ALLOWED_HOSTS='10.1.*,*-test-*' \
+  uv run python run.py --diagnostics --guardrails
+```
+
+环境变量（完整见 `.env.example`）：`OPS_QA_DIAG`（开关）/ `OPS_QA_DIAG_JUMPHOST`（跳板机 ssh 别名，不配则模拟执行）/ `OPS_QA_DIAG_ALLOWED_HOSTS`（目标 glob 白名单）/ `OPS_QA_DIAG_TIMEOUT` / `OPS_QA_DIAG_MOCK` / `OPS_QA_DIAG_PROD_PATTERNS`。终端与飞书共用；飞书只认环境变量（`OPS_QA_DIAG=1`）。
+
+**与编排模式正交**：`run_diagnostic` 挂在真正答题的 agent 上（single 的单 agent、multi/auto 的各组件专家、coordinator 的 as_tool 专家），各模式下都能在答题时按需跑实时诊断；护栏 / 写审批开着时，写命令的识别与路由自动接上上一节的 HITL 闭环。
+
 ## 离线评测 harness（差异化原型 #5）
 
 进程内库 + provider 可换 + 模式可换，天然适合搭评测台：**同一题集 × 多个配置**跑一遍、打分、出报告——把"换模型 / 单 agent vs 多 agent / 改 prompt"的效果变成可量化数字，用于回归与选型（改了检索策略或 prompt 后，跑一遍看决策/转交/来源真实率有没有掉）。
@@ -380,6 +413,6 @@ uv run ruff format .     # 格式化
 
 ## 范围说明
 
-当前已落地：文档问答核心主线 + 五项能力（结构化契约 / 多模型路由 / 多 agent 编排 / 护栏+审批 / 评测台）+ 飞书长连接核心问答闭环 + 飞书写操作审批闭环（HITL 卡片）。这些都建立在 OpenAI Agents SDK 的自由度之上（Session 会话记忆、lifecycle hooks 遥测、按角色 ModelSettings、tool-level guardrails 分层、handoff input_filter），作为承接新场景的基座。尚未做（按新场景需要再扩展）：SSH 实时诊断、数据库只读分析、定时跟进、飞书反馈卡 / 追问卡 / 问答归档。
+当前已落地：文档问答核心主线 + 六项能力（结构化契约 / 多模型路由 / 多 agent 编排 / 护栏+审批 / 评测台 / 实时诊断）+ 飞书长连接核心问答闭环 + 飞书写操作审批闭环（HITL 卡片）。这些都建立在 OpenAI Agents SDK 的自由度之上（Session 会话记忆、lifecycle hooks 遥测、按角色 ModelSettings、tool-level guardrails 分层、handoff input_filter），作为承接新场景的基座。尚未做（按新场景需要再扩展）：数据库只读分析、定时跟进、飞书反馈卡 / 追问卡 / 问答归档。
 
 > 后续方向：本项目不再以"对比 ops-qa-bot"为目标——两者是互补方案（Claude SDK 上手快、OpenAI SDK 自由度大）。重心转向**承接原项目够不着的场景与全新场景**，例如非 markdown / 向量检索的大规模知识库、跨组件协作型复杂任务、结构化数据对外接入自动化流程等。
