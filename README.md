@@ -31,6 +31,7 @@ ops-qa-bot-oai/
 │   ├── guardrails.py         # 输入注入护栏 + 输出来源护栏（差异化 #4）
 │   ├── actions.py            # 写操作审批工具（needs_approval HITL）（差异化 #4）
 │   ├── diagnostics.py        # 实时诊断：run_diagnostic（测试环境只读 ssh，白名单+写路由审批）（差异化 #6）
+│   ├── db_query.py           # 数据库诊断：query_database（只读账号直连）+ request_db_change（needs_approval 参数变更审批）
 │   ├── doc_qa.py             # 飞书文档问答：query_feishu_doc（接外部 /doc_qa 服务，feishu 来源组件专用）
 │   ├── review.py             # 二次复核：另一模型证据核对 + revise-once（差异化 #7）
 │   ├── hooks.py              # 运行遥测 RunHooks：精确转交链 + 按 agent token 归账（#2 量化）
@@ -349,6 +350,38 @@ OPS_QA_DIAG=1 OPS_QA_DIAG_JUMPHOST=jumphost OPS_QA_DIAG_ALLOWED_HOSTS='10.1.*,*-
 环境变量（完整见 `.env.example`）：`OPS_QA_DIAG`（开关）/ `OPS_QA_DIAG_JUMPHOST`（跳板机 ssh 别名，不配则模拟执行）/ `OPS_QA_DIAG_ALLOWED_HOSTS`（目标 glob 白名单）/ `OPS_QA_DIAG_TIMEOUT` / `OPS_QA_DIAG_MOCK` / `OPS_QA_DIAG_PROD_PATTERNS`。终端与飞书共用；飞书只认环境变量（`OPS_QA_DIAG=1`）。
 
 **与编排模式正交**：`run_diagnostic` 挂在真正答题的 agent 上（single 的单 agent、multi/auto 的各组件专家、coordinator 的 as_tool 专家），各模式下都能在答题时按需跑实时诊断；护栏 / 写审批开着时，写命令的识别与路由自动接上上一节的 HITL 闭环。
+
+## 数据库诊断（测试环境只读 + 参数变更审批）
+
+ops-qa-bot（Claude SDK 版）的「数据库只读分析」（`db_query.py`）：asker 在问题里给连接信息（IP、端口、租户、集群），bot 用部署机本地的 `mysql` / `obclient`、以 DBA 预建的**只读账号**连上目标库跑诊断 SQL，agent 据此迭代排查"CPU 高 / 连接数高 / 慢查询"（`SHOW PROCESSLIST` → 可疑 query → `gv$ob_sql_audit` / `performance_schema`…）。参考项目已验证的安全设计**原样移植**（都是纯 stdlib 函数）：
+
+- **只读由数据库引擎强制，不解析 SQL**：只读账号只有 SELECT/SHOW/PROCESS 权限，写被引擎直接拒——不做 SQL 白/黑名单，既不误杀诊断语句、也没有黑名单 fail-open 的风险；唯一拦多语句拼接（`;`）。
+- **凭据工具内注入**：密码经 `MYSQL_PWD` 传给 client、不进 argv（防 `ps` 泄露），LLM 全程拿不到。
+- **目标受 `allowed_hosts`（IP / CIDR / 主机名）白名单约束**，空名单 = 全拒（fail-closed）。
+- **失败返回引导文字而不抛**（含数据库报错原文和"ORA-00942 别急着下无权限结论"这类排查经验），agent 自己改 SQL 重试或走升级规则。
+
+在 OpenAI Agents SDK 上有三处比参考项目干净（见 `db_query.py` 模块 docstring）：
+
+| ops-qa-bot（Claude Agent SDK） | 本项目 |
+|---|---|
+| 参数变更审批要手工搭一整条链：`DbChangeSubmitter` Protocol + 确认卡 + pending 登记 + 飞书回调里执行（Claude SDK 的 hook 无法挂起 run） | `request_db_change` 标 **`needs_approval=True`**，run 在提议处挂起、走与 `request_write_command` **同一条**审批闭环（飞书发卡 → 值班人点按钮 → resume），审批决定与审计落在 RunState 上；确定性校验不过的提议在**发卡前**被 `validate_change_args` 短路驳回，不打扰审批人 |
+| 二次复核不覆盖 DB 证据 | `DbQueryLog` 把本轮查询输出记为**复核证据**，reviewer 连同诊断输出一起核对"结论 vs processlist"是否矛盾 |
+| 必须有真实数据库基建才能跑 | **executor 可注入 + mock 降级**：未配只读账号时返回标注「模拟数据」的假结果（假 processlist 与假 `free -h` 同属无害模拟，不是 doc_qa 那种"假知识库"），链路无基建也能端到端演示；单测注入假 executor |
+
+```bash
+# 缺省关；未配只读账号时自动降级为模拟数据（标注来源），先把链路跑通：
+OPS_QA_DB=1 uv run python run.py \
+  --ask "mysql 10.1.2.3 连接数快满了，帮我看看现在什么情况"
+
+# 配上真实账号走真查询；配合 --guardrails 时改参数走审批闭环：
+OPS_QA_DB=1 OPS_QA_DB_ALLOWED_HOSTS='10.1.0.0/16' \
+  OPS_QA_DB_MYSQL_RO_USER=ro OPS_QA_DB_MYSQL_RO_PASSWORD=xxx \
+  uv run python run.py --guardrails
+```
+
+环境变量：`OPS_QA_DB`（开关）/ `OPS_QA_DB_ALLOWED_HOSTS`（IP/CIDR/主机名白名单）/ `OPS_QA_DB_TIMEOUT`（缺省 30s）/ `OPS_QA_DB_MAX_CHARS`（结果截断，缺省 20000）/ `OPS_QA_DB_MOCK`（强制模拟）；只读账号按连接类型三套：`OPS_QA_DB_MYSQL_RO_USER/PASSWORD`、`OPS_QA_DB_OB_MYSQL_RO_*`、`OPS_QA_DB_OB_ORACLE_RO_*`；参数变更要真执行再配 `OPS_QA_DB_*_ADMIN_USER/PASSWORD`（不配则批准后登记为"待 DBA 人工执行"）。终端与飞书共用。
+
+**与实时诊断的分工**（prompt 里也讲了）：数据库层问题走 `query_database`（直连、凭据注入）；机器/系统层（内存、磁盘、日志）走 `run_diagnostic`。两者正交组合，都与编排模式正交（挂在真正答题的专家上）。
 
 ## 飞书文档问答（来源异构）
 

@@ -236,6 +236,43 @@ def diagnostics_prompt_section(*, has_write_tool: bool) -> str:
 - 实时数据 + 文档结论**结合**给答案：先给现状，再给文档里的处置流程（附来源）。"""
 
 
+# 数据库诊断节（可选，仅当 OPS_QA_DB=1 挂了 query_database 工具时追加）。讲清楚何时用、
+# 迭代排查的姿态、只读由引擎强制、方言差异、与 run_diagnostic 的分工、参数变更的去处。
+# 实现见 db_query.py。
+def db_prompt_section(*, has_change_tool: bool) -> str:
+    """数据库诊断的 prompt 章节。`has_change_tool` 决定"改参数怎么办"那句怎么写。"""
+    change_line = (
+        "调用 `request_db_change` 工具**提议**（挂起等人工审批，批准后才执行/登记），"
+        "不要试图在 `query_database` 里跑 SET GLOBAL / ALTER SYSTEM。"
+        if has_change_tool
+        else "以**文字建议**形式给出变更 SQL（标 ⚠️ 风险、说明由 DBA 人工执行），不要试图执行。"
+    )
+    return f"""
+
+# 数据库诊断（测试环境，只读）
+
+你还有 `query_database(db_type, sql, host, ...)` 工具，可以用系统注入的**只读账号**直连**测试环境**的数据库实例跑诊断 SQL，把实时状态叠加到基于文档的回答上。
+
+## 何时用
+- 用户报告某个**数据库实例**的实时问题（CPU 高、连接数高、慢查询、锁等待、空间增长等），且给了连接信息（IP；OceanBase 还要 mode/租户/集群，端口缺省 MySQL 3306 / OB 2883）。
+- 这类排查要**多次调用、迭代收敛**：先看面上（`SHOW PROCESSLIST` / `gv$ob_processlist`），再挑可疑点深入（`EXPLAIN`、慢查询视图、`gv$ob_sql_audit`、`sys`/`performance_schema`）。每次调用跑**一条**语句。
+- **纯知识问题**（"慢查询怎么优化"）只查文档，不调本工具。
+
+## 怎么用（重要）
+- 账号密码由系统按类型注入，你**不用也拿不到**；连接信息以用户给的为准，不要自己猜。
+- **数据库层面的排查用本工具**（直连、凭据注入），不要绕道 `run_diagnostic` 在目标机上跑 mysql 客户端——目标机上不一定有客户端和凭据。机器/系统层（内存、磁盘、日志）才用 `run_diagnostic`（若可用）。
+- 只读由**数据库账号权限**强制：写/变更语句会被引擎直接拒，不用你自我审查，但也**不要**试图写。
+- 用户要求**改数据库参数**（如调 max_connections）时：{change_line}
+- 杀 session、kill query、加索引、DML/DDL 等其它变更：不属于参数变更，按写操作的规则处理（有 `request_write_command` 就提议审批，否则给带 ⚠️ 的文字建议）。
+- **方言注意**：OceanBase oracle 模式没有 SHOW，用数据字典/动态性能视图（`gv$` 视图、`dba_*`），查 dual 而非空 FROM；OB 动态视图常带 `OB` 前缀（如 `GV$OB_PROCESSLIST`），别照搬标准 Oracle 的 `V$SESSION`。
+- **报错 ≠ 无权限**：表/视图不存在多半是对象名不对，先查数据字典（`SHOW TABLES` / `dba_views`）找到实际对象名再查，多试几种写法再下结论；工具返回的引导提示里有具体建议。
+
+## 输出整合
+- 把查询结果的关键行贴进答案，标 `（数据库实时数据：<host>）`，与文档来源 `（来源：xxx.md）` **区分开**。
+- 查询失败 / 超时 / 被拒时**如实说明**，绝不编造查询结果。
+- 实时数据 + 文档结论**结合**给答案：先给现状，再给文档里的处置流程（附来源）。"""
+
+
 # 飞书文档来源节（可选，仅当配了 OPS_QA_DOC_QA_BASE_URL 挂了 query_feishu_doc 工具时追加）。
 # 只有 single 模式需要它——multi/auto/coordinator 下每个 feishu 组件有自己的专家 agent，
 # 专家只挂 query_feishu_doc、根本没有文档检索工具，"该用哪个工具"是机制而非提示（见
@@ -277,15 +314,20 @@ def build_system_prompt(
     diagnostics: bool = False,
     has_write_tool: bool = False,
     doc_qa: bool = False,
+    db: bool = False,
+    has_db_change_tool: bool = False,
 ) -> str:
     """构造 system prompt。
 
-    `diagnostics=True` 时追加实时诊断章节（OPS_QA_DIAG 开启）；`doc_qa=True` 时追加飞书
-    文档来源章节（OPS_QA_DOC_QA_BASE_URL 配了）。两者正交，缺省都不加、零感知。
+    `diagnostics=True` 时追加实时诊断章节（OPS_QA_DIAG 开启）；`db=True` 时追加数据库
+    诊断章节（OPS_QA_DB 开启）；`doc_qa=True` 时追加飞书文档来源章节
+    （OPS_QA_DOC_QA_BASE_URL 配了）。各特性正交，缺省都不加、零感知。
     """
     prompt = SYSTEM_PROMPT_TEMPLATE.format(docs_root=str(docs_root))
     if diagnostics:
         prompt += diagnostics_prompt_section(has_write_tool=has_write_tool)
+    if db:
+        prompt += db_prompt_section(has_change_tool=has_db_change_tool)
     if doc_qa:
         prompt += doc_qa_prompt_section(docs_root)
     return prompt

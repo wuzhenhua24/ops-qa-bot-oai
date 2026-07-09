@@ -12,6 +12,15 @@ from .bot import (
     StructuredAnswer,
     parse_markers,
 )
+from .db_query import (
+    DatabaseClient,
+    DatabaseQueryError,
+    DbConfig,
+    DbCreds,
+    DbQueryLog,
+    make_db_change_tool,
+    make_query_database_tool,
+)
 from .doc_qa import (
     DocQAClient,
     DocQAConfig,
@@ -59,6 +68,13 @@ __all__ = [
     "parse_index_components",
     "feishu_registry",
     "feishu_citation",
+    "DbConfig",
+    "DbCreds",
+    "DbQueryLog",
+    "DatabaseClient",
+    "DatabaseQueryError",
+    "make_query_database_tool",
+    "make_db_change_tool",
     "DocQAConfig",
     "DocQAClient",
     "DocQAError",

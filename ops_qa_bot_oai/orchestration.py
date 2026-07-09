@@ -31,12 +31,14 @@ from pathlib import Path
 from agents import Agent, Model
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
+from .db_query import DB_CHANGE_TOOL_NAME, DB_TOOL_NAME
 from .diagnostics import DIAG_TOOL_NAME
 from .index import Component, feishu_citation, parse_index_components
 from .model import ModelRouter, role_model_settings
 from .prompt import (
     STRUCTURED_CONTRACT_SUFFIX,
     TRIAGE_CLARIFY_NOTE,
+    db_prompt_section,
     diagnostics_prompt_section,
     escalate_marker,
     free_text_markers_section,
@@ -86,9 +88,15 @@ def _write_block(has_write_tool: bool) -> str:
 
 
 def _tail(
-    *, has_write_tool: bool, has_diag_tool: bool, structured: bool, escalate_rule: str
+    *,
+    has_write_tool: bool,
+    has_diag_tool: bool,
+    has_db_tool: bool = False,
+    has_db_change_tool: bool = False,
+    structured: bool,
+    escalate_rule: str,
 ) -> str:
-    """专家 instructions 的公共结尾：实时诊断章节（若挂了工具）+ 输出契约。
+    """专家 instructions 的公共结尾：实时诊断/数据库诊断章节（若挂了工具）+ 输出契约。
 
     输出契约二选一，互斥：结构化模式用 `AnswerContract` 的字段（decision/escalate_to/
     followups）；自由文本模式用 `<<CLARIFY>>` / `<<ESCALATE>>` / `<<FOLLOWUPS>>` 标记。
@@ -96,12 +104,13 @@ def _tail(
     ——否则它们永远不发标记，飞书的 @负责人 就永远不触发。
     """
     diag = diagnostics_prompt_section(has_write_tool=has_write_tool) if has_diag_tool else ""
+    db = db_prompt_section(has_change_tool=has_db_change_tool) if has_db_tool else ""
     contract = (
         STRUCTURED_CONTRACT_SUFFIX
         if structured
         else free_text_markers_section(escalate_rule=escalate_rule)
     )
-    return f"{diag}{contract}"
+    return f"{diag}{db}{contract}"
 
 
 def _specialist_escalate_rule(c: Component, *, source_phrase: str) -> str:
@@ -131,6 +140,8 @@ def _specialist_instructions(
     *,
     has_write_tool: bool = False,
     has_diag_tool: bool = False,
+    has_db_tool: bool = False,
+    has_db_change_tool: bool = False,
     structured: bool = False,
 ) -> str:
     """本地 markdown 来源的组件专家：作用域限定在自己的目录，挂文档检索工具。"""
@@ -158,6 +169,8 @@ def _specialist_instructions(
 {_tail(
         has_write_tool=has_write_tool,
         has_diag_tool=has_diag_tool,
+        has_db_tool=has_db_tool,
+        has_db_change_tool=has_db_change_tool,
         structured=structured,
         escalate_rule=_specialist_escalate_rule(c, source_phrase=f"`{c.dir}/` 下的文档里"),
     )}"""
@@ -168,6 +181,8 @@ def _feishu_specialist_instructions(
     *,
     has_write_tool: bool = False,
     has_diag_tool: bool = False,
+    has_db_tool: bool = False,
+    has_db_change_tool: bool = False,
     structured: bool = False,
 ) -> str:
     """飞书文档来源的组件专家：唯一知识入口是 `query_feishu_doc`，本地没有它的 md 文件。
@@ -204,6 +219,8 @@ def _feishu_specialist_instructions(
 {_tail(
         has_write_tool=has_write_tool,
         has_diag_tool=has_diag_tool,
+        has_db_tool=has_db_tool,
+        has_db_change_tool=has_db_change_tool,
         structured=structured,
         escalate_rule=_specialist_escalate_rule(c, source_phrase="该组件的飞书文档里"),
     )}"""
@@ -250,6 +267,8 @@ def build_specialist_agent(
             c,
             has_write_tool=_WRITE_TOOL_NAME in names,
             has_diag_tool=DIAG_TOOL_NAME in names,
+            has_db_tool=DB_TOOL_NAME in names,
+            has_db_change_tool=DB_CHANGE_TOOL_NAME in names,
             structured=structured,
         ),
         tools=base_tools + extra,

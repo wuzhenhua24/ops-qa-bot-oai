@@ -40,6 +40,16 @@ from agents.memory import Session
 from openai.types.responses import ResponseTextDeltaEvent
 
 from .actions import WriteCommandLog, make_write_command_tool
+from .db_query import (
+    DB_CHANGE_TOOL_NAME,
+    DB_TOOL_NAME,
+    DatabaseClient,
+    DbConfig,
+    DbQueryLog,
+    make_db_change_tool,
+    make_query_database_tool,
+    validate_change_args,
+)
 from .diagnostics import DiagConfig, DiagnosticLog, make_diagnostic_tool
 from .doc_qa import DOC_QA_TOOL_NAME, DocQAConfig, DocQALog, make_feishu_doc_tool
 from .guardrails import (
@@ -118,12 +128,14 @@ _VALID_FOLLOWUP_KEYS = {
 class _EvidenceMark:
     """答题前各证据日志的长度快照。
 
-    复核只该看**本轮**新增的证据：诊断日志和飞书文档答案在多轮会话里是累积的，不切一刀，
-    第二轮的 reviewer 会拿到第一轮的诊断输出当"本轮证据"，据此判定第二轮答案"与证据矛盾"。
+    复核只该看**本轮**新增的证据：诊断日志、数据库查询和飞书文档答案在多轮会话里是累积
+    的，不切一刀，第二轮的 reviewer 会拿到第一轮的诊断输出当"本轮证据"，据此判定第二轮
+    答案"与证据矛盾"。
     """
 
     diag: int
     doc_qa: int
+    db: int
 
 
 @dataclass
@@ -257,6 +269,16 @@ def format_tool_call(name: str, args: dict) -> str:
         return f"run_diagnostic {args.get('host', '?')}: {args.get('command', '?')}"
     if name == "request_write_command":
         return f"request_write_command {args.get('target', '?')}: {args.get('command', '?')}"
+    if name == DB_TOOL_NAME:
+        sql = str(args.get("sql", "?"))
+        if len(sql) > 60:
+            sql = sql[:60] + "…"
+        return f"query_database {args.get('db_type', '?')}@{args.get('host', '?')}: {sql}"
+    if name == DB_CHANGE_TOOL_NAME:
+        return (
+            f"request_db_change {args.get('host', '?')}: "
+            f"{args.get('param', '?')}={args.get('value', '?')}"
+        )
     if name == DOC_QA_TOOL_NAME:
         q = str(args.get("question", "?"))
         if len(q) > 60:
@@ -295,6 +317,7 @@ class OpsQABot:
         guardrails: bool = False,
         session: Session | None = None,
         diag_config: DiagConfig | None = None,
+        db_config: DbConfig | None = None,
         doc_qa_config: DocQAConfig | None = None,
         review_config: ReviewConfig | None = None,
     ):
@@ -330,6 +353,25 @@ class OpsQABot:
             self._extra_tools = self._extra_tools + [
                 make_diagnostic_tool(self.diag_config, self.diag_log)
             ]
+
+        # 数据库诊断（测试环境只读，OPS_QA_DB=1 开启）：query_database 用只读账号直连
+        # 目标库跑诊断 SQL，与 run_diagnostic 并列进 _extra_tools（横切工具，挂到答题
+        # agent / 各专家）。guardrails 开启时额外挂 request_db_change（needs_approval，
+        # 参数变更走与 request_write_command 同一条审批闭环）。见 db_query.py。
+        self.db_config = db_config or DbConfig.from_env()
+        self.db = self.db_config.enabled
+        self.db_log = DbQueryLog()
+        self._has_db_change_tool = False
+        if self.db:
+            db_client = DatabaseClient(self.db_config)
+            self._extra_tools = self._extra_tools + [
+                make_query_database_tool(db_client, self.db_log)
+            ]
+            if guardrails:
+                self._has_db_change_tool = True
+                self._extra_tools = self._extra_tools + [
+                    make_db_change_tool(db_client, self.write_log)
+                ]
 
         # 飞书文档问答（OPS_QA_DOC_QA_BASE_URL 配了才开）：把「用飞书文档维护知识」的组件
         # 接进来。与 diagnostics/guardrails 的区别是它不是横切工具——它是某些组件的**唯一
@@ -399,6 +441,8 @@ class OpsQABot:
                     diagnostics=self.diagnostics,
                     has_write_tool=guardrails,
                     doc_qa=self.doc_qa,
+                    db=self.db,
+                    has_db_change_tool=self._has_db_change_tool,
                 ),
                 tools=list(DOC_TOOLS) + self._extra_tools + self._feishu_tools(),
                 model=self.model_choice.model,
@@ -445,22 +489,32 @@ class OpsQABot:
 
     def _evidence_mark(self) -> _EvidenceMark:
         """快照各证据日志的长度，用于把复核证据限定在"本轮之后新增的"。"""
-        return _EvidenceMark(diag=len(self.diag_log.results), doc_qa=len(self.doc_qa_log.calls))
+        return _EvidenceMark(
+            diag=len(self.diag_log.results),
+            doc_qa=len(self.doc_qa_log.calls),
+            db=len(self.db_log.results),
+        )
+
+    def _ran_realtime(self, mark: _EvidenceMark) -> bool:
+        """本轮是否产生了实时证据（诊断命令 / 数据库查询）——决定答案是否算 risky。"""
+        return len(self.diag_log.results) > mark.diag or len(self.db_log.results) > mark.db
 
     async def _review(
         self, question: str, draft1: Draft, reanswer: Any, mark: _EvidenceMark
     ) -> ReviewOutcome:
         """对一版答案跑 revise-once 复核。不合格（反问/无可核对证据）时原样返回。
 
-        证据 = 引用文档实际内容 + **本轮**（`mark` 之后）的诊断输出与飞书文档答案，reviewer
-        只在此范围内核对（见 review.gather_evidence）。飞书来源没有本地文件可读，必须把工具
-        实际拿回的 markdown 一并喂进去，否则 reviewer 会对每条飞书引用读到 `[未找到]`。
+        证据 = 引用文档实际内容 + **本轮**（`mark` 之后）的诊断输出、数据库查询输出与飞书
+        文档答案，reviewer 只在此范围内核对（见 review.gather_evidence）。飞书来源没有本地
+        文件可读，必须把工具实际拿回的 markdown 一并喂进去，否则 reviewer 会对每条飞书引用
+        读到 `[未找到]`。
         """
         if not is_review_eligible(draft1.citations, draft1.risky, draft1.clarify):
             return ReviewOutcome(final=draft1)
 
         def evidence_fn(d: Draft) -> str:
             outs = [r.output for r in self.diag_log.results[mark.diag :] if r.output]
+            outs += self.db_log.outputs(mark.db)
             return gather_evidence(
                 self.docs_root,
                 d.citations,
@@ -657,7 +711,7 @@ class OpsQABot:
             return Draft(
                 text=r.text,
                 citations=extract_citations(r.text),
-                risky=len(self.diag_log.results) > mark.diag,
+                risky=self._ran_realtime(mark),
                 clarify=r.markers.clarify,
                 payload=r,
             )
@@ -714,7 +768,7 @@ class OpsQABot:
             return Draft(
                 text=c.answer,
                 citations=list(c.citations),
-                risky=len(self.diag_log.results) > mark.diag,
+                risky=self._ran_realtime(mark),
                 # 只复核真答题（decision=answer）；反问/拒绝/升级不下事实结论，clarify=True 跳过。
                 clarify=c.decision != Decision.answer,
                 payload=r,
@@ -821,7 +875,7 @@ class OpsQABot:
             return Draft(
                 text=r.text,
                 citations=extract_citations(r.text),
-                risky=(len(self.diag_log.results) > mark.diag) or write_proposed,
+                risky=self._ran_realtime(mark) or write_proposed,
                 clarify=r.markers.clarify,
                 payload=r,
             )
@@ -890,6 +944,24 @@ class OpsQABot:
                             itr, rejection_message=_BLACKLIST_REJECTION_MSG.format(label=forbidden)
                         )
                         continue
+                    # 参数变更提议的发卡前校验（与禁止清单短路同一姿态）：参数/值/连接
+                    # 信息确定性校验不过的提议直接驳回、不打扰审批人；带 config 时连
+                    # host 白名单一起查。工具执行体内还会再校验一遍（纵深防御）。
+                    if req.tool_name == DB_CHANGE_TOOL_NAME:
+                        bad = validate_change_args(req.arguments, self.db_config)
+                        if bad:
+                            logger.warning("参数变更提议校验不过，审批前自动驳回：%s", bad)
+                            blacklist_rejections.append((req, bad))
+                            state.reject(
+                                itr,
+                                rejection_message=(
+                                    f"该参数变更提议未通过校验（{bad}），已自动驳回、未进入"
+                                    "人工审批。若能修正（如补齐/改正连接信息、参数名、目标值）"
+                                    "请修正后重新提议；否则按「写操作建议输出格式」给文字建议"
+                                    "由 DBA 人工执行。"
+                                ),
+                            )
+                            continue
                     if approver is None:
                         approved = False
                     else:

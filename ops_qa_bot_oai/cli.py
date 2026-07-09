@@ -15,6 +15,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .bot import GuardedAnswer, OpsQABot, StructuredAnswer, format_tool_call
+from .db_query import DbConfig
 from .diagnostics import DiagConfig
 from .doc_qa import DocQAConfig
 from .model import MODE_LABELS, MODES, resolve_mode, resolve_model
@@ -110,6 +111,23 @@ def _diag_line(cfg: DiagConfig) -> str | None:
     return f"实时诊断：测试环境只读 · {how} · 目标白名单：{hosts}"
 
 
+def _resolve_db_config(force_on: bool) -> DbConfig:
+    """解析数据库诊断配置：读 OPS_QA_DB*；--db 可强制开启。"""
+    cfg = DbConfig.from_env()
+    if force_on and not cfg.enabled:
+        cfg = replace(cfg, enabled=True)
+    return cfg
+
+
+def _db_line(cfg: DbConfig) -> str | None:
+    """数据库诊断的横幅细节；未开启返回 None。"""
+    if not cfg.enabled:
+        return None
+    how = "模拟数据（未配只读账号）" if cfg.use_mock else "只读账号直连"
+    hosts = "、".join(cfg.allowed_hosts) if cfg.allowed_hosts else "（未配白名单，真实模式下全拒）"
+    return f"数据库诊断：测试环境只读 · {how} · 实例白名单：{hosts}"
+
+
 def _doc_qa_line(cfg: DocQAConfig) -> str | None:
     """飞书文档问答的横幅细节；未开启返回 None。
 
@@ -165,20 +183,23 @@ async def run_once(
     mode: str = "single",
     guardrails: bool = False,
     diagnostics: bool = False,
+    db: bool = False,
     review: bool = False,
 ) -> None:
     """一次性问一个问题就退出（适合脚本调用 / 批量跑题）。"""
     model_choice = resolve_model()
     diag_config = _resolve_diag_config(diagnostics)
+    db_config = _resolve_db_config(db)
     doc_qa_config = DocQAConfig.from_env()
     review_config = _resolve_review_config(review)
-    # 路由 × 输出 × 护栏 × 诊断 × 飞书文档 × 复核 正交，可任意组合。
+    # 路由 × 输出 × 护栏 × 诊断 × 数据库 × 飞书文档 × 复核 正交，可任意组合。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
         mode=mode,
         guardrails=guardrails,
         diag_config=diag_config,
+        db_config=db_config,
         doc_qa_config=doc_qa_config,
         review_config=review_config,
     )
@@ -188,11 +209,18 @@ async def run_once(
                 print(f"[{ln}]")
         if line := _diag_line(diag_config):
             print(f"[{line}]")
+        if line := _db_line(db_config):
+            print(f"[{line}]")
         if line := _doc_qa_line(doc_qa_config):
             print(f"[{line}]")
         if review_config.enabled:
             print("[二次复核：另一模型证据核对，revise-once 后交付]")
-        extras_on = diag_config.enabled or doc_qa_config.enabled or review_config.enabled
+        extras_on = (
+            diag_config.enabled
+            or db_config.enabled
+            or doc_qa_config.enabled
+            or review_config.enabled
+        )
         if mode != "single" or extras_on:
             print()
 
@@ -265,19 +293,22 @@ async def run_repl(
     mode: str = "single",
     guardrails: bool = False,
     diagnostics: bool = False,
+    db: bool = False,
     review: bool = False,
 ) -> None:
     model_choice = resolve_model()
     diag_config = _resolve_diag_config(diagnostics)
+    db_config = _resolve_db_config(db)
     doc_qa_config = DocQAConfig.from_env()
     review_config = _resolve_review_config(review)
-    # 路由 × 输出 × 护栏 × 诊断 × 飞书文档 × 复核 正交，可任意组合。
+    # 路由 × 输出 × 护栏 × 诊断 × 数据库 × 飞书文档 × 复核 正交，可任意组合。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
         mode=mode,
         guardrails=guardrails,
         diag_config=diag_config,
+        db_config=db_config,
         doc_qa_config=doc_qa_config,
         review_config=review_config,
     )
@@ -291,6 +322,8 @@ async def run_repl(
         parts.append("护栏 + 写操作审批")
     if diag_config.enabled:
         parts.append("实时诊断")
+    if db_config.enabled:
+        parts.append("数据库诊断")
     if doc_qa_config.enabled:
         parts.append("飞书文档问答")
     if review_config.enabled:
@@ -301,6 +334,8 @@ async def run_repl(
     for ln in _orchestration_lines(mode, bot):
         print(ln)
     if line := _diag_line(diag_config):
+        print(line)
+    if line := _db_line(db_config):
         print(line)
     if line := _doc_qa_line(doc_qa_config):
         print(line)
@@ -450,6 +485,12 @@ def main() -> None:
         "未配 OPS_QA_DIAG_JUMPHOST 时自动降级为模拟执行。配合 --guardrails 时写命令走审批",
     )
     parser.add_argument(
+        "--db",
+        action="store_true",
+        help="开启数据库诊断（测试环境只读 query_database），等价 OPS_QA_DB=1；"
+        "未配只读账号时自动降级为模拟数据。配合 --guardrails 时改参数走 request_db_change 审批",
+    )
+    parser.add_argument(
         "--review",
         action="store_true",
         help="开启二次复核（等价 OPS_QA_REVIEW=1）：另一模型对答案做证据核对，revise-once 后交付。"
@@ -468,6 +509,7 @@ def main() -> None:
                 mode=args.mode,
                 guardrails=args.guardrails,
                 diagnostics=args.diagnostics,
+                db=args.db,
                 review=args.review,
             )
         )
@@ -480,6 +522,7 @@ def main() -> None:
                 mode=args.mode,
                 guardrails=args.guardrails,
                 diagnostics=args.diagnostics,
+                db=args.db,
                 review=args.review,
             )
         )

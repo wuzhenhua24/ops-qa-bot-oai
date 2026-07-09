@@ -10,6 +10,8 @@
 | 用量 | `ResultMessage.usage`（含 cache_read/creation、官方 cost_usd） | `result.context_wrapper.usage`（input/output/total、requests、cached、reasoning） |
 | 模型 | Claude（SDK 绑定 Anthropic） | provider 无关：OpenAI 原生 / 兼容代理 / LiteLLM 运行时切换 |
 | 权限/写防护 | `permission_mode` + PreToolUse hook 拦写命令 | 核心版无 Bash，工具天然只读；沙箱在 `tools.py` 自己做 |
+| 数据库参数变更审批 | 手工链路：`DbChangeSubmitter` Protocol + 飞书确认卡 + pending 登记 + 回调里执行（hook 无法挂起 run） | `request_db_change` 标 `needs_approval=True`，run 原生挂起、走与写审批同一条 HITL 闭环；发卡前 `validate_change_args` 短路非法提议（`db_query.py`） |
+| 二次复核证据 | （无二次复核） | 引用文档内容 + 诊断输出 + **数据库查询输出**（`DbQueryLog`）+ 飞书文档答案 |
 
 ## 关键设计差异
 

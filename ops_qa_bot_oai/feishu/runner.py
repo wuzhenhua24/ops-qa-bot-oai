@@ -31,6 +31,7 @@ from lark_oapi.channel.config import (
 )
 from lark_oapi.channel.types import InboundMessage, TextContent
 
+from ..db_query import DB_CHANGE_TOOL_NAME, change_display
 from ..diagnostics import DiagConfig
 from ..model import MODE_LABELS
 from ..review import ReviewConfig
@@ -53,6 +54,17 @@ _ERROR_TEXT = (
     "⚠️ 处理这条问题时出错了（模型服务异常/超时或网络抖动），请稍后重试。"
     "若持续失败，请联系管理员查看服务日志。"
 )
+
+
+def _approval_display(req) -> tuple[str, str]:
+    """从一条审批请求里取 (命令, 目标) 展示文本。
+
+    `request_write_command` 的参数就是 command/target；`request_db_change` 的参数是
+    param/value/host 等结构化字段，用 `change_display` 拼成可读的变更语句 + 目标。
+    """
+    if getattr(req, "tool_name", "") == DB_CHANGE_TOOL_NAME:
+        return change_display(req.arguments)
+    return str(req.arguments.get("command", "?")), str(req.arguments.get("target", "?"))
 
 
 class FeishuClient:
@@ -243,10 +255,11 @@ class WsRunner:
                         }
                     }
                     await self._client.update_post(ph_id, wait_post)
+                command, target = _approval_display(req)
                 return await self._approvals.request(
                     chat_id,
-                    command=str(args.get("command", "?")),
-                    target=str(args.get("target", "?")),
+                    command=command,
+                    target=target,
                     reason=str(args.get("reason", "")),
                     asker_id=sender_id,
                     parent_id=msg_id,
@@ -269,13 +282,15 @@ class WsRunner:
         final_post = build_answer_post(result.text, asker_id=sender_id, escalate_to=esc)
         # 审批轨迹（仅 GuardedAnswer 有这些字段）：黑名单自动驳回 / 人工拍板结果。
         for req, reason in getattr(result, "blacklist_rejections", None) or []:
-            cmd = req.arguments.get("command", "?")
+            cmd = _approval_display(req)[0]
             final_post["zh_cn"]["content"].append(
-                [{"tag": "text", "text": f"⛔ 命令 `{cmd}` 命中禁止清单（{reason}），已自动驳回。"}]
+                [{"tag": "text", "text": f"⛔ 提议 `{cmd}` 被自动驳回（{reason}）。"}]
             )
         for req, ok in getattr(result, "approvals", None) or []:
-            cmd = req.arguments.get("command", "?")
-            mark = "✅ 已批准（待人工执行）" if ok else "🚫 已驳回"
+            cmd = _approval_display(req)[0]
+            # db 参数变更批准后可能已真执行（配了 admin 账号时），执行结果在答案正文里；
+            # 这里只记审批结论，不断言"待人工执行"。
+            mark = "✅ 已批准" if ok else "🚫 已驳回"
             final_post["zh_cn"]["content"].append(
                 [{"tag": "text", "text": f"审批：`{cmd}` → {mark}"}]
             )
