@@ -17,6 +17,11 @@ grep_docs），`feishu` 组件的专家**只挂 `query_feishu_doc`**。参考项
 prompt，只能靠自律条款"来源=feishu 时不要用 Glob/Read/Grep"来区分；这里 feishu 专家物理上
 就没有文档检索工具，规则从 prompt 自律变成了机制保证（与 diagnostics 用白名单取代黑名单
 是同一个姿态）。跨来源问题（Redis 本地 + Nginx 飞书）由 coordinator 分别咨询再合并。
+
+**输出契约要各发一份**：拆成独立 agent 的代价是每个 agent 只看得见自己的 instructions。
+single 模式那份 `SYSTEM_PROMPT_TEMPLATE` 里的 `<<CLARIFY>>` / `<<ESCALATE>>` / `<<FOLLOWUPS>>`
+契约，专家和协调者是读不到的——所以这里必须把契约再发给它们（`_tail` / `free_text_markers_section`）。
+漏掉这一步的后果很隐蔽：答案看着正常，只是标记从不出现，飞书的 @负责人 永远不触发。
 """
 
 from __future__ import annotations
@@ -29,7 +34,13 @@ from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 from .diagnostics import DIAG_TOOL_NAME
 from .index import Component, feishu_citation, parse_index_components
 from .model import ModelRouter, role_model_settings
-from .prompt import STRUCTURED_CONTRACT_SUFFIX, diagnostics_prompt_section
+from .prompt import (
+    STRUCTURED_CONTRACT_SUFFIX,
+    TRIAGE_CLARIFY_NOTE,
+    diagnostics_prompt_section,
+    escalate_marker,
+    free_text_markers_section,
+)
 from .tools import DOC_TOOLS, DocsContext
 
 __all__ = [
@@ -74,10 +85,45 @@ def _write_block(has_write_tool: bool) -> str:
     )
 
 
-def _tail(*, has_write_tool: bool, has_diag_tool: bool, structured: bool) -> str:
-    """专家 instructions 的公共结尾：实时诊断章节（若挂了工具）+ 结构化契约后缀（若结构化）。"""
+def _tail(
+    *, has_write_tool: bool, has_diag_tool: bool, structured: bool, escalate_rule: str
+) -> str:
+    """专家 instructions 的公共结尾：实时诊断章节（若挂了工具）+ 输出契约。
+
+    输出契约二选一，互斥：结构化模式用 `AnswerContract` 的字段（decision/escalate_to/
+    followups）；自由文本模式用 `<<CLARIFY>>` / `<<ESCALATE>>` / `<<FOLLOWUPS>>` 标记。
+    专家是独立 agent，拿不到 single 模式那份 SYSTEM_PROMPT_TEMPLATE，标记契约必须在这里给
+    ——否则它们永远不发标记，飞书的 @负责人 就永远不触发。
+    """
     diag = diagnostics_prompt_section(has_write_tool=has_write_tool) if has_diag_tool else ""
-    return f"{diag}{STRUCTURED_CONTRACT_SUFFIX if structured else ''}"
+    contract = (
+        STRUCTURED_CONTRACT_SUFFIX
+        if structured
+        else free_text_markers_section(escalate_rule=escalate_rule)
+    )
+    return f"{diag}{contract}"
+
+
+def _specialist_escalate_rule(c: Component, *, source_phrase: str) -> str:
+    """某组件专家的升级规则：标记字面量在构建期算好，模型只需照抄（见 prompt.escalate_marker）。"""
+    marker = escalate_marker(c.open_id, c.dir)
+    unnamed = "" if c.open_id.startswith("ou_") else "（该组件在 INDEX.md 未登记 open_id，故不 @ 人）"
+    return f"""- {source_phrase}确实没有相关内容时：先回复「文档中未找到相关内容」+ 一两句说明你查了什么，然后在末尾独立一行原样输出 `{marker}`{unnamed}。
+- 这条标记**本组件固定就是它**，照抄即可：不要改动、不要换成别的 open_id 或目录、不要自己去 INDEX.md 里另找。"""
+
+
+def _not_found_line(c: Component, *, structured: bool) -> str:
+    """「找不到怎么办」那条规范。两种模式下**升级的出口不同**，措辞必须跟着变。
+
+    自由文本模式绝不能让它在正文里写 `（open_id: ou_x）`——那与「答案塑形标记」里"不要在正文
+    里直接写 @ou_xxx"直接打架，而且系统只认 `<<ESCALATE:...>>` 标记来 @ 人，正文里写了也 @
+    不到。结构化模式则把 open_id / 目录直接填进契约字段，同样在构建期算好、不让模型去查表。
+    """
+    head = '- **找不到就说找不到**：确实没有就明说"文档中未找到相关内容"，**不要编**'
+    if not structured:
+        return f"{head}，并按下面「答案塑形标记」里的升级规则通知负责人（正文里不要写 @ 或 open_id）。"
+    to = f'`escalate_to="{c.open_id}"`' if c.open_id.startswith("ou_") else "`escalate_to=\"\"`"
+    return f'{head}，改用 `decision=escalate`，并填 {to} 与 `escalate_dir="{c.dir}"`（这两个值固定，照抄）。'
 
 
 def _specialist_instructions(
@@ -88,7 +134,6 @@ def _specialist_instructions(
     structured: bool = False,
 ) -> str:
     """本地 markdown 来源的组件专家：作用域限定在自己的目录，挂文档检索工具。"""
-    owner = c.open_id or "（INDEX.md 未登记 open_id）"
     write_block = _write_block(has_write_tool)
     # 结构化时来源走契约的 citations 字段，正文别写行内来源——否则跟契约要求打架、把模型带偏。
     cite_line = (
@@ -106,11 +151,16 @@ def _specialist_instructions(
 
 # 回答规范
 {cite_line}
-- **找不到就说找不到**：文档没有就明说"文档中未找到相关内容"，**不要编**，并建议联系负责人（open_id: {owner}）。
+{_not_found_line(c, structured=structured)}
 - **危险操作**（删除/重启/flush/改主库等）显式标 ⚠️ 风险，并引用文档里的对应警告。{write_block}
 - 中文、简洁、分点。
 - 信息不足以准确回答（缺版本/环境/报错码且会让答案分叉）时，先反问 1-2 个关键点，不要硬答。
-{_tail(has_write_tool=has_write_tool, has_diag_tool=has_diag_tool, structured=structured)}"""
+{_tail(
+        has_write_tool=has_write_tool,
+        has_diag_tool=has_diag_tool,
+        structured=structured,
+        escalate_rule=_specialist_escalate_rule(c, source_phrase=f"`{c.dir}/` 下的文档里"),
+    )}"""
 
 
 def _feishu_specialist_instructions(
@@ -129,7 +179,6 @@ def _feishu_specialist_instructions(
     - **一次问不到就升级**：不像本地文档可以换关键词再 grep 一轮，这里换着问法反复调上游
       既慢又贵，且上游已经跑过一轮 agent 了。
     """
-    owner = c.open_id or "（INDEX.md 未登记 open_id）"
     citation = feishu_citation(c.name)
     write_block = _write_block(has_write_tool)
     cite_line = (
@@ -148,11 +197,16 @@ def _feishu_specialist_instructions(
 
 # 回答规范
 {cite_line}
-- **取不到就说取不到**：工具返回"未能取得…"/"未登记…"，或返回内容明显答非所问时，明说"文档中未找到相关内容"，**不要编**，并建议联系负责人（open_id: {owner}）。**不要**换个问法反复重试——上游每次调用内部都会跑一轮 agent，换问法重试既慢又贵。
+{_not_found_line(c, structured=structured)} 工具返回"未能取得…"/"未登记…"、或返回内容明显答非所问，都算取不到。**不要**换个问法反复重试——上游每次调用内部都会跑一轮 agent，换问法重试既慢又贵。
 - **危险操作**（删除/重启/reload/改配置/限流调整等）显式标 ⚠️ 风险，并引用文档里的对应警告。{write_block}
 - 中文、简洁、分点。
 - 信息不足以准确回答（缺版本/环境/报错码且会让答案分叉）时，先反问 1-2 个关键点，不要硬答——**反问不要调工具**，先把问题问清楚再去查。
-{_tail(has_write_tool=has_write_tool, has_diag_tool=has_diag_tool, structured=structured)}"""
+{_tail(
+        has_write_tool=has_write_tool,
+        has_diag_tool=has_diag_tool,
+        structured=structured,
+        escalate_rule=_specialist_escalate_rule(c, source_phrase="该组件的飞书文档里"),
+    )}"""
 
 
 def build_specialist_agent(
@@ -263,8 +317,8 @@ def build_triage_agent(
         for c in components
     ]
     instructions = _triage_instructions(components)
-    if structured:
-        instructions += STRUCTURED_CONTRACT_SUFFIX
+    # 分诊台只做路由 + 问候/拒绝自答，唯一会用到的标记是反问轮的 <<CLARIFY>>。
+    instructions += STRUCTURED_CONTRACT_SUFFIX if structured else TRIAGE_CLARIFY_NOTE
     triage = Agent[DocsContext](
         name="triage",
         instructions=instructions,
@@ -288,6 +342,28 @@ def build_triage_agent(
 # 专家当**工具**调用，自己保留控制权，收齐各组件证据后综合出根因链。这是单一巨型
 # prompt（原项目那种）很难做干净的场景：每个专家独立作用域、独立上下文，协调者只
 # 负责拆解与综合。
+
+
+def _coordinator_escalate_rule(components: list[Component]) -> str:
+    """协调者的升级规则：它跨组件，归属要自己判，所以得把各组件的标记摆出来让它挑一条。
+
+    与专家（标记唯一、照抄即可）不同：协调者可能只在一个组件上找到线索、也可能哪个都不指向。
+    归属不明就 `<<ESCALATE:none>>`——不 @ 任何人，好过 @ 错人。
+    """
+    known = [c for c in components if c.open_id.startswith("ou_")]
+    table = "\n".join(f"  - {c.name} → `{escalate_marker(c.open_id, c.dir)}`" for c in known)
+    per_component = (
+        f"- 归属**明确落在某一个组件**时，用该组件对应的那条（原样照抄）：\n{table}\n"
+        if table
+        else ""
+    )
+    return (
+        "- 综合各专家的证据后仍然答不出时：先说明你咨询了哪些组件、各自查到什么，"
+        "然后在末尾独立一行输出升级标记。\n"
+        f"{per_component}"
+        "- **跨多个组件 / 归属判断不明**（最常见）→ 输出 `<<ESCALATE:none>>`，不 @ 任何人。\n"
+        "- 只要有任一专家给出了足以作答的证据，就正常作答，不要升级。"
+    )
 
 
 def _coordinator_instructions(components: list[Component]) -> str:
@@ -367,8 +443,11 @@ def build_coordinator_agent(
         for c in components
     ]
     coord_instructions = _coordinator_instructions(components)
-    if structured:
-        coord_instructions += STRUCTURED_CONTRACT_SUFFIX
+    coord_instructions += (
+        STRUCTURED_CONTRACT_SUFFIX
+        if structured
+        else free_text_markers_section(escalate_rule=_coordinator_escalate_rule(components))
+    )
     coordinator = Agent[DocsContext](
         name="coordinator",
         handoff_description=handoff_description,
@@ -471,8 +550,7 @@ def build_auto_agent(
         agent_tool_hooks=agent_tool_hooks,
     )
     instructions = _auto_triage_instructions(components)
-    if structured:
-        instructions += STRUCTURED_CONTRACT_SUFFIX
+    instructions += STRUCTURED_CONTRACT_SUFFIX if structured else TRIAGE_CLARIFY_NOTE
     triage = Agent[DocsContext](
         name="triage",
         instructions=instructions,

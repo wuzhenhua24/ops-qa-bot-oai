@@ -1442,3 +1442,132 @@ async def test_runner_answer_ok_edits_placeholder_to_answer():
     assert r._client.updated_posts, "成功路径未落地答案"
     _, ans_post = r._client.updated_posts[-1]
     assert "maxmemory" in _post_text(ans_post)
+
+
+# ---------------------------------------------------------------------------
+# 多 agent 模式的答案塑形标记契约（回归：专家/协调者曾经从不发标记）
+#
+# 每个专家 / 协调者是独立 Agent、各有各的 instructions，读不到 single 模式那份
+# SYSTEM_PROMPT_TEMPLATE。契约漏发的后果很隐蔽：答案看着正常，只是 <<ESCALATE>> 从不出现
+# —— 飞书接入靠它 @ 负责人（feishu/render.escalate_open_id），于是默认的 auto 模式下
+# @负责人 永远不触发；evaluate 的 decision 推断也永远落到 "answer"。
+# ---------------------------------------------------------------------------
+
+from ops_qa_bot_oai.feishu.render import escalate_open_id  # noqa: E402
+from ops_qa_bot_oai.index import Component  # noqa: E402
+from ops_qa_bot_oai.model import build_model_router  # noqa: E402
+from ops_qa_bot_oai.orchestration import (  # noqa: E402
+    build_coordinator_agent,
+    build_specialist_agent,
+    build_triage_agent,
+)
+from ops_qa_bot_oai.prompt import escalate_marker  # noqa: E402
+
+
+def _component(name="Redis", dir_="redis", open_id="ou_abc", source="local") -> Component:
+    return Component(name=name, dir=dir_, source=source, coverage="缓存", open_id=open_id)
+
+
+def test_escalate_marker_literal():
+    assert escalate_marker("ou_abc", "redis") == "<<ESCALATE:ou_abc:redis>>"
+
+
+def test_escalate_marker_falls_back_to_none_without_open_id():
+    """open_id 没登记时不 @ 一个不存在的人，但升级照常发生。"""
+    assert escalate_marker("", "redis") == "<<ESCALATE:none>>"
+    assert escalate_marker("（INDEX.md 未登记 open_id）", "redis") == "<<ESCALATE:none>>"
+
+
+def test_specialist_prompt_carries_its_exact_escalate_marker():
+    agent = build_specialist_agent(_component(), "gpt-5")
+    assert "<<ESCALATE:ou_abc:redis>>" in agent.instructions
+    assert "<<CLARIFY>>" in agent.instructions
+    assert "<<FOLLOWUPS:" in agent.instructions
+
+
+def test_specialist_prompt_does_not_invite_inline_open_id():
+    """正文里写 @ou_xxx 是 @ 不到人的（系统只认标记），prompt 不该诱导它这么写。"""
+    agent = build_specialist_agent(_component(), "gpt-5")
+    assert "open_id:" not in agent.instructions
+
+
+def test_structured_specialist_has_no_markers_but_bakes_contract_fields():
+    """结构化模式走契约字段，且 escalate_to/dir 同样在构建期算好，不让模型去 INDEX.md 查表。"""
+    agent = build_specialist_agent(_component(), "gpt-5", output_type=AnswerContract)
+    assert "<<ESCALATE:ou_abc:redis>>" not in agent.instructions
+    assert "<<CLARIFY>>" not in agent.instructions
+    assert 'escalate_to="ou_abc"' in agent.instructions
+    assert 'escalate_dir="redis"' in agent.instructions
+
+
+def test_feishu_specialist_also_gets_the_escalate_marker():
+    from ops_qa_bot_oai.doc_qa import DocQAConfig, DocQALog, make_feishu_doc_tool
+
+    tool = make_feishu_doc_tool(DocQAConfig(base_url="http://x.test"), DocQALog())
+    c = _component(name="Nginx", dir_="nginx", open_id="ou_xyz", source="feishu")
+    agent = build_specialist_agent(c, "gpt-5", feishu_tool=tool)
+    assert "<<ESCALATE:ou_xyz:nginx>>" in agent.instructions
+
+
+def test_coordinator_prompt_lists_per_component_markers_and_none(tmp_path):
+    (tmp_path / "INDEX.md").write_text(
+        "| 组件 | 目录 | 覆盖内容 | open_id |\n"
+        "|---|---|---|---|\n"
+        "| Redis | `redis/` | 缓存 | ou_aaa |\n"
+        "| MySQL | `mysql/` | 库 | ou_bbb |\n",
+        encoding="utf-8",
+    )
+    agent, _ = build_coordinator_agent(tmp_path, build_model_router())
+    assert "<<ESCALATE:ou_aaa:redis>>" in agent.instructions
+    assert "<<ESCALATE:ou_bbb:mysql>>" in agent.instructions
+    # 跨组件是协调者最常见的情形：归属不明就不 @ 人
+    assert "<<ESCALATE:none>>" in agent.instructions
+
+
+def test_triage_gets_clarify_only_not_escalate(tmp_path):
+    (tmp_path / "INDEX.md").write_text(
+        "| 组件 | 目录 | 覆盖内容 | open_id |\n|---|---|---|---|\n"
+        "| Redis | `redis/` | 缓存 | ou_aaa |\n",
+        encoding="utf-8",
+    )
+    agent, _ = build_triage_agent(tmp_path, build_model_router())
+    assert "<<CLARIFY>>" in agent.instructions
+    # 分诊台不答组件问题，给它升级/追问契约会诱导它抢专家的活
+    assert "<<ESCALATE" not in agent.instructions
+    assert "<<FOLLOWUPS" not in agent.instructions
+
+
+def test_marker_round_trip_producer_to_feishu_at_mention():
+    """生产端（prompt 里给模型的字面量）→ 解析端（parse_markers）→ 消费端（飞书 @ 负责人）。
+
+    这条链此前从未被端到端串起来测过，中间那一环（专家 prompt 根本不含标记）就这么漏了。
+    """
+    marker = escalate_marker("ou_abc", "redis")
+    answer = f"文档中未找到相关内容，我查了 redis/overview.md 和 troubleshooting.md。\n\n{marker}"
+    cleaned, markers = parse_markers(answer)
+    assert "<<ESCALATE" not in cleaned  # 用户看不到标记
+    assert escalate_open_id(markers.escalate) == "ou_abc"  # 飞书据此 @ 负责人
+
+
+def test_marker_round_trip_none_mentions_nobody():
+    _, markers = parse_markers(f"跨组件，归属不明。\n\n{escalate_marker('', 'redis')}")
+    assert markers.escalate == "none"
+    assert escalate_open_id(markers.escalate) is None
+
+
+def test_coordinator_without_any_open_id_only_offers_none(tmp_path):
+    """一个 open_id 都没登记时，协调者不该被塞一张空表，只留 <<ESCALATE:none>>。"""
+    (tmp_path / "INDEX.md").write_text(
+        "| 组件 | 目录 | 覆盖内容 | open_id |\n|---|---|---|---|\n"
+        "| Redis | `redis/` | 缓存 |  |\n",
+        encoding="utf-8",
+    )
+    agent, _ = build_coordinator_agent(tmp_path, build_model_router())
+    assert "<<ESCALATE:none>>" in agent.instructions
+    assert "<<ESCALATE:ou_" not in agent.instructions
+
+
+def test_markers_section_forbids_narrating_the_marker():
+    """回归：模型曾把标记复述成正文「已标记升级：ou_xxx」，把内部 id 泄露给用户。"""
+    agent = build_specialist_agent(_component(), "gpt-5")
+    assert "不要在正文里复述" in agent.instructions

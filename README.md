@@ -227,7 +227,11 @@ uv run python run.py --ask "Redis 内存告警怎么处理？" --mode multi
 
 `multi` 是纯 handoff 路由的**确定性模式**（评测用）；日常交互推荐默认的 `auto`——它在 `multi` 基础上多挂一个跨组件协调者逃生口（见上「答题模式」）。
 
-实现见 `ops_qa_bot_oai/orchestration.py`（`parse_index_components` / `build_triage_agent` / `build_auto_agent`）。当前核心版只为 `local` 来源的组件建专家。
+实现见 `ops_qa_bot_oai/orchestration.py`（`build_triage_agent` / `build_auto_agent`）+ `index.py`（`parse_index_components`）。`local` 组件的专家挂文档检索工具，`feishu` 组件的专家只挂 `query_feishu_doc`（见上「飞书文档问答」）。
+
+**拆成独立 agent 的代价：输出契约要各发一份。** 每个 agent 只看得见自己的 instructions，single 模式那份 `SYSTEM_PROMPT_TEMPLATE` 里的 `<<CLARIFY>>` / `<<ESCALATE>>` / `<<FOLLOWUPS>>` 契约，专家和协调者是读不到的。漏发的后果很隐蔽——答案看着完全正常，只是标记从不出现：飞书接入靠 `<<ESCALATE:...>>` 来 @ 负责人，于是默认的 `auto` 模式下 **@负责人 永远不触发**；`evaluate` 的 decision 推断也永远落到 `answer`。所以 `_tail()` 会给每个专家/协调者补一份 `free_text_markers_section()`（结构化模式改发 `AnswerContract` 字段，两者互斥）。
+
+顺带一个比 single 模式更稳的地方：专家在**构建期**就知道自己组件的 `open_id` 和目录，所以升级标记 `<<ESCALATE:ou_xxx:redis>>` 是算好了直接写进 instructions 让模型照抄的——不像 single 模式要模型自己去 `INDEX.md` 查表再填，少一步查表就少一个填错 `ou_` 的机会。协调者跨组件，才需要给它一张"组件 → 标记"的表让它挑，归属不明就 `<<ESCALATE:none>>`（不 @ 人好过 @ 错人）。
 
 **转交剥噪音（handoff input_filter）**：多轮对话下，历史里堆着此前专家 `read_doc` 的整篇文档 dump，转交时会原样带给新 agent 的**每次** LLM 调用。本项目用 run 级 `RunConfig(handoff_input_filter=remove_all_tools)`（SDK 内置 filter）在转交时把工具调用/输出项从新 agent 可见输入里剥掉——只影响模型可见输入，session 落盘历史不动，专家需要时自己重新 `read_doc`。实测 GLM 两轮对话的第二轮专家输入 token：**跨组件**（redis→mysql）开 filter 省 34%（4243 vs 6464，旧组件的 dump 对新专家是纯噪音）；**同组件追问**（redis→redis）短文档下反而多花（重读文档 vs 带着缓存）——但 dump 是随轮次**累积**、每次调用重发的负担，对话越长/文档越大 filter 越赚，故默认开。`OPS_QA_HANDOFF_STRIP_TOOLS=0` 可关（短对话 + 单组件深聊的场景）。
 
