@@ -33,6 +33,7 @@ from lark_oapi.channel.types import InboundMessage, TextContent
 
 from ..db_query import DB_CHANGE_TOOL_NAME, change_display
 from ..diagnostics import DiagConfig
+from ..gateway_trace import GatewayTraceConfig
 from ..model import MODE_LABELS
 from ..review import ReviewConfig
 from .approvals import ApprovalCenter
@@ -187,6 +188,13 @@ class WsRunner:
             )
             hosts = "、".join(diag.allowed_hosts) if diag.allowed_hosts else "不限（仍拒生产）"
             logger.info("实时诊断：开（测试环境只读；%s；目标白名单：%s）", how, hosts)
+        # 网关链路排查（OPS_QA_GW_TRACE=1）：同上，各会话 bot 自己从环境读配置。这里回显的
+        # 「挂在组件 X 上」尤其值得看一眼——组件目录名配错时工具会静默挂空（OpsQABot 构造时
+        # 另有 WARNING，但那要等第一个问题进来才打）。
+        gw = GatewayTraceConfig.from_env()
+        if gw.enabled:
+            how = "模拟链路数据（未配 base_url）" if gw.use_mock else f"真实 cat 平台 {gw.base_url}"
+            logger.info("网关链路排查：开（%s；挂在组件 `%s` 的专家上）", how, gw.component)
         # 二次复核（OPS_QA_REVIEW=1）：各会话 bot 自己从环境读配置，这里只做启动日志回显。
         if ReviewConfig.from_env().enabled:
             logger.info("二次复核：开（另一模型证据核对，revise-once 后交付；诊断/写不过转人工）")

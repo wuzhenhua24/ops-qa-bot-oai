@@ -18,6 +18,7 @@ from .bot import GuardedAnswer, OpsQABot, StructuredAnswer, format_tool_call
 from .db_query import DbConfig
 from .diagnostics import DiagConfig
 from .doc_qa import DocQAConfig
+from .gateway_trace import GatewayTraceConfig
 from .model import MODE_LABELS, MODES, resolve_mode, resolve_model
 from .review import ReviewConfig
 
@@ -128,6 +129,22 @@ def _db_line(cfg: DbConfig) -> str | None:
     return f"数据库诊断：测试环境只读 · {how} · 实例白名单：{hosts}"
 
 
+def _resolve_gw_trace_config(force_on: bool) -> GatewayTraceConfig:
+    """解析网关链路排查配置：读 OPS_QA_GW_TRACE*；--gateway-trace 可强制开启。"""
+    cfg = GatewayTraceConfig.from_env()
+    if force_on and not cfg.enabled:
+        cfg = replace(cfg, enabled=True)
+    return cfg
+
+
+def _gw_trace_line(cfg: GatewayTraceConfig) -> str | None:
+    """网关链路排查的横幅细节；未开启返回 None。"""
+    if not cfg.enabled:
+        return None
+    how = "模拟链路数据（未配 base_url）" if cfg.use_mock else f"真实 cat 平台 {cfg.base_url}"
+    return f"网关链路排查：query_gateway_trace · {how} · 挂在组件 `{cfg.component}` 的专家上"
+
+
 def _doc_qa_line(cfg: DocQAConfig) -> str | None:
     """飞书文档问答的横幅细节；未开启返回 None。
 
@@ -184,6 +201,7 @@ async def run_once(
     guardrails: bool = False,
     diagnostics: bool = False,
     db: bool = False,
+    gw_trace: bool = False,
     review: bool = False,
 ) -> None:
     """一次性问一个问题就退出（适合脚本调用 / 批量跑题）。"""
@@ -191,8 +209,9 @@ async def run_once(
     diag_config = _resolve_diag_config(diagnostics)
     db_config = _resolve_db_config(db)
     doc_qa_config = DocQAConfig.from_env()
+    gw_trace_config = _resolve_gw_trace_config(gw_trace)
     review_config = _resolve_review_config(review)
-    # 路由 × 输出 × 护栏 × 诊断 × 数据库 × 飞书文档 × 复核 正交，可任意组合。
+    # 路由 × 输出 × 护栏 × 诊断 × 数据库 × 飞书文档 × 网关链路 × 复核 正交，可任意组合。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
@@ -201,6 +220,7 @@ async def run_once(
         diag_config=diag_config,
         db_config=db_config,
         doc_qa_config=doc_qa_config,
+        gw_trace_config=gw_trace_config,
         review_config=review_config,
     )
     if show_tools:
@@ -211,6 +231,8 @@ async def run_once(
             print(f"[{line}]")
         if line := _db_line(db_config):
             print(f"[{line}]")
+        if line := _gw_trace_line(gw_trace_config):
+            print(f"[{line}]")
         if line := _doc_qa_line(doc_qa_config):
             print(f"[{line}]")
         if review_config.enabled:
@@ -218,6 +240,7 @@ async def run_once(
         extras_on = (
             diag_config.enabled
             or db_config.enabled
+            or gw_trace_config.enabled
             or doc_qa_config.enabled
             or review_config.enabled
         )
@@ -294,14 +317,16 @@ async def run_repl(
     guardrails: bool = False,
     diagnostics: bool = False,
     db: bool = False,
+    gw_trace: bool = False,
     review: bool = False,
 ) -> None:
     model_choice = resolve_model()
     diag_config = _resolve_diag_config(diagnostics)
     db_config = _resolve_db_config(db)
     doc_qa_config = DocQAConfig.from_env()
+    gw_trace_config = _resolve_gw_trace_config(gw_trace)
     review_config = _resolve_review_config(review)
-    # 路由 × 输出 × 护栏 × 诊断 × 数据库 × 飞书文档 × 复核 正交，可任意组合。
+    # 路由 × 输出 × 护栏 × 诊断 × 数据库 × 飞书文档 × 网关链路 × 复核 正交，可任意组合。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
@@ -310,6 +335,7 @@ async def run_repl(
         diag_config=diag_config,
         db_config=db_config,
         doc_qa_config=doc_qa_config,
+        gw_trace_config=gw_trace_config,
         review_config=review_config,
     )
     approver = _make_approver(interactive=True) if guardrails else None
@@ -324,6 +350,8 @@ async def run_repl(
         parts.append("实时诊断")
     if db_config.enabled:
         parts.append("数据库诊断")
+    if gw_trace_config.enabled:
+        parts.append("网关链路排查")
     if doc_qa_config.enabled:
         parts.append("飞书文档问答")
     if review_config.enabled:
@@ -336,6 +364,8 @@ async def run_repl(
     if line := _diag_line(diag_config):
         print(line)
     if line := _db_line(db_config):
+        print(line)
+    if line := _gw_trace_line(gw_trace_config):
         print(line)
     if line := _doc_qa_line(doc_qa_config):
         print(line)
@@ -491,6 +521,13 @@ def main() -> None:
         "未配只读账号时自动降级为模拟数据。配合 --guardrails 时改参数走 request_db_change 审批",
     )
     parser.add_argument(
+        "--gateway-trace",
+        action="store_true",
+        help="开启网关链路排查（query_gateway_trace），等价 OPS_QA_GW_TRACE=1；"
+        "按 Hi-Trace-Id 取一次请求的网关链路表。未配 OPS_QA_GW_TRACE_BASE_URL 时降级为模拟数据。"
+        "多 agent 模式下只挂在 OPS_QA_GW_TRACE_COMPONENT（缺省 gateway）那个组件的专家上",
+    )
+    parser.add_argument(
         "--review",
         action="store_true",
         help="开启二次复核（等价 OPS_QA_REVIEW=1）：另一模型对答案做证据核对，revise-once 后交付。"
@@ -510,6 +547,7 @@ def main() -> None:
                 guardrails=args.guardrails,
                 diagnostics=args.diagnostics,
                 db=args.db,
+                gw_trace=args.gateway_trace,
                 review=args.review,
             )
         )
@@ -523,6 +561,7 @@ def main() -> None:
                 guardrails=args.guardrails,
                 diagnostics=args.diagnostics,
                 db=args.db,
+                gw_trace=args.gateway_trace,
                 review=args.review,
             )
         )

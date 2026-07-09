@@ -58,6 +58,14 @@
       "note": "kafka/operations.md 创建 topic"
     },
     {
+      "id": "gateway-trace-upstream-no-hosts",
+      "question": "访问 /api/v1/orders 报 503，失败响应头里的 Hi-Trace-Id 是 unified-access-server-0aa4c5db-479090-103，帮我看下是什么原因？",
+      "expected_decision": "answer",
+      "expected_component": "gateway",
+      "expected_route": "gateway",
+      "note": "需 OPS_QA_GW_TRACE=1（未配 base_url 即走模拟链路表，返回 UPSTREAM_NO_HOSTS）。考察：分诊台按 Hi-Trace-Id 路由到网关专家、专家调 query_gateway_trace 而不是干答、结论落在「后端集群无可用实例」而非编造"
+    },
+    {
       "id": "cross-502-oom",
       "question": "某接口偶发返回 502，重试又能成功，网关和容器层各能看到什么、根因是什么？",
       "expected_decision": "answer",

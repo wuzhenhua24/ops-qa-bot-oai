@@ -11,7 +11,8 @@
 | 模型 | Claude（SDK 绑定 Anthropic） | provider 无关：OpenAI 原生 / 兼容代理 / LiteLLM 运行时切换 |
 | 权限/写防护 | `permission_mode` + PreToolUse hook 拦写命令 | 核心版无 Bash，工具天然只读；沙箱在 `tools.py` 自己做 |
 | 数据库参数变更审批 | 手工链路：`DbChangeSubmitter` Protocol + 飞书确认卡 + pending 登记 + 回调里执行（hook 无法挂起 run） | `request_db_change` 标 `needs_approval=True`，run 原生挂起、走与写审批同一条 HITL 闭环；发卡前 `validate_change_args` 短路非法提议（`db_query.py`） |
-| 二次复核证据 | （无二次复核） | 引用文档内容 + 诊断输出 + **数据库查询输出**（`DbQueryLog`）+ 飞书文档答案 |
+| 网关链路排查 | `query_gateway_trace` 挂在唯一那个巨型 agent 上（没有专家可挂），靠工具描述自律 | **组件专属工具**（`scoped_tools`）：只有网关专家有它；分诊台带 `Hi-Trace-Id` 兜底路由规则补偿"路由错=工具不可见"（`gateway_trace.py`） |
+| 二次复核证据 | （无二次复核） | 引用文档内容 + 诊断输出 + **数据库查询输出**（`DbQueryLog`）+ **网关链路表**（`GatewayTraceLog`）+ 飞书文档答案 |
 
 ## 关键设计差异
 

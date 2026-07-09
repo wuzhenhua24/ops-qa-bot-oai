@@ -33,6 +33,7 @@ ops-qa-bot-oai/
 │   ├── diagnostics.py        # 实时诊断：run_diagnostic（测试环境只读 ssh，白名单+写路由审批）（差异化 #6）
 │   ├── db_query.py           # 数据库诊断：query_database（只读账号直连）+ request_db_change（needs_approval 参数变更审批）
 │   ├── doc_qa.py             # 飞书文档问答：query_feishu_doc（接外部 /doc_qa 服务，feishu 来源组件专用）
+│   ├── gateway_trace.py      # 网关链路排查：query_gateway_trace（按 Hi-Trace-Id 查链路，组件专属工具）
 │   ├── review.py             # 二次复核：另一模型证据核对 + revise-once（差异化 #7）
 │   ├── hooks.py              # 运行遥测 RunHooks：精确转交链 + 按 agent token 归账（#2 量化）
 │   ├── bot.py                # OpsQABot：Agent + Runner，answer()/answer_structured()/answer_guarded()
@@ -382,6 +383,29 @@ OPS_QA_DB=1 OPS_QA_DB_ALLOWED_HOSTS='10.1.0.0/16' \
 环境变量：`OPS_QA_DB`（开关）/ `OPS_QA_DB_ALLOWED_HOSTS`（IP/CIDR/主机名白名单）/ `OPS_QA_DB_TIMEOUT`（缺省 30s）/ `OPS_QA_DB_MAX_CHARS`（结果截断，缺省 20000）/ `OPS_QA_DB_MOCK`（强制模拟）；只读账号按连接类型三套：`OPS_QA_DB_MYSQL_RO_USER/PASSWORD`、`OPS_QA_DB_OB_MYSQL_RO_*`、`OPS_QA_DB_OB_ORACLE_RO_*`；参数变更要真执行再配 `OPS_QA_DB_*_ADMIN_USER/PASSWORD`（不配则批准后登记为"待 DBA 人工执行"）。终端与飞书共用。
 
 **与实时诊断的分工**（prompt 里也讲了）：数据库层问题走 `query_database`（直连、凭据注入）；机器/系统层（内存、磁盘、日志）走 `run_diagnostic`。两者正交组合，都与编排模式正交（挂在真正答题的专家上）。
+
+## 网关链路排查（组件专属工具）
+
+网关文档里的排查流程第一步是"拿失败响应头里的 `Hi-Trace-Id` 去链路平台查这次请求"。`query_gateway_trace(hi_trace_id)` 把那个页面背后的接口（`GET {base_url}/cat/r/model/logview/unified-access-server?messageId=...`，返回应用层 gzip 的 logview 表）包成工具，让 agent 确定性地取到链路数据，而不是靠读散文 runbook 现拼 curl。移植自 ops-qa-bot 的 `gateway_trace.py`；工具只对固定端点发 GET，唯一来自 LLM 的输入是 trace id（httpx 负责 urlencode），天生只能读。
+
+它是本项目的第三类工具：既不像 `run_diagnostic` / `query_database` 那样**横切**（每个专家都可能用），也不像 `query_feishu_doc` 那样是某组件的**唯一知识来源**（网关文档仍是本地 md）。所以走 `scoped_tools`——**只挂在网关组件的专家上**，别的专家物理上看不见它。
+
+| ops-qa-bot（Claude Agent SDK） | 本项目 |
+|---|---|
+| 单个巨型 agent，工具对所有问题可见，靠工具描述里"没给 Hi-Trace-Id 就别调"自律 | 组件专属挂载：只有网关专家有这个工具（同 feishu 专家没有文档检索工具的姿态） |
+| 无二次复核，链路表拿到就直接喂模型 | `GatewayTraceLog` 进 `gather_evidence`，reviewer 对着链路表核对"URL_NOT_MATCHED 这条结论表里到底有没有" |
+| 无 mock，评测机连不上内网 cat 平台就覆盖不到 | 未配 base_url 自动降级为**标注过的**模拟链路表，评测/演示能端到端跑 |
+| trace id 只校验非空 + 长度 | 正向字符白名单（同 `_IDENT_RE` / `_HOST_VALID_RE`），挡住模型把整句话当 id 传 |
+
+**组件专属挂载的代价是"路由错 = 工具不可见"**：用户说"服务偶发 5xx，Hi-Trace-Id 是 xxx"，分诊台可能按「服务/5xx」转给应用侧专家，而那个专家既没工具也读不懂 logview 表。所以分诊台带一条兜底规则（`prompt.trace_routing_rule`）：出现 `Hi-Trace-Id` 时，multi 模式一律转网关专家；auto 模式只允许转网关专家或跨组件协调者（协调者的 `ask_gateway` 同样带这个工具，且能把链路证据和容器侧证据串成根因链），**绝不许**落到别的单组件专家手里。协调者那边另加了一条"用户给的标识符逐字照抄进子问题"——转述时丢掉 trace id 会让专家静默查不了，答案看着正常却从没查过真实数据。
+
+```bash
+# 缺省关。未配 base_url 时走模拟链路数据（标注过的假表），可直接体验。
+OPS_QA_GW_TRACE=1 uv run python run.py --mode auto \
+  --ask "访问 api 报 503，Hi-Trace-Id 是 unified-access-server-0aa4c5db-479090-103，为什么？"
+```
+
+环境变量（完整见 `.env.example`）：`OPS_QA_GW_TRACE`（开关）/ `OPS_QA_GW_TRACE_BASE_URL`（cat 平台地址，不配即 mock）/ `OPS_QA_GW_TRACE_COMPONENT`（挂在哪个组件的专家上，缺省 `gateway`；**配错会静默失效**，故启动时打 WARNING）/ `OPS_QA_GW_TRACE_TIMEOUT` / `_MAX_CHARS` / `_MOCK`。终端 `--gateway-trace` 可临时开启。
 
 ## 飞书文档问答（来源异构）
 

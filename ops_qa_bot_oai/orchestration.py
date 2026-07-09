@@ -33,6 +33,7 @@ from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
 from .db_query import DB_CHANGE_TOOL_NAME, DB_TOOL_NAME
 from .diagnostics import DIAG_TOOL_NAME
+from .gateway_trace import GW_TRACE_TOOL_NAME
 from .index import Component, feishu_citation, parse_index_components
 from .model import ModelRouter, role_model_settings
 from .prompt import (
@@ -42,6 +43,8 @@ from .prompt import (
     diagnostics_prompt_section,
     escalate_marker,
     free_text_markers_section,
+    gateway_trace_prompt_section,
+    trace_routing_rule,
 )
 from .tools import DOC_TOOLS, DocsContext
 
@@ -61,6 +64,37 @@ _WRITE_TOOL_NAME = "request_write_command"
 
 def _tool_names(tools: list | None) -> set[str]:
     return {getattr(t, "name", "") for t in (tools or [])}
+
+
+# 组件专属工具表：`{组件目录名: [工具, ...]}`。与横切的 `specialist_extra_tools`（每个专家都
+# 挂：写审批 / 实时诊断 / 数据库）相对——这里的工具只挂给**某一个组件**的专家（目前只有网关
+# 链路排查 `query_gateway_trace`）。与「来源」正交：飞书来源的组件照样能拿到自己的专属工具。
+ScopedTools = dict[str, list]
+
+
+def _scoped_for(scoped_tools: ScopedTools | None, dir_: str) -> list:
+    return list((scoped_tools or {}).get(dir_, []))
+
+
+def _gw_trace_component(
+    components: list[Component], scoped_tools: ScopedTools | None
+) -> Component | None:
+    """找出挂了 `query_gateway_trace` 的那个组件（没有则 None）。分诊台据此加路由兜底规则。"""
+    for c in components:
+        if GW_TRACE_TOOL_NAME in _tool_names(_scoped_for(scoped_tools, c.dir)):
+            return c
+    return None
+
+
+def _trace_routing_note(
+    components: list[Component],
+    scoped_tools: ScopedTools | None,
+    *,
+    has_coordinator: bool = False,
+) -> str:
+    """分诊台的 Hi-Trace-Id 路由兜底规则（没挂链路工具时为空串）。见 prompt.trace_routing_rule。"""
+    c = _gw_trace_component(components, scoped_tools)
+    return trace_routing_rule(c.name, c.dir, has_coordinator=has_coordinator) if c else ""
 
 
 def routable_components(components: list[Component], feishu_tool: object | None) -> list[Component]:
@@ -93,10 +127,11 @@ def _tail(
     has_diag_tool: bool,
     has_db_tool: bool = False,
     has_db_change_tool: bool = False,
+    has_gw_trace_tool: bool = False,
     structured: bool,
     escalate_rule: str,
 ) -> str:
-    """专家 instructions 的公共结尾：实时诊断/数据库诊断章节（若挂了工具）+ 输出契约。
+    """专家 instructions 的公共结尾：实时诊断/数据库/网关链路章节（若挂了工具）+ 输出契约。
 
     输出契约二选一，互斥：结构化模式用 `AnswerContract` 的字段（decision/escalate_to/
     followups）；自由文本模式用 `<<CLARIFY>>` / `<<ESCALATE>>` / `<<FOLLOWUPS>>` 标记。
@@ -105,12 +140,13 @@ def _tail(
     """
     diag = diagnostics_prompt_section(has_write_tool=has_write_tool) if has_diag_tool else ""
     db = db_prompt_section(has_change_tool=has_db_change_tool) if has_db_tool else ""
+    gw = gateway_trace_prompt_section() if has_gw_trace_tool else ""
     contract = (
         STRUCTURED_CONTRACT_SUFFIX
         if structured
         else free_text_markers_section(escalate_rule=escalate_rule)
     )
-    return f"{diag}{db}{contract}"
+    return f"{diag}{db}{gw}{contract}"
 
 
 def _specialist_escalate_rule(c: Component, *, source_phrase: str) -> str:
@@ -142,6 +178,7 @@ def _specialist_instructions(
     has_diag_tool: bool = False,
     has_db_tool: bool = False,
     has_db_change_tool: bool = False,
+    has_gw_trace_tool: bool = False,
     structured: bool = False,
 ) -> str:
     """本地 markdown 来源的组件专家：作用域限定在自己的目录，挂文档检索工具。"""
@@ -171,6 +208,7 @@ def _specialist_instructions(
         has_diag_tool=has_diag_tool,
         has_db_tool=has_db_tool,
         has_db_change_tool=has_db_change_tool,
+        has_gw_trace_tool=has_gw_trace_tool,
         structured=structured,
         escalate_rule=_specialist_escalate_rule(c, source_phrase=f"`{c.dir}/` 下的文档里"),
     )}"""
@@ -183,6 +221,7 @@ def _feishu_specialist_instructions(
     has_diag_tool: bool = False,
     has_db_tool: bool = False,
     has_db_change_tool: bool = False,
+    has_gw_trace_tool: bool = False,
     structured: bool = False,
 ) -> str:
     """飞书文档来源的组件专家：唯一知识入口是 `query_feishu_doc`，本地没有它的 md 文件。
@@ -221,6 +260,7 @@ def _feishu_specialist_instructions(
         has_diag_tool=has_diag_tool,
         has_db_tool=has_db_tool,
         has_db_change_tool=has_db_change_tool,
+        has_gw_trace_tool=has_gw_trace_tool,
         structured=structured,
         escalate_rule=_specialist_escalate_rule(c, source_phrase="该组件的飞书文档里"),
     )}"""
@@ -231,6 +271,7 @@ def build_specialist_agent(
     model: str | Model,
     *,
     extra_tools: list | None = None,
+    scoped_tools: ScopedTools | None = None,
     feishu_tool: object | None = None,
     output_type: object | None = None,
     output_guardrails: list | None = None,
@@ -246,6 +287,11 @@ def build_specialist_agent(
     `run_diagnostic`）挂到专家上——多/自适应/协调者模式下真正答题、可能提议写操作的是专家，
     护栏得挂在这一层。这些工具与来源正交：飞书来源的组件照样可以诊断它的机器、提议变更。
 
+    `scoped_tools` 是**组件专属**工具（`{目录名: [工具]}`），只挂给对应组件的专家：目前是
+    网关组件的 `query_gateway_trace`。与 `extra_tools` 的区别是"谁该有这个能力"——链路排查
+    只有网关专家用得上，别的专家连这个工具都看不见（对齐飞书专家没有文档检索工具的姿态：
+    能变成机制的就不留给 prompt 自律）。同样与来源正交。
+
     `output_type` 非空时专家作为**终端 agent** 产出结构化契约（multi/auto 下 handoff 后
     由专家收尾）——此时叠加契约字段引导、并挂 `output_guardrails`。coordinator 模式下
     专家是被 as_tool 调用、返回文字喂协调者，不传 output_type。
@@ -257,8 +303,9 @@ def build_specialist_agent(
         )
     structured = output_type is not None
     extra = list(extra_tools or [])
+    scoped = _scoped_for(scoped_tools, c.dir)
     base_tools: list = [feishu_tool] if c.is_feishu else list(DOC_TOOLS)
-    names = _tool_names(extra)
+    names = _tool_names(extra) | _tool_names(scoped)
     instructions_fn = _feishu_specialist_instructions if c.is_feishu else _specialist_instructions
     return Agent[DocsContext](
         name=f"{c.dir}_specialist",
@@ -269,9 +316,10 @@ def build_specialist_agent(
             has_diag_tool=DIAG_TOOL_NAME in names,
             has_db_tool=DB_TOOL_NAME in names,
             has_db_change_tool=DB_CHANGE_TOOL_NAME in names,
+            has_gw_trace_tool=GW_TRACE_TOOL_NAME in names,
             structured=structured,
         ),
-        tools=base_tools + extra,
+        tools=base_tools + extra + scoped,
         model=model,
         model_settings=role_model_settings(c.dir),
         output_type=output_type,
@@ -279,7 +327,7 @@ def build_specialist_agent(
     )
 
 
-def _triage_instructions(components: list[Component]) -> str:
+def _triage_instructions(components: list[Component], trace_note: str = "") -> str:
     lines = [f"- **{c.name}**（转交目标：{c.dir}_specialist）：{c.coverage}" for c in components]
     roster = "\n".join(lines) if lines else "（INDEX.md 未解析到组件）"
     body = f"""你是内部运维问答的**分诊台**。你自己不查组件文档、不回答组件细节问题——你的职责是把问题**转交（handoff）给正确的组件专家**。
@@ -288,7 +336,7 @@ def _triage_instructions(components: list[Component]) -> str:
 {roster}
 
 # 路由规则
-- **运维组件问题** → 立即 handoff 给最匹配的那个专家（按问题里的组件名 / 关键词判断），**不要自己用工具查文档作答**。
+- **运维组件问题** → 立即 handoff 给最匹配的那个专家（按问题里的组件名 / 关键词判断），**不要自己用工具查文档作答**。{trace_note}
 - **问候 / 致谢 / 闲聊性收尾**（"你好"、"在吗"、"谢谢"）→ 自己简短回应，1-2 句，引导用户提具体运维问题。
 - **询问能力 / "你能做什么"** → 自己回答：列出上面覆盖的组件 + 给 1-2 个示例问题（可 `read_doc("INDEX.md")` 核对）。
 - **与运维无关的请求**（写代码 / 翻译 / 通用知识）→ 自己友好拒绝，说明只覆盖运维组件问答。
@@ -304,6 +352,7 @@ def build_triage_agent(
     *,
     input_guardrails: list | None = None,
     specialist_extra_tools: list | None = None,
+    scoped_tools: ScopedTools | None = None,
     feishu_tool: object | None = None,
     output_type: object | None = None,
     output_guardrails: list | None = None,
@@ -319,6 +368,10 @@ def build_triage_agent(
     护栏（横切，与编排模式正交）：`input_guardrails` 挂在入口分诊 agent 上（输入护栏
     只在入口 agent 对用户输入跑一次）；`specialist_extra_tools`（如写审批工具）挂到各专家。
 
+    `scoped_tools`（组件专属工具，如网关的 `query_gateway_trace`）只挂给对应组件的专家；
+    分诊台会据此多一条路由兜底规则（问题里出现 Hi-Trace-Id 一律转网关专家），因为组件专属
+    工具的代价正是"路由错 = 工具不可见"。
+
     结构化输出（与路由正交）：`output_type` 非空时，各专家（handoff 后终端）与分诊自身
     （自答场景）都产出该契约类型，`output_guardrails`（来源护栏）挂到这些终端 agent。
     """
@@ -329,13 +382,14 @@ def build_triage_agent(
             c,
             router.for_role(c.dir)[1],
             extra_tools=specialist_extra_tools,
+            scoped_tools=scoped_tools,
             feishu_tool=feishu_tool,
             output_type=output_type,
             output_guardrails=output_guardrails,
         )
         for c in components
     ]
-    instructions = _triage_instructions(components)
+    instructions = _triage_instructions(components, _trace_routing_note(components, scoped_tools))
     # 分诊台只做路由 + 问候/拒绝自答，唯一会用到的标记是反问轮的 <<CLARIFY>>。
     instructions += STRUCTURED_CONTRACT_SUFFIX if structured else TRIAGE_CLARIFY_NOTE
     triage = Agent[DocsContext](
@@ -396,6 +450,7 @@ def _coordinator_instructions(components: list[Component]) -> str:
 # 工作流程
 1. **拆解现象**：判断这个现象**可能涉及哪些组件**。运维问题常是跨层的——例如"接口偶发失败"可能同时牵涉网关（看到上游实例偶发不健康）和容器平台（实例 OOM 重启）。
 2. **并行求证**：对每个相关组件，调用其 `ask_<组件>` 工具，传一个**自包含的子问题**（写清现象 + 要它从本组件角度查什么）。可以调用多个工具。每个工具会返回该组件文档依据下的发现。
+   - **用户给的标识符必须原样带进子问题**：`Hi-Trace-Id`、机器 IP / 主机名、数据库连接信息、具体报错码等，**逐字照抄，不要改写、不要省略、不要概括成"用户提供的 trace id"**。专家要拿它去调自己的工具（查链路、跑诊断、连库）；丢了标识符它就查不了，只能干答，而这种失败很安静——答案看着正常，只是从来没查过真实数据。
 3. **综合根因**：把各组件的发现**串成因果链**，指出最可能的根因和证据链路。例如「容器层 A 实例周期性 OOM 重启 → 重启期间网关健康检查判其 unhealthy 并摘流 → 命中该实例的请求偶发 5xx」。
 4. **给处置建议**：基于综合结论给排查/处置建议；涉及变更（改配置/扩资源/重启）只给文字建议，标 ⚠️ 风险，不代为执行。
 
@@ -415,6 +470,7 @@ def build_coordinator_agent(
     handoff_description: str | None = None,
     input_guardrails: list | None = None,
     specialist_extra_tools: list | None = None,
+    scoped_tools: ScopedTools | None = None,
     feishu_tool: object | None = None,
     output_type: object | None = None,
     output_guardrails: list | None = None,
@@ -449,6 +505,7 @@ def build_coordinator_agent(
             c,
             router.for_role(c.dir)[1],
             extra_tools=specialist_extra_tools,
+            scoped_tools=scoped_tools,
             feishu_tool=feishu_tool,
         ).as_tool(
             tool_name=f"ask_{c.dir}",
@@ -497,7 +554,7 @@ _AUTO_COORDINATOR_HANDOFF_DESC = (
 )
 
 
-def _auto_triage_instructions(components: list[Component]) -> str:
+def _auto_triage_instructions(components: list[Component], trace_note: str = "") -> str:
     lines = [f"- **{c.name}**（转交目标：{c.dir}_specialist）：{c.coverage}" for c in components]
     roster = "\n".join(lines) if lines else "（INDEX.md 未解析到组件）"
     body = f"""你是内部运维问答的**分诊台**（自适应路由）。你自己不查组件文档、不回答组件细节——职责是把问题**转交（handoff）给正确的处理者**。
@@ -514,7 +571,7 @@ def _auto_triage_instructions(components: list[Component]) -> str:
 - **问候 / 致谢 / 闲聊**（"你好"、"谢谢"）→ 自己简短回应，1-2 句，引导用户提具体运维问题。
 - **询问能力 / "你能做什么"** → 自己回答：列出上面覆盖的组件 + 1-2 个示例问题（可 `read_doc("INDEX.md")` 核对）。
 - **与运维无关的请求**（写代码 / 翻译 / 通用知识）→ 自己友好拒绝，说明只覆盖运维组件问答。
-- 拿不准是单组件还是跨组件时，**倾向先转给单组件专家**（更聚焦）；确有跨组件迹象再转协调者。
+- 拿不准是单组件还是跨组件时，**倾向先转给单组件专家**（更聚焦）；确有跨组件迹象再转协调者。{trace_note}
 
 转交后由处理者作答，你不需要再介入。"""
     return prompt_with_handoff_instructions(body)
@@ -527,6 +584,7 @@ def build_auto_agent(
     specialist_max_turns: int = 12,
     input_guardrails: list | None = None,
     specialist_extra_tools: list | None = None,
+    scoped_tools: ScopedTools | None = None,
     feishu_tool: object | None = None,
     output_type: object | None = None,
     output_guardrails: list | None = None,
@@ -551,6 +609,7 @@ def build_auto_agent(
             c,
             router.for_role(c.dir)[1],
             extra_tools=specialist_extra_tools,
+            scoped_tools=scoped_tools,
             feishu_tool=feishu_tool,
             output_type=output_type,
             output_guardrails=output_guardrails,
@@ -563,12 +622,15 @@ def build_auto_agent(
         specialist_max_turns=specialist_max_turns,
         handoff_description=_AUTO_COORDINATOR_HANDOFF_DESC,
         specialist_extra_tools=specialist_extra_tools,
+        scoped_tools=scoped_tools,
         feishu_tool=feishu_tool,
         output_type=output_type,
         output_guardrails=output_guardrails,
         agent_tool_hooks=agent_tool_hooks,
     )
-    instructions = _auto_triage_instructions(components)
+    instructions = _auto_triage_instructions(
+        components, _trace_routing_note(components, scoped_tools, has_coordinator=True)
+    )
     instructions += STRUCTURED_CONTRACT_SUFFIX if structured else TRIAGE_CLARIFY_NOTE
     triage = Agent[DocsContext](
         name="triage",

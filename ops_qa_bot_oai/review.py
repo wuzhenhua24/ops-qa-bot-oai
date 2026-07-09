@@ -210,7 +210,9 @@ def gather_evidence(
       `query_feishu_doc` 实际拿回的 markdown（`feishu_answers`，键是组件名）。**不这么做的话
       reviewer 会对每条飞书来源都读到 `[未找到]`、稳定误判"引用不实"并触发无意义的重答。**
       引用了某个组件、本轮却没调过它的工具 → 明确标成"无据可核"，这正是要抓的幻觉。
-    - **诊断输出**：本轮 `run_diagnostic` 的输出行。
+    - **实时证据**（`diag_outputs`）：本轮 `run_diagnostic` 的输出、`query_database` 的查询
+      结果、`query_gateway_trace` 取到的网关链路表。三者都带来源前缀，reviewer 据此核对
+      "结论是否被实时数据支持"。
 
     整体截断到 max_chars 防超长。
     """
@@ -234,7 +236,7 @@ def gather_evidence(
     for name, answer in pending.values():
         parts.append(f"## 飞书文档答案：{name}（答案未显式引用）\n{answer}")
     for out in diag_outputs:
-        parts.append(f"## 诊断输出\n{out}")
+        parts.append(f"## 实时证据\n{out}")
     if not parts:
         return "（无可核对的证据：答案未引用任何文档、也没有诊断输出。）"
     text = "\n\n".join(parts)

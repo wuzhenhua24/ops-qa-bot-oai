@@ -52,12 +52,19 @@ from .db_query import (
 )
 from .diagnostics import DiagConfig, DiagnosticLog, make_diagnostic_tool
 from .doc_qa import DOC_QA_TOOL_NAME, DocQAConfig, DocQALog, make_feishu_doc_tool
+from .gateway_trace import (
+    GW_TRACE_TOOL_NAME,
+    GatewayTraceConfig,
+    GatewayTraceLog,
+    make_gateway_trace_tool,
+)
 from .guardrails import (
     citation_output_guardrail,
     detect_forbidden_command,
     injection_input_guardrail,
 )
 from .hooks import RunTelemetry
+from .index import parse_index_components
 from .model import (
     MODES,
     ModelChoice,
@@ -128,14 +135,15 @@ _VALID_FOLLOWUP_KEYS = {
 class _EvidenceMark:
     """答题前各证据日志的长度快照。
 
-    复核只该看**本轮**新增的证据：诊断日志、数据库查询和飞书文档答案在多轮会话里是累积
-    的，不切一刀，第二轮的 reviewer 会拿到第一轮的诊断输出当"本轮证据"，据此判定第二轮
-    答案"与证据矛盾"。
+    复核只该看**本轮**新增的证据：诊断日志、数据库查询、网关链路和飞书文档答案在多轮会话里
+    是累积的，不切一刀，第二轮的 reviewer 会拿到第一轮的诊断输出当"本轮证据"，据此判定第二
+    轮答案"与证据矛盾"。
     """
 
     diag: int
     doc_qa: int
     db: int
+    gw_trace: int
 
 
 @dataclass
@@ -279,6 +287,8 @@ def format_tool_call(name: str, args: dict) -> str:
             f"request_db_change {args.get('host', '?')}: "
             f"{args.get('param', '?')}={args.get('value', '?')}"
         )
+    if name == GW_TRACE_TOOL_NAME:
+        return f"query_gateway_trace {args.get('hi_trace_id', '?')}"
     if name == DOC_QA_TOOL_NAME:
         q = str(args.get("question", "?"))
         if len(q) > 60:
@@ -319,6 +329,7 @@ class OpsQABot:
         diag_config: DiagConfig | None = None,
         db_config: DbConfig | None = None,
         doc_qa_config: DocQAConfig | None = None,
+        gw_trace_config: GatewayTraceConfig | None = None,
         review_config: ReviewConfig | None = None,
     ):
         if mode not in MODES:
@@ -385,6 +396,20 @@ class OpsQABot:
             make_feishu_doc_tool(self.doc_qa_config, self.doc_qa_log) if self.doc_qa else None
         )
 
+        # 网关链路排查（OPS_QA_GW_TRACE=1 开启）：query_gateway_trace 按 Hi-Trace-Id 取一次
+        # 请求的网关链路表。它既不是横切工具（只有网关专家用得上），也不是某组件的唯一知识
+        # 来源（网关文档仍是本地 md）——所以走第三条路：**组件专属工具** scoped_tools，
+        # 由编排层只挂到 INDEX.md 里那一个组件的专家上。见 gateway_trace.py / orchestration。
+        self.gw_trace_config = gw_trace_config or GatewayTraceConfig.from_env()
+        self.gw_trace = self.gw_trace_config.enabled
+        self.gw_trace_log = GatewayTraceLog()
+        self._scoped_tools: dict[str, list] = {}
+        if self.gw_trace:
+            self._scoped_tools[self.gw_trace_config.component] = [
+                make_gateway_trace_tool(self.gw_trace_config, self.gw_trace_log)
+            ]
+            self._warn_if_scoped_component_missing()
+
         # 运行遥测（lifecycle hooks）：精确转交链 + 按 agent 的 token 归账。挂在 bot 上
         # 跨 run 复用（coordinator 的 as_tool 子 run 需要构建期注入同一实例），每次答题
         # reset_run() 清零。见 hooks.py。
@@ -411,6 +436,7 @@ class OpsQABot:
         gr = {
             "input_guardrails": self._input_guardrails,
             "specialist_extra_tools": self._extra_tools,
+            "scoped_tools": self._scoped_tools,
             "feishu_tool": self._feishu_tool,
         }
         if mode == "coordinator":
@@ -443,8 +469,16 @@ class OpsQABot:
                     doc_qa=self.doc_qa,
                     db=self.db,
                     has_db_change_tool=self._has_db_change_tool,
+                    gw_trace=self.gw_trace,
                 ),
-                tools=list(DOC_TOOLS) + self._extra_tools + self._feishu_tools(),
+                # single 模式只有一个 agent，"组件专属"无处可依附——链路工具与文档检索工具
+                # 并列挂上，靠 prompt 章节区分何时用（同 query_feishu_doc 在 single 下的处境）。
+                tools=(
+                    list(DOC_TOOLS)
+                    + self._extra_tools
+                    + self._feishu_tools()
+                    + self._all_scoped_tools()
+                ),
                 model=self.model_choice.model,
                 model_settings=role_model_settings("single"),
                 input_guardrails=self._input_guardrails,
@@ -471,6 +505,29 @@ class OpsQABot:
         """single 模式下 `query_feishu_doc` 与文档检索工具并列挂在同一个 agent 上（未开则空）。"""
         return [self._feishu_tool] if self._feishu_tool is not None else []
 
+    def _all_scoped_tools(self) -> list:
+        """把所有组件专属工具摊平（single 模式用：没有专家可挂，只能都挂在唯一的 agent 上）。"""
+        return [t for tools in self._scoped_tools.values() for t in tools]
+
+    def _warn_if_scoped_component_missing(self) -> None:
+        """组件专属工具指向的目录不在 INDEX.md 里时告警。
+
+        配错 `OPS_QA_GW_TRACE_COMPONENT` 的后果是**静默失效**：专家照常建出来，工具却没进去，
+        问到网关时 agent 只会说"我查了文档没找到链路数据"——没有任何报错指向配置。真实部署里
+        那一行未必叫 `gateway`，所以这条告警是必要的。single 模式不受影响（工具全挂在唯一
+        agent 上），但配置写错仍值得提醒。
+        """
+        known = {c.dir for c in parse_index_components(self.docs_root)}
+        for dir_ in self._scoped_tools:
+            if dir_ not in known:
+                logger.warning(
+                    "组件专属工具指向的目录 %r 不在 INDEX.md 的组件表里（已登记：%s）；"
+                    "%s 模式下该工具不会被任何专家挂载。请核对 OPS_QA_GW_TRACE_COMPONENT。",
+                    dir_,
+                    "、".join(sorted(known)) or "（无）",
+                    self.mode,
+                )
+
     async def reset(self) -> None:
         """清空会话上下文，开始新对话。"""
         await self._session.clear_session()
@@ -493,21 +550,31 @@ class OpsQABot:
             diag=len(self.diag_log.results),
             doc_qa=len(self.doc_qa_log.calls),
             db=len(self.db_log.results),
+            gw_trace=len(self.gw_trace_log.records),
         )
 
     def _ran_realtime(self, mark: _EvidenceMark) -> bool:
-        """本轮是否产生了实时证据（诊断命令 / 数据库查询）——决定答案是否算 risky。"""
-        return len(self.diag_log.results) > mark.diag or len(self.db_log.results) > mark.db
+        """本轮是否产生了实时证据（诊断命令 / 数据库查询 / 网关链路）——决定答案是否算 risky。
+
+        链路查询是只读的，但它和 `run_diagnostic` 一样让答案的结论**建立在实时数据上**：
+        复核两轮都不过时该转人工（兜底 B），而不是带个 ⚠️ 注解就发出去（兜底 A）。
+        """
+        return (
+            len(self.diag_log.results) > mark.diag
+            or len(self.db_log.results) > mark.db
+            or len(self.gw_trace_log.records) > mark.gw_trace
+        )
 
     async def _review(
         self, question: str, draft1: Draft, reanswer: Any, mark: _EvidenceMark
     ) -> ReviewOutcome:
         """对一版答案跑 revise-once 复核。不合格（反问/无可核对证据）时原样返回。
 
-        证据 = 引用文档实际内容 + **本轮**（`mark` 之后）的诊断输出、数据库查询输出与飞书
-        文档答案，reviewer 只在此范围内核对（见 review.gather_evidence）。飞书来源没有本地
-        文件可读，必须把工具实际拿回的 markdown 一并喂进去，否则 reviewer 会对每条飞书引用
-        读到 `[未找到]`。
+        证据 = 引用文档实际内容 + **本轮**（`mark` 之后）的诊断输出、数据库查询输出、网关
+        链路表与飞书文档答案，reviewer 只在此范围内核对（见 review.gather_evidence）。飞书
+        来源没有本地文件可读，必须把工具实际拿回的 markdown 一并喂进去，否则 reviewer 会对
+        每条飞书引用读到 `[未找到]`。链路表同理：模型很容易扫一眼就下一个表里没有的结论
+        （"网关没匹配到路由"），不把原始表喂给 reviewer 就核对不出来。
         """
         if not is_review_eligible(draft1.citations, draft1.risky, draft1.clarify):
             return ReviewOutcome(final=draft1)
@@ -515,6 +582,7 @@ class OpsQABot:
         def evidence_fn(d: Draft) -> str:
             outs = [r.output for r in self.diag_log.results[mark.diag :] if r.output]
             outs += self.db_log.outputs(mark.db)
+            outs += self.gw_trace_log.outputs(mark.gw_trace)
             return gather_evidence(
                 self.docs_root,
                 d.citations,
@@ -582,6 +650,10 @@ class OpsQABot:
         用非严格 schema（strict_json_schema=False）下发，以兼容 Claude / 智谱 / 火山等
         不支持 OpenAI strict 结构化输出的 provider。护栏：结构化走 `answer_structured`
         （非流式、无写审批中断循环），故只挂输入注入护栏 + 输出来源护栏，不挂写审批工具。
+
+        `scoped_tools` **要挂**：链路排查是只读的、不触发审批中断，结构化路径正是评测
+        （`evaluate.py` 走 `answer_structured`）跑的那条，不挂它就没法评测带 Hi-Trace-Id
+        的题。这与"不挂写审批工具"不矛盾——排除的是会挂起 run 的 needs_approval 工具。
         """
         if self._structured_agent is not None:
             return self._structured_agent
@@ -591,6 +663,7 @@ class OpsQABot:
         og = [citation_output_guardrail] if self.guardrails else []
         gr: dict[str, Any] = {
             "input_guardrails": self._input_guardrails,
+            "scoped_tools": self._scoped_tools,
             "feishu_tool": self._feishu_tool,
             "output_type": out,
             "output_guardrails": og,
@@ -616,8 +689,10 @@ class OpsQABot:
         else:  # single：单 agent + whole-docs 契约 prompt
             agent = Agent(
                 name="ops-qa-bot-structured",
-                instructions=build_structured_system_prompt(self.docs_root, doc_qa=self.doc_qa),
-                tools=list(DOC_TOOLS) + self._feishu_tools(),
+                instructions=build_structured_system_prompt(
+                    self.docs_root, doc_qa=self.doc_qa, gw_trace=self.gw_trace
+                ),
+                tools=list(DOC_TOOLS) + self._feishu_tools() + self._all_scoped_tools(),
                 model=self.model_choice.model,
                 model_settings=role_model_settings("single"),
                 output_type=out,
