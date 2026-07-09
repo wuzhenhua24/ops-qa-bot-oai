@@ -41,6 +41,7 @@ from openai.types.responses import ResponseTextDeltaEvent
 
 from .actions import WriteCommandLog, make_write_command_tool
 from .diagnostics import DiagConfig, DiagnosticLog, make_diagnostic_tool
+from .doc_qa import DOC_QA_TOOL_NAME, DocQAConfig, DocQALog, make_feishu_doc_tool
 from .guardrails import (
     citation_output_guardrail,
     detect_forbidden_command,
@@ -111,6 +112,18 @@ _VALID_FOLLOWUP_KEYS = {
     "commands",
     "related",
 }
+
+
+@dataclass(frozen=True)
+class _EvidenceMark:
+    """答题前各证据日志的长度快照。
+
+    复核只该看**本轮**新增的证据：诊断日志和飞书文档答案在多轮会话里是累积的，不切一刀，
+    第二轮的 reviewer 会拿到第一轮的诊断输出当"本轮证据"，据此判定第二轮答案"与证据矛盾"。
+    """
+
+    diag: int
+    doc_qa: int
 
 
 @dataclass
@@ -244,6 +257,11 @@ def format_tool_call(name: str, args: dict) -> str:
         return f"run_diagnostic {args.get('host', '?')}: {args.get('command', '?')}"
     if name == "request_write_command":
         return f"request_write_command {args.get('target', '?')}: {args.get('command', '?')}"
+    if name == DOC_QA_TOOL_NAME:
+        q = str(args.get("question", "?"))
+        if len(q) > 60:
+            q = q[:60] + "…"
+        return f"query_feishu_doc {args.get('component', '?')} ← {q}"
     if name.startswith("ask_"):
         # 协调者调用组件专家（agents-as-tools）；子问题可能很长，截断展示。
         q = str(args.get("input") or args.get("question") or args.get("query") or args)
@@ -277,6 +295,7 @@ class OpsQABot:
         guardrails: bool = False,
         session: Session | None = None,
         diag_config: DiagConfig | None = None,
+        doc_qa_config: DocQAConfig | None = None,
         review_config: ReviewConfig | None = None,
     ):
         if mode not in MODES:
@@ -312,6 +331,18 @@ class OpsQABot:
                 make_diagnostic_tool(self.diag_config, self.diag_log)
             ]
 
+        # 飞书文档问答（OPS_QA_DOC_QA_BASE_URL 配了才开）：把「用飞书文档维护知识」的组件
+        # 接进来。与 diagnostics/guardrails 的区别是它不是横切工具——它是某些组件的**唯一
+        # 知识来源**，所以不进 _extra_tools，而是单独传给编排层：multi/auto/coordinator 下
+        # 只挂到 feishu 组件的专家上（那些专家没有 read_doc/glob_docs/grep_docs），single 下
+        # 与文档检索工具并列挂在同一个 agent 上、靠 prompt 区分来源。见 doc_qa.py。
+        self.doc_qa_config = doc_qa_config or DocQAConfig.from_env()
+        self.doc_qa = self.doc_qa_config.enabled
+        self.doc_qa_log = DocQALog()
+        self._feishu_tool = (
+            make_feishu_doc_tool(self.doc_qa_config, self.doc_qa_log) if self.doc_qa else None
+        )
+
         # 运行遥测（lifecycle hooks）：精确转交链 + 按 agent 的 token 归账。挂在 bot 上
         # 跨 run 复用（coordinator 的 as_tool 子 run 需要构建期注入同一实例），每次答题
         # reset_run() 清零。见 hooks.py。
@@ -334,9 +365,11 @@ class OpsQABot:
         self.components: list[Component]
         self.model_router: ModelRouter | None = None
         # 护栏是横切关注点，与编排模式正交：输入注入护栏挂入口 agent，写审批工具挂各专家。
+        # feishu_tool 由编排层按组件来源分配（只挂给 feishu 组件的专家）。
         gr = {
             "input_guardrails": self._input_guardrails,
             "specialist_extra_tools": self._extra_tools,
+            "feishu_tool": self._feishu_tool,
         }
         if mode == "coordinator":
             # 跨组件协作：协调者把各组件专家当工具（agents-as-tools）调用、综合根因。
@@ -362,9 +395,12 @@ class OpsQABot:
             self._agent = Agent(
                 name="ops-qa-bot",
                 instructions=build_system_prompt(
-                    self.docs_root, diagnostics=self.diagnostics, has_write_tool=guardrails
+                    self.docs_root,
+                    diagnostics=self.diagnostics,
+                    has_write_tool=guardrails,
+                    doc_qa=self.doc_qa,
                 ),
-                tools=list(DOC_TOOLS) + self._extra_tools,
+                tools=list(DOC_TOOLS) + self._extra_tools + self._feishu_tools(),
                 model=self.model_choice.model,
                 model_settings=role_model_settings("single"),
                 input_guardrails=self._input_guardrails,
@@ -387,6 +423,10 @@ class OpsQABot:
         )
         self._reviewer_agent: Agent | None = None
 
+    def _feishu_tools(self) -> list:
+        """single 模式下 `query_feishu_doc` 与文档检索工具并列挂在同一个 agent 上（未开则空）。"""
+        return [self._feishu_tool] if self._feishu_tool is not None else []
+
     async def reset(self) -> None:
         """清空会话上下文，开始新对话。"""
         await self._session.clear_session()
@@ -403,23 +443,29 @@ class OpsQABot:
             self._reviewer_agent = build_reviewer_agent(model)
         return self._reviewer_agent
 
+    def _evidence_mark(self) -> _EvidenceMark:
+        """快照各证据日志的长度，用于把复核证据限定在"本轮之后新增的"。"""
+        return _EvidenceMark(diag=len(self.diag_log.results), doc_qa=len(self.doc_qa_log.calls))
+
     async def _review(
-        self, question: str, draft1: Draft, reanswer: Any, diag_since: int
+        self, question: str, draft1: Draft, reanswer: Any, mark: _EvidenceMark
     ) -> ReviewOutcome:
         """对一版答案跑 revise-once 复核。不合格（反问/无可核对证据）时原样返回。
 
-        证据 = 引用文档实际内容 + **本轮**（diag_since 之后）的诊断输出，reviewer 只在此
-        范围内核对（见 review.gather_evidence）。
+        证据 = 引用文档实际内容 + **本轮**（`mark` 之后）的诊断输出与飞书文档答案，reviewer
+        只在此范围内核对（见 review.gather_evidence）。飞书来源没有本地文件可读，必须把工具
+        实际拿回的 markdown 一并喂进去，否则 reviewer 会对每条飞书引用读到 `[未找到]`。
         """
         if not is_review_eligible(draft1.citations, draft1.risky, draft1.clarify):
             return ReviewOutcome(final=draft1)
 
         def evidence_fn(d: Draft) -> str:
-            outs = [r.output for r in self.diag_log.results[diag_since:] if r.output]
+            outs = [r.output for r in self.diag_log.results[mark.diag :] if r.output]
             return gather_evidence(
                 self.docs_root,
                 d.citations,
                 outs,
+                feishu_answers=self.doc_qa_log.answers(mark.doc_qa),
                 max_chars=self.review_config.max_evidence_chars,
             )
 
@@ -491,6 +537,7 @@ class OpsQABot:
         og = [citation_output_guardrail] if self.guardrails else []
         gr: dict[str, Any] = {
             "input_guardrails": self._input_guardrails,
+            "feishu_tool": self._feishu_tool,
             "output_type": out,
             "output_guardrails": og,
         }
@@ -515,8 +562,8 @@ class OpsQABot:
         else:  # single：单 agent + whole-docs 契约 prompt
             agent = Agent(
                 name="ops-qa-bot-structured",
-                instructions=build_structured_system_prompt(self.docs_root),
-                tools=list(DOC_TOOLS),
+                instructions=build_structured_system_prompt(self.docs_root, doc_qa=self.doc_qa),
+                tools=list(DOC_TOOLS) + self._feishu_tools(),
                 model=self.model_choice.model,
                 model_settings=role_model_settings("single"),
                 output_type=out,
@@ -603,14 +650,14 @@ class OpsQABot:
         """一次性返回完整答案 + 用量 + 解析出的标记。开启复核（#7）时叠加 revise-once 核对。"""
         if not self.review:
             return await self._answer_once(question)
-        diag_since = len(self.diag_log.results)
+        mark = self._evidence_mark()
         r1 = await self._answer_once(question)
 
         def to_draft(r: AnswerResult) -> Draft:
             return Draft(
                 text=r.text,
                 citations=extract_citations(r.text),
-                risky=len(self.diag_log.results) > diag_since,
+                risky=len(self.diag_log.results) > mark.diag,
                 clarify=r.markers.clarify,
                 payload=r,
             )
@@ -618,7 +665,7 @@ class OpsQABot:
         async def reanswer(note: str) -> Draft:
             return to_draft(await self._answer_once(note))
 
-        outcome = await self._review(question, to_draft(r1), reanswer, diag_since)
+        outcome = await self._review(question, to_draft(r1), reanswer, mark)
         return self._apply_review_outcome(outcome)
 
     async def _answer_once(self, question: str) -> AnswerResult:
@@ -659,7 +706,7 @@ class OpsQABot:
         """结构化输出模式（差异化 #1）。开启复核（#7）时叠加 revise-once 核对。"""
         if not self.review:
             return await self._answer_structured_once(question)
-        diag_since = len(self.diag_log.results)
+        mark = self._evidence_mark()
         r1 = await self._answer_structured_once(question)
 
         def to_draft(r: StructuredAnswer) -> Draft:
@@ -667,7 +714,7 @@ class OpsQABot:
             return Draft(
                 text=c.answer,
                 citations=list(c.citations),
-                risky=len(self.diag_log.results) > diag_since,
+                risky=len(self.diag_log.results) > mark.diag,
                 # 只复核真答题（decision=answer）；反问/拒绝/升级不下事实结论，clarify=True 跳过。
                 clarify=c.decision != Decision.answer,
                 payload=r,
@@ -676,7 +723,7 @@ class OpsQABot:
         async def reanswer(note: str) -> Draft:
             return to_draft(await self._answer_structured_once(note))
 
-        outcome = await self._review(question, to_draft(r1), reanswer, diag_since)
+        outcome = await self._review(question, to_draft(r1), reanswer, mark)
         return self._apply_review_outcome(outcome)
 
     async def _answer_structured_once(self, question: str) -> StructuredAnswer:
@@ -765,7 +812,7 @@ class OpsQABot:
             raise RuntimeError("answer_guarded 需要以 guardrails=True 构造 OpsQABot")
         if not self.review:
             return await self._answer_guarded_once(question, approver)
-        diag_since = len(self.diag_log.results)
+        mark = self._evidence_mark()
         r1 = await self._answer_guarded_once(question, approver)
 
         def to_draft(r: GuardedAnswer) -> Draft:
@@ -774,7 +821,7 @@ class OpsQABot:
             return Draft(
                 text=r.text,
                 citations=extract_citations(r.text),
-                risky=(len(self.diag_log.results) > diag_since) or write_proposed,
+                risky=(len(self.diag_log.results) > mark.diag) or write_proposed,
                 clarify=r.markers.clarify,
                 payload=r,
             )
@@ -782,7 +829,7 @@ class OpsQABot:
         async def reanswer(note: str) -> Draft:
             return to_draft(await self._answer_guarded_once(note, approver))
 
-        outcome = await self._review(question, to_draft(r1), reanswer, diag_since)
+        outcome = await self._review(question, to_draft(r1), reanswer, mark)
         return self._apply_review_outcome(outcome)
 
     async def _answer_guarded_once(self, question: str, approver: Any = None) -> GuardedAnswer:

@@ -24,12 +24,14 @@ ops-qa-bot-oai/
 │   ├── tools.py              # read_doc / glob_docs / grep_docs（对标 Claude 内置 Read/Glob/Grep）
 │   ├── prompt.py             # system prompt（移植自 ops-qa-bot 的核心主线）
 │   ├── model.py              # provider 解析：openai / responses / compatible / anthropic / litellm 运行时切换
+│   ├── index.py              # INDEX.md 路由表解析：组件注册表 + 飞书来源 + 来源标识（orchestration/doc_qa/schema 共用）
 │   ├── schema.py             # 结构化输出契约 AnswerContract + 来源真实性校验（差异化 #1）
 │   ├── orchestration.py      # 多 agent 编排：从 INDEX.md 生成分诊 + 组件专家（差异化 #3）
 │   ├── evaluate.py           # 离线评测 harness：题集 × 多模式打分出对比报告（差异化 #5）
 │   ├── guardrails.py         # 输入注入护栏 + 输出来源护栏（差异化 #4）
 │   ├── actions.py            # 写操作审批工具（needs_approval HITL）（差异化 #4）
 │   ├── diagnostics.py        # 实时诊断：run_diagnostic（测试环境只读 ssh，白名单+写路由审批）（差异化 #6）
+│   ├── doc_qa.py             # 飞书文档问答：query_feishu_doc（接外部 /doc_qa 服务，feishu 来源组件专用）
 │   ├── review.py             # 二次复核：另一模型证据核对 + revise-once（差异化 #7）
 │   ├── hooks.py              # 运行遥测 RunHooks：精确转交链 + 按 agent token 归账（#2 量化）
 │   ├── bot.py                # OpsQABot：Agent + Runner，answer()/answer_structured()/answer_guarded()
@@ -37,6 +39,7 @@ ops-qa-bot-oai/
 │   └── feishu/               # 飞书长连接接入：render（渲染纯逻辑）/ session / runner
 ├── eval/cases.json           # 评测题集（映射到 docs/，带 expected_decision / expected_component / expected_route）
 ├── tests/test_tools.py       # 检索 / 沙箱 / 标记 / 契约 / 评分 / 护栏 / 审批 / 飞书渲染回归测试（无需 LLM）
+├── tests/test_doc_qa.py      # 飞书文档问答：注册表解析 / HTTP 错误映射 / 来源校验 / 复核证据（无需 LLM）
 ├── run.py                    # CLI 入口
 ├── run_eval.py               # 评测入口
 ├── run_ws.py                 # 飞书长连接入口
@@ -342,6 +345,33 @@ OPS_QA_DIAG=1 OPS_QA_DIAG_JUMPHOST=jumphost OPS_QA_DIAG_ALLOWED_HOSTS='10.1.*,*-
 环境变量（完整见 `.env.example`）：`OPS_QA_DIAG`（开关）/ `OPS_QA_DIAG_JUMPHOST`（跳板机 ssh 别名，不配则模拟执行）/ `OPS_QA_DIAG_ALLOWED_HOSTS`（目标 glob 白名单）/ `OPS_QA_DIAG_TIMEOUT` / `OPS_QA_DIAG_MOCK` / `OPS_QA_DIAG_PROD_PATTERNS`。终端与飞书共用；飞书只认环境变量（`OPS_QA_DIAG=1`）。
 
 **与编排模式正交**：`run_diagnostic` 挂在真正答题的 agent 上（single 的单 agent、multi/auto 的各组件专家、coordinator 的 as_tool 专家），各模式下都能在答题时按需跑实时诊断；护栏 / 写审批开着时，写命令的识别与路由自动接上上一节的 HITL 闭环。
+
+## 飞书文档问答（来源异构）
+
+有些组件的运维知识维护在**飞书文档**里，不是 `docs/` 下的本地 markdown。`INDEX.md` 的「来源」列标 `feishu`、「飞书文档」列登记 doc token，bot 就改用 `query_feishu_doc(component, question)` 工具去问一个外部的 `POST /doc_qa` 服务（该服务内部自己跑 agent 读文档和图，返回 markdown 答案）。移植自 ops-qa-bot 的 `doc_qa.py`，两条安全设计原样保留：
+
+- **agent 只传组件名，doc token 由代码查 `INDEX.md` 解析**。token 是权威数据，agent 不碰——防写错，更防被文档内容注入诱导去拉任意飞书文档（与 `_resolve_within` 不信任模型给的路径、`validate_host` 不信任模型给的机器名同一套姿态）。
+- **工具失败返回文字提示而不抛异常**。抛异常会打断 agent 这一轮；返回「取不到飞书文档，请按升级规则通知负责人」让它自己决定 escalate。
+
+移到 OpenAI Agents SDK 之后有三处比参考项目干净：
+
+| ops-qa-bot（Claude Agent SDK） | 本项目 |
+|---|---|
+| 工具要包成进程内 MCP server（`create_sdk_mcp_server`），agent 侧全名 `mcp__docqa__query_feishu_doc` | 直接 `@function_tool`，工具名就是函数名 |
+| 单一巨型 prompt 靠**自律条款**区分来源：「来源=feishu 时不要用 Glob/Read/Grep」 | feishu 组件**各建一个专家 agent，只挂 `query_feishu_doc`**——它物理上没有文档检索工具，规则从 prompt 自律变成**机制保证** |
+| `parse_feishu_registry` 与 `_index_owner_to_dirs` 各解析一遍 INDEX.md | 下沉成叶子模块 `index.py`，orchestration / doc_qa / schema 共用一份（带 mtime 缓存） |
+
+**来源标识 `飞书文档·<组件>`**：飞书答案没有本地路径可引用，所以引用写成 `（来源：飞书文档·Nginx）`。这不是给它开后门绕过校验——`validate_citations` 会拿它去核对该组件**是否在 INDEX.md 里登记为 feishu 来源**，编一个 `飞书文档·Postgres` 照样进 `invalid_citations`、照样 trip 输出来源护栏。二次复核（#7）也接上了：飞书来源没有文件可读，`gather_evidence` 改喂本轮 `query_feishu_doc` **实际拿回的 markdown**，否则 reviewer 会对每条飞书引用读到 `[未找到]`、稳定误判"引用不实"并触发无意义的重答。
+
+```bash
+# 缺省关：不配则 feishu 组件不建专家、prompt 不加章节、问到它们回"不在覆盖范围"，零感知。
+OPS_QA_DOC_QA_BASE_URL=http://doc-qa.internal OPS_QA_DOC_QA_TOKEN=xxx \
+  uv run python run.py --mode auto --ask "nginx 的限流怎么配？"
+```
+
+环境变量（完整见 `.env.example`）：`OPS_QA_DOC_QA_BASE_URL`（开关 + 上游地址）/ `OPS_QA_DOC_QA_TOKEN`（Bearer 鉴权，可空）/ `OPS_QA_DOC_QA_TIMEOUT`（缺省 60s，上游要跑 agent + 拉图，别设太短）。终端与飞书共用。
+
+**刻意没有 `--doc-qa` 开关、也没有 mock 模式**（对比 `OPS_QA_DIAG_MOCK`）：诊断的模拟数据是假的 `free -h` 输出，无害；飞书文档问答的模拟数据是**假的知识库**——正是这个 bot 存在的意义所要防的东西。实测也印证了：任何如实标注"这不是真文档"的模拟内容，都会（正确地）触发 prompt 里的防幻觉条款让 agent 拒答并升级，链路照样跑不通；不标注的则会被当成真答案。没有上游服务时就让这个特性关着。本地想端到端验证，起一个真的 stub 服务即可（见 `tests/test_doc_qa.py` 里那个走真 socket 的用例）。
 
 ## 二次复核（差异化原型 #7）
 

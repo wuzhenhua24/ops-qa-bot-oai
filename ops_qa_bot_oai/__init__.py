@@ -12,19 +12,25 @@ from .bot import (
     StructuredAnswer,
     parse_markers,
 )
+from .doc_qa import (
+    DocQAClient,
+    DocQAConfig,
+    DocQAError,
+    DocQALog,
+    make_feishu_doc_tool,
+)
 from .evaluate import EvalCase, aggregate, load_cases, run_eval, score_case
 from .guardrails import (
     citation_output_guardrail,
     detect_injection,
     injection_input_guardrail,
 )
+from .index import Component, feishu_citation, feishu_registry, parse_index_components
 from .model import ModelChoice, ModelRouter, build_model_router, resolve_model
 from .orchestration import (
-    Component,
     build_auto_agent,
     build_coordinator_agent,
     build_triage_agent,
-    parse_index_components,
 )
 from .schema import AnswerContract, Decision, Followup, validate_citations
 
@@ -51,6 +57,13 @@ __all__ = [
     "validate_citations",
     "Component",
     "parse_index_components",
+    "feishu_registry",
+    "feishu_citation",
+    "DocQAConfig",
+    "DocQAClient",
+    "DocQAError",
+    "DocQALog",
+    "make_feishu_doc_tool",
     "build_triage_agent",
     "build_coordinator_agent",
     "build_auto_agent",

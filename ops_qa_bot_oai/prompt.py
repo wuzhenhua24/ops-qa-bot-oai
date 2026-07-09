@@ -169,13 +169,58 @@ def diagnostics_prompt_section(*, has_write_tool: bool) -> str:
 - 实时数据 + 文档结论**结合**给答案：先给现状，再给文档里的处置流程（附来源）。"""
 
 
+# 飞书文档来源节（可选，仅当配了 OPS_QA_DOC_QA_BASE_URL 挂了 query_feishu_doc 工具时追加）。
+# 只有 single 模式需要它——multi/auto/coordinator 下每个 feishu 组件有自己的专家 agent，
+# 专家只挂 query_feishu_doc、根本没有文档检索工具，"该用哪个工具"是机制而非提示（见
+# orchestration._feishu_specialist_instructions）。具体哪些组件是 feishu 由模型读 INDEX.md
+# 得知，不在 prompt 里写死。实现见 doc_qa.py。
+def doc_qa_prompt_section(docs_root: Path, *, structured: bool = False) -> str:
+    """飞书文档来源的 prompt 章节。`structured` 决定"来源写到哪"那句怎么写。"""
+    cite_line = (
+        "  - **来源**填到契约的 `citations` 字段，写成 `飞书文档·<组件>`（如 `飞书文档·Nginx`）。"
+        "它和本地路径一样会被系统按 INDEX.md 的登记核对——编造一个没登记的组件同样会被拦截。"
+        if structured
+        else "  - **引用来源**写成 `（来源：飞书文档·<组件>）`，例如 `（来源：飞书文档·Nginx）`；"
+        "不要编造飞书文档的具体路径或链接。"
+    )
+    return f"""
+
+# 组件文档来源（本地 markdown vs 飞书文档）
+
+`{docs_root}/INDEX.md` 的组件表有一列「来源」：
+
+- **来源 = `local`**（默认）：文档是 `{docs_root}` 下的本地 md 文件，按上面「工作流程」用 `glob_docs` / `read_doc` / `grep_docs` 查。
+- **来源 = `feishu`**：该组件的运维知识维护在**飞书文档**里，`{docs_root}` 下**没有**它的本地 md 文件。**不要对这类组件用 glob_docs / read_doc / grep_docs**（查不到，白费一轮），改用 `query_feishu_doc` 工具。
+
+## 用 query_feishu_doc 工具
+
+- 路由命中一个 `feishu` 来源的组件时，调 `query_feishu_doc`：
+  - `component`：传 INDEX.md 里该组件的「组件」列名（如 `Nginx`），**不要传 doc token**（token 由系统按组件名解析，你不用也拿不到）。
+  - `question`：传一个**自包含的完整问题**。这个服务**没有对话记忆**——用户追问、或补齐反问信息后，要把前面几轮的关键上下文（组件、版本、报错、已确认的环境）**折进这一条 question**，不能只发"那它怎么回滚"这种依赖上文的半句。
+- 工具返回该组件飞书文档里的**答案 markdown**，把它当作文档依据来组织回答，规范同本地文档：
+{cite_line}
+  - 危险操作照样标 ⚠️ 风险；危险/操作类问题照样可挂 `<<FOLLOWUPS:...>>`。
+- **取不到内容时**（工具返回"未能取得…"/"未登记…"，或内容明显答非所问）：按「升级规则」回复未找到 + 通知负责人，**不要凭常识编答案**，也**不要**换个问法反复重试（上游每次调用内部都会跑一轮 agent，重试既慢又贵）。
+- 跨来源问题（一个组件本地、一个组件飞书）：分别用对应方式查，再合并作答，各自标清来源。"""
+
+
 def build_system_prompt(
-    docs_root: Path, *, diagnostics: bool = False, has_write_tool: bool = False
+    docs_root: Path,
+    *,
+    diagnostics: bool = False,
+    has_write_tool: bool = False,
+    doc_qa: bool = False,
 ) -> str:
-    """构造 system prompt。`diagnostics=True` 时追加实时诊断章节（OPS_QA_DIAG 开启）。"""
+    """构造 system prompt。
+
+    `diagnostics=True` 时追加实时诊断章节（OPS_QA_DIAG 开启）；`doc_qa=True` 时追加飞书
+    文档来源章节（OPS_QA_DOC_QA_BASE_URL 配了）。两者正交，缺省都不加、零感知。
+    """
     prompt = SYSTEM_PROMPT_TEMPLATE.format(docs_root=str(docs_root))
     if diagnostics:
         prompt += diagnostics_prompt_section(has_write_tool=has_write_tool)
+    if doc_qa:
+        prompt += doc_qa_prompt_section(docs_root)
     return prompt
 
 
@@ -197,7 +242,7 @@ STRUCTURED_CONTRACT_SUFFIX = """
     并填 `escalate_to`（INDEX.md 里该组件负责人的 ou_xxx）和 `escalate_dir`（组件目录名，如 `redis`）。
   - `reject`：运维范围外 → `answer` 里友好说明不在覆盖范围。
 - `answer`：给用户看的中文 markdown 正文（反问/拒绝时就是那段话）。**不要**在正文里写 `（来源：xxx）`，来源改填到 `citations`。
-- `citations`：答案依据的文档相对路径列表（如 `redis/troubleshooting.md`）。`decision=answer` 时至少给一条且必须是你真读过的文件；`reject`/`clarify` 通常留空。**绝不要编造不存在的路径。**
+- `citations`：答案依据的来源列表——本地文档写相对路径（如 `redis/troubleshooting.md`），飞书文档来源的组件写 `飞书文档·<组件>`（如 `飞书文档·Nginx`）。`decision=answer` 时至少给一条，且必须是你**真读过 / 真查过**的来源；`reject`/`clarify` 通常留空。**绝不要编造不存在的路径或未登记的组件。**
 - `escalate_to` / `escalate_dir`：仅 `decision=escalate` 时填，其余留空字符串。跨组件/归属不明则都留空。
 - `followups`：从 `troubleshoot|risks|rollback|checklist|commands|related` 里挑 0-3 个建议追问；问候/拒绝/升级/反问场景留空。
 - `confidence`：0~1 自评。文档命中充分给高分；靠推断/部分命中给低分。
@@ -206,6 +251,13 @@ STRUCTURED_CONTRACT_SUFFIX = """
 """
 
 
-def build_structured_system_prompt(docs_root: Path) -> str:
-    """结构化输出模式的 system prompt：领域规则同上，但用字段取代 `<<MARKER>>`。"""
-    return SYSTEM_PROMPT_TEMPLATE.format(docs_root=str(docs_root)) + STRUCTURED_CONTRACT_SUFFIX
+def build_structured_system_prompt(docs_root: Path, *, doc_qa: bool = False) -> str:
+    """结构化输出模式的 system prompt：领域规则同上，但用字段取代 `<<MARKER>>`。
+
+    飞书文档来源节放在契约后缀**之前**：后缀里"citations 必须是你真读过的文件"那句会被
+    前面的"飞书来源填 `飞书文档·<组件>`"补全，顺序反了模型容易只记住"必须是文件路径"。
+    """
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(docs_root=str(docs_root))
+    if doc_qa:
+        prompt += doc_qa_prompt_section(docs_root, structured=True)
+    return prompt + STRUCTURED_CONTRACT_SUFFIX

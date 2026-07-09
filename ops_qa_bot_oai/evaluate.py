@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from .bot import Markers, OpsQABot
+from .index import norm_key, parse_feishu_citation
 from .model import ModelChoice, resolve_model
 from .schema import validate_citations
 
@@ -142,6 +143,17 @@ def normalize_route(route: str | None) -> str:
     return route
 
 
+def _cites_feishu_component(citation: str, expected_component: str) -> bool:
+    """`飞书文档·Nginx` 这条引用是否指向 `expected_component`（用例里写的是「目录」列名）。
+
+    按归一化后的名字比（`Nginx` → `nginx`）。`score_case` 是纯函数、不读 INDEX.md，所以这里
+    做的是"组件名 ≈ 目录名"的近似匹配——两者不一致的组件（如名 `API Gateway`、目录 `gateway`）
+    需要用例把 expected_component 写成组件名。绝大多数登记两者同名，够用。
+    """
+    name = parse_feishu_citation(citation)
+    return name is not None and norm_key(name) == norm_key(expected_component)
+
+
 def score_case(case: EvalCase, outcome: RunOutcome) -> CaseScore:
     """纯函数评分：不跑模型、不读盘（来源真实性已在 outcome.invalid_citations 里算好）。"""
     decision_correct: bool | None = None
@@ -150,8 +162,13 @@ def score_case(case: EvalCase, outcome: RunOutcome) -> CaseScore:
 
     component_cited: bool | None = None
     if case.expected_component is not None:
-        prefix = case.expected_component.rstrip("/") + "/"
-        component_cited = any(c.startswith(prefix) for c in outcome.citations)
+        # 本地来源引用的是 `redis/xxx.md` 这类路径，飞书来源引用的是 `飞书文档·Nginx`——
+        # 两种都要认，否则 feishu 组件的用例恒判"没引对组件"。
+        expected = case.expected_component.rstrip("/")
+        prefix = expected + "/"
+        component_cited = any(
+            c.startswith(prefix) or _cites_feishu_component(c, expected) for c in outcome.citations
+        )
 
     # 路由只在能路由的模式下评分（outcome.route 为 None 表示该模式不计路由）。
     route_correct: bool | None = None

@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from .bot import GuardedAnswer, OpsQABot, StructuredAnswer, format_tool_call
 from .diagnostics import DiagConfig
+from .doc_qa import DocQAConfig
 from .model import MODE_LABELS, MODES, resolve_mode, resolve_model
 from .review import ReviewConfig
 
@@ -109,6 +110,17 @@ def _diag_line(cfg: DiagConfig) -> str | None:
     return f"实时诊断：测试环境只读 · {how} · 目标白名单：{hosts}"
 
 
+def _doc_qa_line(cfg: DocQAConfig) -> str | None:
+    """飞书文档问答的横幅细节；未开启返回 None。
+
+    没有 `--doc-qa` 开关：这个特性需要一个真实的上游服务（见 doc_qa.DocQAConfig 为何不做
+    mock），纯靠 `OPS_QA_DOC_QA_BASE_URL` 开关，命令行强制开不出东西来。
+    """
+    if not cfg.enabled:
+        return None
+    return f"飞书文档问答：query_feishu_doc · 上游 {cfg.base_url}/doc_qa"
+
+
 def _resolve_review_config(force_on: bool) -> ReviewConfig:
     """解析二次复核配置：读 OPS_QA_REVIEW*；--review 可强制开启。"""
     cfg = ReviewConfig.from_env()
@@ -158,14 +170,16 @@ async def run_once(
     """一次性问一个问题就退出（适合脚本调用 / 批量跑题）。"""
     model_choice = resolve_model()
     diag_config = _resolve_diag_config(diagnostics)
+    doc_qa_config = DocQAConfig.from_env()
     review_config = _resolve_review_config(review)
-    # 路由 × 输出 × 护栏 × 诊断 × 复核 正交，可任意组合。
+    # 路由 × 输出 × 护栏 × 诊断 × 飞书文档 × 复核 正交，可任意组合。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
         mode=mode,
         guardrails=guardrails,
         diag_config=diag_config,
+        doc_qa_config=doc_qa_config,
         review_config=review_config,
     )
     if show_tools:
@@ -174,9 +188,12 @@ async def run_once(
                 print(f"[{ln}]")
         if line := _diag_line(diag_config):
             print(f"[{line}]")
+        if line := _doc_qa_line(doc_qa_config):
+            print(f"[{line}]")
         if review_config.enabled:
             print("[二次复核：另一模型证据核对，revise-once 后交付]")
-        if mode != "single" or diag_config.enabled or review_config.enabled:
+        extras_on = diag_config.enabled or doc_qa_config.enabled or review_config.enabled
+        if mode != "single" or extras_on:
             print()
 
     if guardrails and not structured:
@@ -252,14 +269,16 @@ async def run_repl(
 ) -> None:
     model_choice = resolve_model()
     diag_config = _resolve_diag_config(diagnostics)
+    doc_qa_config = DocQAConfig.from_env()
     review_config = _resolve_review_config(review)
-    # 路由 × 输出 × 护栏 × 诊断 × 复核 正交，可任意组合。
+    # 路由 × 输出 × 护栏 × 诊断 × 飞书文档 × 复核 正交，可任意组合。
     bot = OpsQABot(
         docs_root=docs_root,
         model_choice=model_choice,
         mode=mode,
         guardrails=guardrails,
         diag_config=diag_config,
+        doc_qa_config=doc_qa_config,
         review_config=review_config,
     )
     approver = _make_approver(interactive=True) if guardrails else None
@@ -272,6 +291,8 @@ async def run_repl(
         parts.append("护栏 + 写操作审批")
     if diag_config.enabled:
         parts.append("实时诊断")
+    if doc_qa_config.enabled:
+        parts.append("飞书文档问答")
     if review_config.enabled:
         parts.append("二次复核")
     print("运维文档问答机器人（OpenAI Agents SDK）")
@@ -280,6 +301,8 @@ async def run_repl(
     for ln in _orchestration_lines(mode, bot):
         print(ln)
     if line := _diag_line(diag_config):
+        print(line)
+    if line := _doc_qa_line(doc_qa_config):
         print(line)
     if review_config.enabled:
         print("二次复核：另一模型证据核对，revise-once 后交付（低风险带注解、诊断/写不过转人工）")

@@ -22,6 +22,7 @@ from pathlib import Path
 from agents import AgentOutputSchema
 from pydantic import BaseModel, Field
 
+from .index import Component, feishu_registry, norm_key, parse_feishu_citation
 from .tools import _resolve_within
 
 # 有些 provider 的 json_schema 实现会把 JSON 裹在 ```json ... ``` 代码围栏里返回
@@ -112,13 +113,29 @@ class AnswerContract(BaseModel):
 
 
 def validate_citations(docs_root: Path, citations: list[str]) -> list[str]:
-    """返回 citations 里**不存在 / 越界**的路径列表（空列表表示全部真实存在）。
+    """返回 citations 里**不存在 / 越界 / 未登记**的来源列表（空列表表示全部真实）。
 
     把"答案必须引用真实文档"从 prompt 自律变成可执行的代码校验——这是结构化契约
     带来的直接好处：拿到强类型 citations 后能在返回给用户前逐条核对。
+
+    两类来源，两种核对方式：
+
+    - **本地路径**（`redis/overview.md`）：解析到 docs_root 子树内且确实是个文件。
+    - **飞书文档**（`飞书文档·Nginx`）：飞书来源的组件没有本地文件可 stat，改为核对该组件
+      **在 INDEX.md 里登记为 feishu 来源**（见 index.feishu_registry）。这不是给飞书来源开
+      后门——`飞书文档·Postgres` 这种编出来的组件同样进 invalid、同样会 trip 输出护栏；只是
+      把"真实存在"的判据从"文件在盘上"扩展成"组件在注册表里"。
     """
     invalid: list[str] = []
+    registry: dict[str, Component] | None = None
     for rel in citations:
+        component = parse_feishu_citation(rel)
+        if component is not None:
+            if registry is None:  # 懒解析：没有飞书来源的答案不必读 INDEX.md
+                registry = feishu_registry(docs_root)
+            if norm_key(component) not in registry:
+                invalid.append(rel)
+            continue
         try:
             target = _resolve_within(docs_root, rel)
         except ValueError:

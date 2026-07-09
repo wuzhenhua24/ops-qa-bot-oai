@@ -51,6 +51,7 @@ from typing import Any, Literal
 from agents import Agent, Runner
 from pydantic import BaseModel, Field
 
+from .index import norm_key, parse_feishu_citation
 from .model import role_model_settings
 from .schema import FenceTolerantOutputSchema
 from .tools import _read_doc
@@ -196,14 +197,25 @@ def gather_evidence(
     citations: list[str],
     diag_outputs: list[str],
     *,
+    feishu_answers: dict[str, str] | None = None,
     max_chars: int = 8000,
 ) -> str:
-    """把答案依据的证据拼成给 reviewer 的文本：引用文档的**实际内容** + 诊断**实际输出**。
+    """把答案依据的证据拼成给 reviewer 的文本：引用来源的**实际内容** + 诊断**实际输出**。
 
-    这是复核能"对证据核对"而非"凭先验瞎猜"的前提，也是收敛的关键。citations 去重后
-    逐条 `_read_doc` 读原文（不存在的会读到 `[未找到]`，正好让 reviewer 抓到引用不实）；
-    diag_outputs 是本轮 `run_diagnostic` 的输出行。整体截断到 max_chars 防超长。
+    这是复核能"对证据核对"而非"凭先验瞎猜"的前提，也是收敛的关键。三类证据：
+
+    - **本地文档**：citations 去重后逐条 `_read_doc` 读原文（不存在的读到 `[未找到]`，正好
+      让 reviewer 抓到引用不实）。
+    - **飞书文档**（`飞书文档·<组件>` 这类 citation）：本地无文件可读，改用本轮
+      `query_feishu_doc` 实际拿回的 markdown（`feishu_answers`，键是组件名）。**不这么做的话
+      reviewer 会对每条飞书来源都读到 `[未找到]`、稳定误判"引用不实"并触发无意义的重答。**
+      引用了某个组件、本轮却没调过它的工具 → 明确标成"无据可核"，这正是要抓的幻觉。
+    - **诊断输出**：本轮 `run_diagnostic` 的输出行。
+
+    整体截断到 max_chars 防超长。
     """
+    # 键归一化，好让 citation 里的组件名（大小写/目录名）能对上工具调用记录。
+    pending = {norm_key(k): (k, v) for k, v in (feishu_answers or {}).items()}
     parts: list[str] = []
     seen: set[str] = set()
     for rel in citations:
@@ -211,8 +223,16 @@ def gather_evidence(
         if not rel or rel in seen:
             continue
         seen.add(rel)
-        content = _read_doc(docs_root, rel)
-        parts.append(f"## 引用文档：{rel}\n{content}")
+        component = parse_feishu_citation(rel)
+        if component is not None:
+            hit = pending.pop(norm_key(component), None)
+            body = hit[1] if hit else "（本轮未取得该组件的飞书文档内容——此引用无据可核）"
+            parts.append(f"## 引用飞书文档：{rel}\n{body}")
+            continue
+        parts.append(f"## 引用文档：{rel}\n{_read_doc(docs_root, rel)}")
+    # 本轮查到、但答案没显式引用的飞书文档答案：仍是答案的事实依据，一并交给 reviewer。
+    for name, answer in pending.values():
+        parts.append(f"## 飞书文档答案：{name}（答案未显式引用）\n{answer}")
     for out in diag_outputs:
         parts.append(f"## 诊断输出\n{out}")
     if not parts:
