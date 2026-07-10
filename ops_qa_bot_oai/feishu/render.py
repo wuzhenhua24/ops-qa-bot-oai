@@ -15,6 +15,8 @@ RESET_WORDS = {"/reset", "/new", "新对话", "重置"}
 TASKS_WORDS = {"/tasks", "跟进任务"}
 # 取消在途提问：停掉自己正在处理/排队中的提问（发错了不用干等）。匹配前先 lower。
 CANCEL_WORDS = {"/cancel", "取消"}
+# 帮助指令：能力清单 + 指令说明。匹配前先 lower（"HELP"/"Help" 也认）。
+HELP_WORDS = {"/help", "help", "帮助"}
 
 
 def clean_question(raw_text: str, mention_keys: list[str]) -> str:
@@ -587,3 +589,70 @@ def parse_feedback_reason_value(value: Any) -> tuple[str, str, str | None] | Non
     if not qid or kind not in ("submit", "skip"):
         return None
     return str(qid), str(kind), str(value.get("asker") or "") or None
+
+
+# ---------------------------------------------------------------------------
+# /help：能力清单 + 指令说明
+# ---------------------------------------------------------------------------
+
+
+def build_help_text(
+    components: list[str],
+    *,
+    diag: bool = False,
+    gw_trace: bool = False,
+    db: bool = False,
+    db_change: bool = False,
+    followup: bool = False,
+    idle_minutes: int = 30,
+) -> str:
+    """/help 的能力清单文案（markdown）。按实际启用的可选特性动态拼——没启用的
+    不出现，避免新人照着帮助试了个被关掉的功能。组件清单来自 INDEX.md（解析
+    失败传空列表即可，不列）。纯函数，可单测。
+    """
+    lines: list[str] = [
+        "👋 我是运维问答机器人，**@ 我 + 问题** 即可提问。",
+        "",
+        "**我能做什么**",
+    ]
+    comp_suffix = f"（当前覆盖：{'、'.join(components)}）" if components else ""
+    lines.append(f"- 📚 文档问答：基于运维文档库回答组件问题{comp_suffix}")
+    lines.append("- 🖼️ 看图提问：直接发报错弹窗/监控面板等截图，可附文字说明")
+    if diag:
+        lines.append(
+            "- 🖥️ 实时诊断：带上机器 IP/名字问「现在内存/连接数/load 怎么样」，"
+            "我会连到测试环境跑只读命令看实况（永不执行写操作；生产环境不支持）"
+        )
+    if gw_trace:
+        lines.append(
+            "- 🔗 网关链路排查：访问失败时把响应头里的 Hi-Trace-Id 发我，"
+            "我帮你查链路日志定位哪一跳出的问题"
+        )
+    if db:
+        lines.append(
+            "- 🗄️ 数据库实时分析：给出测试库 IP/端口（OceanBase 还需租户），"
+            "我用只读账号帮你查 CPU/连接数/慢查询"
+        )
+    if db_change:
+        lines.append("- 🔧 参数变更申请：可帮你发起数据库参数修改，值班人在群里点批准后才会执行")
+    if followup:
+        lines.append(
+            "- ⏰ 定时跟进：「20 分钟后帮我看看 XX 完成没」，到点我自动复查并 @ 你；"
+            "发 `/tasks`（或 跟进任务）可查看并取消你挂起的跟进"
+        )
+    lines.append("")
+    lines.append(
+        "**答不上来时**：我会自动 @ 对应组件负责人协助；负责人在归档卡里填的答案会"
+        "沉淀回文档库，下次同样的问题我就能直接答。"
+    )
+    lines.append("**答完之后**：可以点答案下方的 👍/👎 给这次回答打分，帮我们持续改进。")
+    lines.append("")
+    lines.append("**指令**")
+    lines.append("- `/reset`（或 `/new`、新对话、重置）：清空你的对话历史，开新会话")
+    lines.append("- `/cancel`（或 取消）：停掉你正在处理/排队中的提问（发错了不用干等）")
+    if followup:
+        lines.append("- `/tasks`（或 跟进任务）：管理你挂起的定时跟进")
+    lines.append("- `/help`（或 帮助）：显示本帮助")
+    lines.append("")
+    lines.append(f"💡 同一会话里可以直接追问；{idle_minutes} 分钟没动静上下文会自动过期。")
+    return "\n".join(lines)

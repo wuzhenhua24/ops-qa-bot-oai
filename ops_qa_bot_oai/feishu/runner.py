@@ -8,10 +8,12 @@
 
 会话按 (chat,user) 隔离（SessionManager），/reset 开新会话；/tasks 列出自己挂起的
 定时跟进（带取消按钮，OPS_QA_FOLLOWUP=1 时）；/cancel（或「取消」）停掉自己正在
-处理/排队中的提问——发错问题不用干等答完，也不白烧 token。
+处理/排队中的提问——发错问题不用干等答完，也不白烧 token；/help（或「帮助」）出
+能力清单与指令说明（按实际启用的特性动态拼）。
 升级到负责人（<<ESCALATE:ou_xxx:dir>>）时随答案再发一张**问答归档表单卡**：负责人
 填答案提交 → 写进 docs/<组件>/qa-archive.md → @ 提问者推送答案（闭环见
-feishu/archive.py）。反馈卡 / 追问卡暂不做（产品壳层，不影响 SDK 对比）。
+feishu/archive.py）。每轮答完随答案发 👍/👎 反馈卡（事件落 feedback.log，报表见
+feedback_stats.py）。追问卡暂不做（产品壳层，不影响 SDK 对比）。
 
 支持三种可答题的消息形态（对齐 ops-qa-bot 的视觉路径）：
 
@@ -44,10 +46,11 @@ from lark_oapi.channel.config import (
 )
 from lark_oapi.channel.types import ImageContent, InboundMessage, PostContent, TextContent
 
-from ..db_query import DB_CHANGE_TOOL_NAME, change_display
+from ..db_query import DB_CHANGE_TOOL_NAME, DbConfig, change_display
 from ..diagnostics import DiagConfig
 from ..followup import FollowupConfig
 from ..gateway_trace import GatewayTraceConfig
+from ..index import parse_index_components
 from ..model import MODE_LABELS
 from ..review import ReviewConfig
 from .approvals import ApprovalCenter
@@ -76,12 +79,14 @@ from .inbound import (
 )
 from .render import (
     CANCEL_WORDS,
+    HELP_WORDS,
     RESET_WORDS,
     TASKS_WORDS,
     build_answer_post,
     build_archive_form_card,
     build_feedback_card,
     build_followup_tasks_card,
+    build_help_text,
     clean_question,
     escalate_dir,
     escalate_open_id,
@@ -301,6 +306,16 @@ class WsRunner:
                 self._followup_config.max_delay_minutes,
                 self._followup_config.max_pending_per_user,
             )
+        # /help 用的特性开关快照（env 是启动期静态的，存一份免得每次重读）。
+        # 参数变更申请要 db + guardrails 同时开（request_db_change 只在护栏模式挂载）。
+        db_cfg = DbConfig.from_env()
+        self._help_features = {
+            "diag": diag.enabled,
+            "gw_trace": gw.enabled,
+            "db": db_cfg.enabled,
+            "db_change": db_cfg.enabled and self._session.guardrails,
+            "followup": self._followups is not None,
+        }
         self._channel.on("message", self._on_inbound)
         self._channel.on("cardAction", self._on_card_action)
         self._channel.on("reconnecting", lambda: logger.warning("ws reconnecting ..."))
@@ -327,6 +342,16 @@ class WsRunner:
         question, images = extracted
 
         key = (chat_id, sender_id)
+        # 帮助指令：能力清单 + 指令说明。短路应答、零 LLM 成本；放最前——一句
+        # /help 不该动会话状态（不建 session、不消费过期提示）。
+        if not images and question.lower() in HELP_WORDS:
+            await self._client.send_post(
+                chat_id,
+                build_answer_post(self._help_text(), asker_id=sender_id),
+                parent_id=msg_id,
+            )
+            return
+
         if not images and question in RESET_WORDS:
             await self._session.reset(key)
             await self._client.send_text(chat_id, "（已开启新会话）", parent_id=msg_id)
@@ -703,6 +728,16 @@ class WsRunner:
             return
         card = build_followup_tasks_card(sender_id, chat_id, items)
         await self._client.send_card(chat_id, card, parent_id=msg_id)
+
+    def _help_text(self) -> str:
+        """/help 文案：组件清单每次现读 INDEX.md（mtime 缓存，加组件即时生效），
+        特性开关用启动期快照。"""
+        try:
+            components = [c.name for c in parse_index_components(self._docs_root)]
+        except Exception:
+            components = []  # 解析失败降级成不列组件，帮助本身照常给
+        idle_minutes = max(1, int(self._session.idle_ttl // 60))
+        return build_help_text(components, idle_minutes=idle_minutes, **self._help_features)
 
     async def _on_card_action(self, event) -> None:
         """cardAction 统一入口：跟进取消 → 归档提交 → 反馈 → 写审批中心，依次尝试。
