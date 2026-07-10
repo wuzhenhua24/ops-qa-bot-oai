@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import base64
 import inspect
 import logging
 import re
@@ -239,6 +240,28 @@ class GuardedAnswer:
     reviewed: bool = False
     revised: bool = False
     needs_human_review: bool = False
+
+
+def build_user_input(question: str, images: list[tuple[str, bytes]] | None = None):
+    """把 (问题, 图片) 组装成 `Runner.run(input=...)` 可接受的形态。
+
+    没有图时返回原字符串（不改变历史行为）；有图时返回单条 user 消息的输入项列表，
+    每张图是一个 `input_image` 块（data URI base64），文本放在图后——让模型先看到图、
+    再读到引导问题，匹配"看图 → 答"的语序。与 ops-qa-bot（Claude 版）的 content
+    blocks 组装一一对应，只是换成 Responses API 的块类型（要求底层模型支持视觉）。
+    """
+    if not images:
+        return question
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_image",
+            "image_url": f"data:{media_type};base64,{base64.b64encode(raw).decode('ascii')}",
+            "detail": "auto",
+        }
+        for media_type, raw in images
+    ]
+    content.append({"type": "input_text", "text": question})
+    return [{"role": "user", "content": content}]
 
 
 def format_tool_call(name: str, args: dict) -> str:
@@ -708,7 +731,11 @@ class OpsQABot:
         kwargs.pop("context", None)
         return kwargs
 
-    async def ask(self, question: str) -> AsyncIterator[dict]:
+    async def ask(
+        self,
+        question: str,
+        images: list[tuple[str, bytes]] | None = None,
+    ) -> AsyncIterator[dict]:
         """向 bot 提问，流式返回事件字典：
 
         - {"type": "tool", "name": str, "input": dict}  —— agent 调用的工具
@@ -717,9 +744,15 @@ class OpsQABot:
         - {"type": "done", "usage": dict | None, "num_turns": int | None,
            "subtype": str, "route": str | None,
            "agent_usage": dict}                          —— 本轮结束（含遥测）
+
+        `images` 给定时（list of (media_type, raw_bytes)），把每张图作为 input_image
+        块 + 文本一起发给模型（要求底层模型/代理支持视觉）。没有 images 时走原
+        string 路径，不改变历史行为。
         """
         self._telemetry.reset_run()
-        result = Runner.run_streamed(self._agent, input=question, **self._run_kwargs())
+        result = Runner.run_streamed(
+            self._agent, input=build_user_input(question, images), **self._run_kwargs()
+        )
 
         subtype = "success"
         seen_first_agent = False
@@ -753,12 +786,20 @@ class OpsQABot:
             "agent_usage": self._telemetry.agent_usage(),
         }
 
-    async def answer(self, question: str) -> AnswerResult:
-        """一次性返回完整答案 + 用量 + 解析出的标记。开启复核（#7）时叠加 revise-once 核对。"""
+    async def answer(
+        self,
+        question: str,
+        images: list[tuple[str, bytes]] | None = None,
+    ) -> AnswerResult:
+        """一次性返回完整答案 + 用量 + 解析出的标记。开启复核（#7）时叠加 revise-once 核对。
+
+        `images` 透传给 `ask()`，开启视觉路径。复核重答（reanswer）保持纯文本——
+        图已随首答进了 session 历史，重答的模型仍能看到。
+        """
         if not self.review:
-            return await self._answer_once(question)
+            return await self._answer_once(question, images)
         mark = self._evidence_mark()
-        r1 = await self._answer_once(question)
+        r1 = await self._answer_once(question, images)
 
         def to_draft(r: AnswerResult) -> Draft:
             return Draft(
@@ -775,16 +816,23 @@ class OpsQABot:
         outcome = await self._review(question, to_draft(r1), reanswer, mark)
         return self._apply_review_outcome(outcome)
 
-    async def _answer_once(self, question: str) -> AnswerResult:
+    async def _answer_once(
+        self,
+        question: str,
+        images: list[tuple[str, bytes]] | None = None,
+    ) -> AnswerResult:
         """产出一版自由文本答案（不含复核）。复核开启时被 answer() 调用两次（原答 + 重答）。"""
-        logger.info("question: %s", question)
+        if images:
+            logger.info("question (with %d image(s)): %s", len(images), question)
+        else:
+            logger.info("question: %s", question)
         chunks: list[str] = []
         usage: dict | None = None
         num_turns: int | None = None
         subtype = "success"
         route: str | None = None
         agent_usage: dict[str, dict[str, int]] | None = None
-        async for event in self.ask(question):
+        async for event in self.ask(question, images=images):
             if event["type"] == "tool":
                 logger.info("  tool: %s", format_tool_call(event["name"], event["input"]))
             elif event["type"] == "handoff":
@@ -913,14 +961,22 @@ class OpsQABot:
             agent_usage=self._telemetry.agent_usage() or None,
         )
 
-    async def answer_guarded(self, question: str, approver: Any = None) -> GuardedAnswer:
-        """带护栏 + 写审批（#4）的问答；开启复核（#7）时叠加 revise-once 核对。"""
+    async def answer_guarded(
+        self,
+        question: str,
+        approver: Any = None,
+        images: list[tuple[str, bytes]] | None = None,
+    ) -> GuardedAnswer:
+        """带护栏 + 写审批（#4）的问答；开启复核（#7）时叠加 revise-once 核对。
+
+        `images` 开启视觉路径（同 `answer()`）；复核重答保持纯文本，图在 session 历史里。
+        """
         if not self.guardrails:
             raise RuntimeError("answer_guarded 需要以 guardrails=True 构造 OpsQABot")
         if not self.review:
-            return await self._answer_guarded_once(question, approver)
+            return await self._answer_guarded_once(question, approver, images)
         mark = self._evidence_mark()
-        r1 = await self._answer_guarded_once(question, approver)
+        r1 = await self._answer_guarded_once(question, approver, images)
 
         def to_draft(r: GuardedAnswer) -> Draft:
             # risky：跑了实时诊断，或提议过写命令（审批/黑名单驳回/已登记任一非空）。
@@ -939,7 +995,12 @@ class OpsQABot:
         outcome = await self._review(question, to_draft(r1), reanswer, mark)
         return self._apply_review_outcome(outcome)
 
-    async def _answer_guarded_once(self, question: str, approver: Any = None) -> GuardedAnswer:
+    async def _answer_guarded_once(
+        self,
+        question: str,
+        approver: Any = None,
+        images: list[tuple[str, bytes]] | None = None,
+    ) -> GuardedAnswer:
         """带护栏 + 写操作审批（HITL）的问答（差异化 #4，需 guardrails=True）。
 
         - 输入注入护栏命中 → 直接返回拦截结果（blocked）。
@@ -958,13 +1019,19 @@ class OpsQABot:
         """
         if not self.guardrails:
             raise RuntimeError("answer_guarded 需要以 guardrails=True 构造 OpsQABot")
-        logger.info("question (guarded): %s", question)
+        logger.info(
+            "question (guarded%s): %s",
+            f", with {len(images)} image(s)" if images else "",
+            question,
+        )
         approvals: list[tuple[ApprovalRequest, bool]] = []
         blacklist_rejections: list[tuple[ApprovalRequest, str]] = []
         # reset 只在整轮开始时做一次：审批后的续跑属于同一轮，遥测继续累计。
         self._telemetry.reset_run()
         try:
-            result = await Runner.run(self._agent, input=question, **self._run_kwargs())
+            result = await Runner.run(
+                self._agent, input=build_user_input(question, images), **self._run_kwargs()
+            )
             # 处理写操作审批中断，直到没有待批项（轮次保险丝防模型驳回后无限重提议）。
             rounds = 0
             while result.interruptions:

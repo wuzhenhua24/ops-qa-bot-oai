@@ -1397,7 +1397,7 @@ async def test_runner_answer_error_edits_placeholder_to_error():
     class FailingSession:
         guardrails = False
 
-        async def answer(self, key, question, approver=None):
+        async def answer(self, key, question, approver=None, images=None):
             raise RuntimeError("provider 500 / 超时（模拟）")
 
     r = _bare_runner(FailingSession())
@@ -1416,7 +1416,7 @@ async def test_runner_answer_ok_edits_placeholder_to_answer():
     class OkSession:
         guardrails = False
 
-        async def answer(self, key, question, approver=None):
+        async def answer(self, key, question, approver=None, images=None):
             return SimpleNamespace(
                 text="先看 maxmemory 与淘汰策略。",
                 markers=SimpleNamespace(escalate=None),

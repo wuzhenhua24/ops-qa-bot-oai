@@ -90,20 +90,22 @@ class SessionManager:
                 self._entries[key] = entry
             return entry
 
-    async def answer(self, key: SessionKey, question: str, approver=None):
+    async def answer(self, key: SessionKey, question: str, approver=None, images=None):
         """在该会话上答一题（per-key 锁内串行）。
 
         guardrails 关（默认）→ `bot.answer()` 返回 AnswerResult；
         guardrails 开 → `bot.answer_guarded(approver=...)` 返回 GuardedAnswer（approver
         可为异步，如飞书审批卡片闭环）。两者都有 text/markers/usage/subtype，渲染层通用。
+
+        `images`（list of (media_type, raw_bytes)）透传给 bot，开启视觉路径。
         """
         entry = await self._entry(key)
         async with entry.lock:
             entry.last_used = time.time()
             if self.guardrails:
-                result = await entry.bot.answer_guarded(question, approver=approver)
+                result = await entry.bot.answer_guarded(question, approver=approver, images=images)
             else:
-                result = await entry.bot.answer(question)
+                result = await entry.bot.answer(question, images=images)
             entry.last_used = time.time()
             return result
 

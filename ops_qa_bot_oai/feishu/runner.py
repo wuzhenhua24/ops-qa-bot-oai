@@ -6,14 +6,22 @@
   群里 @机器人 提问 → 立即发占位消息 → 跑 OpsQABot.answer() → 把占位编辑成最终答案
   （头部 @ 提问者；命中 <<ESCALATE>> 时末尾 @ 负责人）
 
-会话按 (chat,user) 隔离（SessionManager），/reset 开新会话。非文字消息回友好提示。
+会话按 (chat,user) 隔离（SessionManager），/reset 开新会话。
 这是"核心问答闭环"范围——反馈卡 / 追问卡 / 归档暂不做（产品壳层，不影响 SDK 对比）。
+
+支持三种可答题的消息形态（对齐 ops-qa-bot 的视觉路径）：
+
+- text：@bot + 纯文字（原有主线）
+- image：单发一张截图（下载 → 视觉答题，要求底层模型支持视觉）
+- post：富文本"@bot + 文字 + 截图"（移动端多图常打成这种），文字 + 图一起喂
+
+其余类型（file/sticker/audio…）回友好提示。
 
 飞书开放平台配置（长连接模式）：
 - 事件订阅方式选「长连接」（不填 Request URL）
 - 订阅事件：`im.message.receive_v1`
 - 权限：`im:message`（收发/更新消息）、`im:message.group_at_msg`（群 @ 消息）、
-  `im:message:send_as_bot`
+  `im:message:send_as_bot`、`im:resource`（下载消息里的图片）
 """
 
 from __future__ import annotations
@@ -29,7 +37,7 @@ from lark_oapi.channel.config import (
     SafetyConfig,
     TextBatchConfig,
 )
-from lark_oapi.channel.types import InboundMessage, TextContent
+from lark_oapi.channel.types import ImageContent, InboundMessage, PostContent, TextContent
 
 from ..db_query import DB_CHANGE_TOOL_NAME, change_display
 from ..diagnostics import DiagConfig
@@ -37,6 +45,14 @@ from ..gateway_trace import GatewayTraceConfig
 from ..model import MODE_LABELS
 from ..review import ReviewConfig
 from .approvals import ApprovalCenter
+from .inbound import (
+    MAX_IMAGE_BYTES,
+    POST_MAX_IMAGES,
+    compose_image_question,
+    extract_image_caption,
+    normalize_image_media_type,
+    parse_post_text,
+)
 from .render import (
     RESET_WORDS,
     build_answer_post,
@@ -48,7 +64,7 @@ from .session import SessionManager
 
 logger = logging.getLogger("ops_qa_bot_oai.feishu")
 
-_UNSUPPORTED = "目前只支持文字提问，关键报错请用文字描述。"
+_UNSUPPORTED = "目前只支持文字和图片（截图）提问，关键报错请用文字描述或直接贴图。"
 # 兜底错误文案：answer() 抛出非预期异常（模型服务异常/超时、provider 5xx、网络抖动）
 # 时编辑进占位消息，避免用户对着"🔍 翻文档中"干等。
 _ERROR_TEXT = (
@@ -124,6 +140,19 @@ class FeishuClient:
             logger.exception("update_card failed msg=%s", message_id)
             return False
         return bool(getattr(r, "success", False))
+
+    async def download_image(self, message_id: str, file_key: str) -> bytes | None:
+        """下载消息里的一张图片，失败返回 None。
+
+        API: GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=image，
+        要求应用有 `im:resource` 权限、bot 是消息所在群成员。media_type 由调用方按
+        magic bytes 嗅探（API 不暴露 Content-Type）。
+        """
+        try:
+            return await self._channel.download_resource(file_key, "image", message_id=message_id)
+        except Exception:
+            logger.exception("download_image failed msg=%s key=%s", message_id, file_key)
+            return None
 
 
 class WsRunner:
@@ -218,24 +247,20 @@ class WsRunner:
         if not chat_id or not sender_id:
             return
 
-        content = inbound.content
-        if not isinstance(content, TextContent):
-            await self._client.send_text(chat_id, _UNSUPPORTED, parent_id=msg_id)
+        extracted = await self._extract_question(inbound, chat_id, msg_id)
+        if extracted is None:
             return
-
-        raw_text = (content.raw or {}).get("text") or ""
-        mention_keys = [m.key for m in (inbound.mentions or []) if getattr(m, "key", None)]
-        question = clean_question(raw_text, mention_keys)
-        if not question:
-            return
+        question, images = extracted
 
         key = (chat_id, sender_id)
-        if question in RESET_WORDS:
+        if not images and question in RESET_WORDS:
             await self._session.reset(key)
             await self._client.send_text(chat_id, "（已开启新会话）", parent_id=msg_id)
             return
 
-        logger.info("Q chat=%s user=%s q=%r", chat_id, sender_id, question[:80])
+        logger.info(
+            "Q chat=%s user=%s images=%d q=%r", chat_id, sender_id, len(images), question[:80]
+        )
 
         # 立即占位（post），答完编辑替换。占位以 post 发出，方便后续 edit 成 post。
         ph_post = {
@@ -274,7 +299,9 @@ class WsRunner:
                 )
 
         try:
-            result = await self._session.answer(key, question, approver=approver)
+            result = await self._session.answer(
+                key, question, approver=approver, images=images or None
+            )
         except Exception:
             # answer() 内部只兜了 max_turns / 护栏，其余异常（provider 5xx、鉴权失败、
             # 超时、网络抖动、ModelBehaviorError…）会抛到这里。不接住的话占位消息会永远
@@ -318,6 +345,81 @@ class WsRunner:
             u.get("input_tokens"),
             u.get("output_tokens"),
         )
+
+    async def _extract_question(
+        self, inbound: InboundMessage, chat_id: str, msg_id: str | None
+    ) -> tuple[str, list[tuple[str, bytes]]] | None:
+        """按消息形态抽出 (问题文本, 图片列表)；不可答题时回友好提示并返回 None。
+
+        - text  → 剥 @bot 占位后的纯文字，无图。
+        - image → 下载单图走视觉路径；下载失败/超大/为空回提示不进答题。引导问题用
+          caption（转发/第三方客户端偶有）或 DEFAULT_IMAGE_PROMPT。
+        - post  → AST 抽文字 + 从 inbound.resources 下载图（最多 POST_MAX_IMAGES 张，
+          单张失败只丢那一张不阻塞）；文字和图都为空才回 unsupported。
+        - 其它  → unsupported 提示。
+        """
+        content = inbound.content
+
+        if isinstance(content, TextContent):
+            raw_text = (content.raw or {}).get("text") or ""
+            mention_keys = [m.key for m in (inbound.mentions or []) if getattr(m, "key", None)]
+            question = clean_question(raw_text, mention_keys)
+            return (question, []) if question else None
+
+        if isinstance(content, ImageContent):
+            if not content.image_key or not msg_id:
+                return None
+            img, err = await self._fetch_image(msg_id, content.image_key)
+            if img is None:
+                await self._client.send_text(chat_id, err or _UNSUPPORTED, parent_id=msg_id)
+                return None
+            caption = extract_image_caption(content.raw or {})
+            return compose_image_question(caption, 1), [img]
+
+        if isinstance(content, PostContent):
+            text = parse_post_text(content.post or {})
+            keys = [
+                r.file_key for r in (inbound.resources or []) if r.type == "image" and r.file_key
+            ]
+            if len(keys) > POST_MAX_IMAGES:
+                logger.warning(
+                    "post 图片超上限，截断 %d → %d：chat=%s", len(keys), POST_MAX_IMAGES, chat_id
+                )
+                keys = keys[:POST_MAX_IMAGES]
+            images: list[tuple[str, bytes]] = []
+            for k in keys if msg_id else []:
+                img, err = await self._fetch_image(msg_id, k)
+                if img is None:
+                    logger.warning("post 图片跳过（%s）：chat=%s key=%s", err, chat_id, k)
+                    continue
+                images.append(img)
+            if not text and not images:
+                # 纯 sticker/表情/仅链接等：明确回不支持，避免 bot 静默无反应。
+                await self._client.send_text(chat_id, _UNSUPPORTED, parent_id=msg_id)
+                return None
+            if not images:
+                return text, []
+            return compose_image_question(text, len(images)), images
+
+        await self._client.send_text(chat_id, _UNSUPPORTED, parent_id=msg_id)
+        return None
+
+    async def _fetch_image(
+        self, msg_id: str, file_key: str
+    ) -> tuple[tuple[str, bytes] | None, str | None]:
+        """下载并校验一张图。成功返回 ((media_type, bytes), None)；失败返回 (None, 提示文案)。"""
+        data = await self._client.download_image(msg_id, file_key)
+        if data is None:
+            return None, "📎 图片读取失败，请把截图里的关键报错或现象用文字描述后再发。"
+        if not data:
+            return None, "图片内容为空，请重新发送 🙏"
+        if len(data) > MAX_IMAGE_BYTES:
+            size_mb = len(data) / (1024 * 1024)
+            return None, (
+                f"图片太大（{size_mb:.1f}MB，上限 {MAX_IMAGE_BYTES // (1024 * 1024)}MB）🙏 "
+                "请压缩后重发，或把关键内容用文字描述出来。"
+            )
+        return (normalize_image_media_type("", data), data), None
 
     async def _deliver(
         self, chat_id: str, ph_id: str | None, post: dict, *, parent_id: str | None = None
