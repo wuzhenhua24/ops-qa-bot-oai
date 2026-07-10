@@ -10,15 +10,23 @@
   空闲回收 / 重启即丢。
 - 设 `OPS_QA_SESSION_DB=<文件路径>` 后历史落盘：空闲回收只丢 bot 实例（轻），
   同一用户再提问时按 session_id 从 db 恢复上下文接着聊；进程重启同理。
+
+上下文有统一的**过期边界**（take_expired_notice）：距上次答题 ≥ idle_ttl 即翻篇
+——清历史开新会话，下一轮答案头部由 runner 挂"已过期"提示。SDK 每轮 run 会把
+session 里**全部**历史（含工具调用与返回原文）拼进模型输入，不设过期边界的话落盘
+历史会无限累积、token 成本线性涨。因此落盘的价值收敛为：进程在 idle_ttl 内重启时，
+活跃会话的上下文不丢。
 """
 
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +36,11 @@ from ..bot import OpsQABot
 from ..model import ModelChoice, env_flag, resolve_mode, resolve_model, resolve_session_db
 
 SessionKey = tuple[str, str]  # (chat_id, user_id)
+
+# _last_seen 内存表的保留时长：超过即随空闲清扫剪掉（防长期运行慢涨）。剪掉后
+# 落盘模式仍能从 session db 的消息时间戳判定过期，内存模式则拿不到提示（上下文
+# 本来也早丢了）——与 ops-qa-bot 的 24h 保留语义一致。
+_LAST_SEEN_RETENTION = 24 * 3600.0
 
 
 @dataclass
@@ -94,6 +107,10 @@ class SessionManager:
         # 找到该用户正在处理/排队中的答题 task 并 cancel。纯内存、同 loop 同步
         # 读写（register/cancel 之间无 await），随问题结束即清，无需加锁。
         self._inflight: dict[SessionKey, dict[str, InflightScope]] = {}
+        # 上下文过期判定用的活跃时间表：(chat, user) → 上次答题的 unix 时间戳。
+        # 独立于 _entries 生命周期（空闲回收不清它），take_expired_notice 据此
+        # 判定"过期回来追问"并翻篇。/reset 主动重置会清掉（不算过期）。
+        self._last_seen: dict[SessionKey, float] = {}
 
     @property
     def model_choice(self) -> ModelChoice:
@@ -144,14 +161,14 @@ class SessionManager:
         """
         entry = await self._entry(key)
         async with entry.lock:
-            entry.last_used = time.time()
+            entry.last_used = self._last_seen[key] = time.time()
             if on_start is not None:
                 await on_start()
             if self.guardrails:
                 result = await entry.bot.answer_guarded(question, approver=approver, images=images)
             else:
                 result = await entry.bot.answer(question, images=images)
-            entry.last_used = time.time()
+            entry.last_used = self._last_seen[key] = time.time()
             return result
 
     def register_inflight(self, key: SessionKey, scope: InflightScope) -> str:
@@ -183,16 +200,75 @@ class SessionManager:
                 scope.task.cancel()
         return len(scopes)
 
+    async def take_expired_notice(self, key: SessionKey) -> bool:
+        """判定"上一轮上下文已过期"；命中则清掉历史（翻篇）并返回 True。
+
+        **必须在 answer() 之前调用**。返回 True 表示本轮按全新会话作答，调用方
+        据此在答案头部挂一行"上下文已过期"提示（一次性：翻篇即消费，下一轮
+        _last_seen 会被 answer 写回，不再触发）。
+
+        判定：距该用户上次答题 ≥ idle_ttl。上次活跃优先取内存 _last_seen；进程
+        重启后内存表是空的，落盘模式下回落到 session db 里最新一条消息的时间戳
+        ——否则重启后陈年历史会被静默无感恢复（落盘模式无上限增长的根源）。
+
+        过期处理直接复用 reset：清 db 历史 + 弹掉 _last_seen。即使 entry 还在
+        内存里（清扫周期间隙）也照样翻篇，语义统一为"idle_ttl 未活跃即重置"。
+        """
+        last = self._last_seen.get(key)
+        if last is None:
+            last = await self._db_last_active(key)
+        if last is None or time.time() - last < self.idle_ttl:
+            return False
+        await self.reset(key)
+        return True
+
+    async def _db_last_active(self, key: SessionKey) -> float | None:
+        """从 session db 读该会话最新一条消息的时间戳（unix 秒）；无历史返回 None。
+
+        只在落盘模式有意义（内存模式各 SQLiteSession 私有一个 :memory: db，从
+        外面连不到）。直查 SDK 的 agent_messages 表（schema 见 SQLiteSession）：
+        created_at 是 SQLite CURRENT_TIMESTAMP（UTC）。表不存在（从未答过题）
+        或解析失败一律按无历史处理——宁可漏提示，不误清历史。
+        """
+        if self.session_db == ":memory:":
+            return None
+
+        def query() -> str | None:
+            conn = sqlite3.connect(self.session_db)
+            try:
+                row = conn.execute(
+                    "SELECT MAX(created_at) FROM agent_messages WHERE session_id = ?",
+                    (f"{key[0]}:{key[1]}",),
+                ).fetchone()
+            finally:
+                conn.close()
+            return row[0] if row else None
+
+        try:
+            raw = await asyncio.to_thread(query)
+        except sqlite3.Error:
+            return None
+        if not raw:
+            return None
+        try:
+            dt = datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        return dt.timestamp()
+
     async def reset(self, key: SessionKey) -> bool:
         """清空该会话上下文。
 
         即使 bot 实例已被空闲回收也要清：落盘模式下历史在 db 里，只看内存 entry 会漏。
         统一走 _entry（不存在则新建）再 reset，语义上"/reset 后一定是新会话"。
+        同时清 _last_seen：用户主动 /reset 不算"过期回收"，下一轮提问按全新会话
+        处理，不要再追加"上下文已过期"提示徒增噪音。
         """
         entry = await self._entry(key)
         async with entry.lock:
             await entry.bot.reset()
             entry.last_used = time.time()
+        self._last_seen.pop(key, None)
         return True
 
     def active_count(self) -> int:
@@ -221,3 +297,7 @@ class SessionManager:
             stale = [k for k, e in self._entries.items() if now - e.last_used > self.idle_ttl]
             for k in stale:
                 self._entries.pop(k, None)
+        # _last_seen 只为过期提示服务，超过保留时长的顺手剪掉（防长期运行慢涨）。
+        cutoff = now - max(self.idle_ttl, _LAST_SEEN_RETENTION)
+        for k in [k for k, t in self._last_seen.items() if t < cutoff]:
+            self._last_seen.pop(k, None)

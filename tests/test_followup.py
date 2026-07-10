@@ -318,6 +318,9 @@ class _RecordingSession:
     def queued(self, key):
         return False
 
+    async def take_expired_notice(self, key):
+        return False
+
     def register_inflight(self, key, scope):
         return "sid"
 

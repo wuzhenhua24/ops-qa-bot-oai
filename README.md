@@ -543,7 +543,9 @@ uv run python run_ws.py                # 群里 @机器人 提问即可
 
 审批 approver 是**异步**的（`answer_guarded` 支持 awaitable approver），run 就挂在 await 上等飞书回调——不用像 ops-qa-bot 那样手工拼卡片回调链路。卡片构造 / 按钮解析 / `ApprovalCenter` 状态机（批准 / 驳回 / 白名单 / 超时 / 发卡失败）已全部单测，闭环走真模型 + 假 channel 实测通过。实现见 `feishu/approvals.py` + `feishu/render.py`。
 
-**会话历史持久化**：多轮历史走 SDK 的 **Session**（`SQLiteSession`，session_id = `chat_id:user_id`）。缺省内存态（与旧行为一致）；`.env` 里设 `OPS_QA_SESSION_DB=.sessions.db` 即落盘——bot 重启 / 会话空闲回收后，同一用户再提问时从 db 恢复上下文接着聊，`/reset` 也会清掉 db 里的历史。
+**会话历史持久化**：多轮历史走 SDK 的 **Session**（`SQLiteSession`，session_id = `chat_id:user_id`）。缺省内存态（与旧行为一致）；`.env` 里设 `OPS_QA_SESSION_DB=.sessions.db` 即落盘，`/reset` 也会清掉 db 里的历史。
+
+**上下文过期边界（idle_ttl，缺省 30 分钟）**：SDK 每轮 run 会把 session 里**全部**历史（含每次工具调用与返回原文）拼进模型输入——不设边界的话落盘历史会无限累积，token 成本线性涨、陈年上下文还干扰答题。因此统一按「距上次答题 ≥ idle_ttl 即翻篇」处理：清历史开新会话，下一轮答案头部挂一行「⏱️ 上一轮上下文已过期（超过 30 分钟未活跃，已自动开新会话），本次按新问题处理」（一次性，不反复唠叨；`/reset` 主动重置不算过期、不补提示）。进程重启后判定依然成立（落盘模式回落读 session db 里最新消息的时间戳），所以**落盘的价值收敛为：进程在 idle_ttl 内重启时活跃会话的上下文不丢**——超过 idle_ttl 的历史无论重启与否都会翻篇。回归测试见 `tests/test_session_expiry.py`。
 
 
 **定时跟进（`OPS_QA_FOLLOWUP=1` 开启）**：用户说「20 分钟后帮我看看那个 ALTER 跑完没」，agent 调 `schedule_followup` 工具登记一笔跟进（当轮立刻回复"到点帮你看"），到点由内存定时器用存好的**自包含 task** 跑一轮全新答题——复用占位 / 审批 / @ 提问者整条落地链路，实打实调 `query_database` 等工具去查，结果 @ 发起人推回原群。群里发 `/tasks`（或"跟进任务"）列出自己挂起的跟进（剩余分钟 + 任务摘要），每条带取消按钮（**仅登记者可取消**；已进入执行阶段的不可取消）。边界：等待区间缺省 1~120 分钟、单人挂起上限 5（`OPS_QA_FOLLOWUP_MIN/MAX_MINUTES`、`OPS_QA_FOLLOWUP_MAX_PENDING`）；**MVP 是纯内存定时器**，进程重启丢未触发任务。

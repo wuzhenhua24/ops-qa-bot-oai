@@ -1399,6 +1399,9 @@ async def test_runner_answer_error_edits_placeholder_to_error():
         def queued(self, key):
             return False
 
+        async def take_expired_notice(self, key):
+            return False
+
         def register_inflight(self, key, scope):
             return "sid"
 
@@ -1426,6 +1429,9 @@ async def test_runner_answer_ok_edits_placeholder_to_answer():
 
         # 在途登记表/排队桩（/cancel、排队占位用，本测试不涉及）
         def queued(self, key):
+            return False
+
+        async def take_expired_notice(self, key):
             return False
 
         def register_inflight(self, key, scope):

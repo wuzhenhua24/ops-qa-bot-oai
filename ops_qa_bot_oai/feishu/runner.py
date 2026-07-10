@@ -349,6 +349,13 @@ class WsRunner:
             question[:80],
         )
 
+        # 上下文过期判定（一次性消费，须在 answer 之前）：距上次答题 ≥ idle_ttl
+        # 即翻篇——清历史开新会话，本轮答案头部挂"已过期"提示，让用户立刻知道
+        # 那句「接着上面的」bot 没拿到上下文、是按全新问题答的。
+        session_expired = await self._session.take_expired_notice(key)
+        if session_expired:
+            logger.info("session expired, starting fresh: chat=%s user=%s", chat_id, sender_id)
+
         # 立即占位（post），答完编辑替换。占位以 post 发出，方便后续 edit 成 post。
         # 同用户前一条还没答完时本条要排队等锁：占位前缀用「🕒 排队中」，拿到锁
         # 开始跑时（on_start 回调）再刷成「🔍 翻文档中」，让用户分辨哪条真的在跑。
@@ -428,7 +435,16 @@ class WsRunner:
         finally:
             self._session.unregister_inflight(key, scope_id)
         esc = escalate_open_id(result.markers.escalate)
-        final_post = build_answer_post(result.text, asker_id=sender_id, escalate_to=esc)
+        answer_text = result.text
+        # 过期提示挂在答案最前面（post 第一段正文，最显眼）。只在成功路径挂：
+        # 答题失败时标记已消费也不补挂——历史已翻篇，错误文案里再解释反而添乱。
+        if session_expired:
+            idle_minutes = max(1, int(self._session.idle_ttl // 60))
+            answer_text = (
+                f"⏱️ 上一轮上下文已过期（超过 {idle_minutes} 分钟未活跃，已自动开新会话），"
+                f"本次按新问题处理。\n\n{answer_text}"
+            )
+        final_post = build_answer_post(answer_text, asker_id=sender_id, escalate_to=esc)
         # 审批轨迹（仅 GuardedAnswer 有这些字段）：黑名单自动驳回 / 人工拍板结果。
         for req, reason in getattr(result, "blacklist_rejections", None) or []:
             cmd = _approval_display(req)[0]
