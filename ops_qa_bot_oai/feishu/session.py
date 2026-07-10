@@ -120,7 +120,18 @@ class SessionManager:
                 self._entries[key] = entry
             return entry
 
-    async def answer(self, key: SessionKey, question: str, approver=None, images=None):
+    def queued(self, key: SessionKey) -> bool:
+        """该 (chat, user) 当前是否有未完成的问题占着 per-key 锁。
+
+        用于占位文本判定：True 表示新进来的问题要排队，前缀用 🕒 排队中；False
+        直接 🔍 翻文档中。纯只读检查，不创建会话。
+        """
+        entry = self._entries.get(key)
+        return entry is not None and entry.lock.locked()
+
+    async def answer(
+        self, key: SessionKey, question: str, approver=None, images=None, on_start=None
+    ):
         """在该会话上答一题（per-key 锁内串行）。
 
         guardrails 关（默认）→ `bot.answer()` 返回 AnswerResult；
@@ -128,10 +139,14 @@ class SessionManager:
         可为异步，如飞书审批卡片闭环）。两者都有 text/markers/usage/subtype，渲染层通用。
 
         `images`（list of (media_type, raw_bytes)）透传给 bot，开启视觉路径。
+        `on_start`（可选异步回调）在拿到锁、真正开始答题前调用——runner 用它把
+        排队中的占位从「🕒 排队中」刷成「🔍 翻文档中」。
         """
         entry = await self._entry(key)
         async with entry.lock:
             entry.last_used = time.time()
+            if on_start is not None:
+                await on_start()
             if self.guardrails:
                 result = await entry.bot.answer_guarded(question, approver=approver, images=images)
             else:

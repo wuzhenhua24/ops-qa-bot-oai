@@ -1358,9 +1358,7 @@ class _FakePostClient:
 
 
 def _post_text(post: dict) -> str:
-    return "".join(
-        seg.get("text", "") for para in post["zh_cn"]["content"] for seg in para
-    )
+    return "".join(seg.get("text", "") for para in post["zh_cn"]["content"] for seg in para)
 
 
 def _text_inbound(question: str = "redis 内存告警怎么处理"):
@@ -1397,14 +1395,17 @@ async def test_runner_answer_error_edits_placeholder_to_error():
     class FailingSession:
         guardrails = False
 
-        # 在途登记表桩（/cancel 用，本测试不取消）
+        # 在途登记表/排队桩（/cancel、排队占位用，本测试不涉及）
+        def queued(self, key):
+            return False
+
         def register_inflight(self, key, scope):
             return "sid"
 
         def unregister_inflight(self, key, scope_id):
             pass
 
-        async def answer(self, key, question, approver=None, images=None):
+        async def answer(self, key, question, approver=None, images=None, on_start=None):
             raise RuntimeError("provider 500 / 超时（模拟）")
 
     r = _bare_runner(FailingSession())
@@ -1423,14 +1424,17 @@ async def test_runner_answer_ok_edits_placeholder_to_answer():
     class OkSession:
         guardrails = False
 
-        # 在途登记表桩（/cancel 用，本测试不取消）
+        # 在途登记表/排队桩（/cancel、排队占位用，本测试不涉及）
+        def queued(self, key):
+            return False
+
         def register_inflight(self, key, scope):
             return "sid"
 
         def unregister_inflight(self, key, scope_id):
             pass
 
-        async def answer(self, key, question, approver=None, images=None):
+        async def answer(self, key, question, approver=None, images=None, on_start=None):
             return SimpleNamespace(
                 text="先看 maxmemory 与淘汰策略。",
                 markers=SimpleNamespace(escalate=None),
@@ -1558,8 +1562,7 @@ def test_marker_round_trip_none_mentions_nobody():
 def test_coordinator_without_any_open_id_only_offers_none(tmp_path):
     """一个 open_id 都没登记时，协调者不该被塞一张空表，只留 <<ESCALATE:none>>。"""
     (tmp_path / "INDEX.md").write_text(
-        "| 组件 | 目录 | 覆盖内容 | open_id |\n|---|---|---|---|\n"
-        "| Redis | `redis/` | 缓存 |  |\n",
+        "| 组件 | 目录 | 覆盖内容 | open_id |\n|---|---|---|---|\n| Redis | `redis/` | 缓存 |  |\n",
         encoding="utf-8",
     )
     agent, _ = build_coordinator_agent(tmp_path, build_model_router())

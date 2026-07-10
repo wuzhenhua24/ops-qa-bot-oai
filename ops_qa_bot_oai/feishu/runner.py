@@ -86,6 +86,11 @@ _ERROR_TEXT = (
 )
 
 
+def _ph_post(text: str) -> dict:
+    """占位/状态提示的 post 负载（单段纯文本）。"""
+    return {"zh_cn": {"title": "", "content": [[{"tag": "text", "text": text}]]}}
+
+
 def _approval_display(req) -> tuple[str, str]:
     """从一条审批请求里取 (命令, 目标) 展示文本。
 
@@ -345,13 +350,18 @@ class WsRunner:
         )
 
         # 立即占位（post），答完编辑替换。占位以 post 发出，方便后续 edit 成 post。
-        ph_post = {
-            "zh_cn": {
-                "title": "",
-                "content": [[{"tag": "text", "text": placeholder_text(question)}]],
-            }
-        }
-        ph_id = await self._client.send_post(chat_id, ph_post, parent_id=msg_id)
+        # 同用户前一条还没答完时本条要排队等锁：占位前缀用「🕒 排队中」，拿到锁
+        # 开始跑时（on_start 回调）再刷成「🔍 翻文档中」，让用户分辨哪条真的在跑。
+        queued = self._session.queued(key)
+        ph_id = await self._client.send_post(
+            chat_id, _ph_post(placeholder_text(question, queued=queued)), parent_id=msg_id
+        )
+
+        on_start = None
+        if queued and ph_id:
+
+            async def on_start():
+                await self._client.update_post(ph_id, _ph_post(placeholder_text(question)))
 
         # 写审批 approver（guardrails 开启时用）：占位改成等待提示 → 发审批卡片 →
         # 等值班人点按钮（超时驳回）。run 在 answer_guarded 的中断循环里挂起等它返回。
@@ -361,15 +371,9 @@ class WsRunner:
             async def approver(req):
                 args = req.arguments
                 if ph_id:
-                    wait_post = {
-                        "zh_cn": {
-                            "title": "",
-                            "content": [
-                                [{"tag": "text", "text": "⏳ agent 提议了写操作，等待审批…"}]
-                            ],
-                        }
-                    }
-                    await self._client.update_post(ph_id, wait_post)
+                    await self._client.update_post(
+                        ph_id, _ph_post("⏳ agent 提议了写操作，等待审批…")
+                    )
                 command, target = _approval_display(req)
                 return await self._approvals.request(
                     chat_id,
@@ -387,7 +391,9 @@ class WsRunner:
         scope_id = self._session.register_inflight(key, scope)
         try:
             task = asyncio.ensure_future(
-                self._session.answer(key, question, approver=approver, images=images)
+                self._session.answer(
+                    key, question, approver=approver, images=images, on_start=on_start
+                )
             )
             scope.task = task
             result = await task

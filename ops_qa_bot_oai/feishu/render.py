@@ -76,12 +76,18 @@ def build_answer_post(
     return {"zh_cn": {"title": title, "content": paragraphs}}
 
 
-def placeholder_text(question: str, *, clarifying: bool = False) -> str:
-    """占位消息文案：收到即发，答完编辑替换。"""
+def placeholder_text(question: str, *, queued: bool = False) -> str:
+    """占位消息文案：收到即发，答完编辑替换。
+
+    queued=True 表示同用户前一条问题还没答完、本条在排队等锁，前缀用「🕒 排队中」
+    让用户分辨哪条占位真的在跑；拿到锁开始答题时 runner 会再刷一次成「🔍 翻文档中」
+    （见 SessionManager.answer 的 on_start 回调）。
+    """
     snippet = question.strip().replace("\n", " ")
     if len(snippet) > 24:
         snippet = snippet[:24] + "…"
-    return f"🔍 翻文档中：'{snippet}'"
+    icon = "🕒 排队中" if queued else "🔍 翻文档中"
+    return f"{icon}：'{snippet}'"
 
 
 # ---------------------------------------------------------------------------

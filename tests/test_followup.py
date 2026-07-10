@@ -314,14 +314,17 @@ class _RecordingSession:
     def __init__(self):
         self.questions: list[str] = []
 
-    # 在途登记表桩（/cancel 用，本测试不取消）
+    # 在途登记表/排队桩（/cancel、排队占位用，本测试不涉及）
+    def queued(self, key):
+        return False
+
     def register_inflight(self, key, scope):
         return "sid"
 
     def unregister_inflight(self, key, scope_id):
         pass
 
-    async def answer(self, key, question, approver=None, images=None):
+    async def answer(self, key, question, approver=None, images=None, on_start=None):
         self.questions.append(question)
         return SimpleNamespace(
             text="跟进结论",
