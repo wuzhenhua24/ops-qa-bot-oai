@@ -529,7 +529,9 @@ uv run python run_ws.py                # 群里 @机器人 提问即可
 
 **飞书开放平台配置**（企业自建应用）：事件订阅方式选「长连接」（不填 Request URL）；订阅 `im.message.receive_v1`；开 `im:message`（收发/更新消息）、`im:message.group_at_msg`（群 @ 消息）、`im:message:send_as_bot`、`im:resource`（下载消息里的图片）权限；发版审批通过后把机器人加进群。
 
-**核心问答闭环**（当前范围）：群里 @机器人 → 立即发占位消息 → 跑 `OpsQABot.answer()` → 把占位**编辑**成最终答案（头部 @ 提问者；命中 `<<ESCALATE>>` 时末尾 @ 负责人）。会话按 `(chat_id, user_id)` 隔离、`/reset` 开新会话、`/tasks` 管理定时跟进、不支持的消息类型（file/sticker/audio…）回友好提示。实现见 `ops_qa_bot_oai/feishu/`，渲染纯逻辑（问题清洗 / 升级 open_id 解析 / @ 段拼装）已单测；真机运行需你的飞书凭证。
+**核心问答闭环**（当前范围）：群里 @机器人 → 立即发占位消息 → 跑 `OpsQABot.answer()` → 把占位**编辑**成最终答案（头部 @ 提问者；命中 `<<ESCALATE>>` 时末尾 @ 负责人）。会话按 `(chat_id, user_id)` 隔离、`/reset` 开新会话、`/tasks` 管理定时跟进、`/cancel`（或「取消」）停掉自己在途的提问、不支持的消息类型（file/sticker/audio…）回友好提示。实现见 `ops_qa_bot_oai/feishu/`，渲染纯逻辑（问题清洗 / 升级 open_id 解析 / @ 段拼装）已单测；真机运行需你的飞书凭证。
+
+**取消在途提问（`/cancel` 或「取消」）**：发错问题不用干等答完。整条答题调用（排队等锁 / 流式答题 / 审批挂起）跑在一个可取消的 asyncio task 里，`/cancel` 按 `(chat, user)` 找到自己全部在途提问并 cancel——排队中的直接放弃（零 token），运行中的经 `bot.ask()` 的收尾调 SDK `RunResultStreaming.cancel()` 停掉后台 run（不再烧 token），审批挂起中的顺带把待批卡片作废。对应占位消息收尾成"已取消"，半截答案丢弃；按人隔离，取消不掉别人的提问。回归测试见 `tests/test_cancel_question.py`。
 
 **贴图提问（视觉路径，对齐 ops-qa-bot）**：除纯文字外还支持两种带图形态——单发一张**截图**（image 消息），以及"@bot + 文字 + 截图"的**富文本**（post 消息，移动端多图常打成这种，最多取 5 张）。图片经 `im:resource` API 下载、magic bytes 嗅探出 media type 后，作为 Responses API 的 `input_image` 块（data URI base64）随问题进入模型（`bot.build_user_input`），引导语是"先识别图中关键信息（报错 / 命令 / 指标 / 配置），再按线索查文档"；只发图无文字时用默认引导问题。下载失败 / 超过 5MB / 内容为空回友好提示不进答题；post 里单张图失败只丢那一张。**要求底层模型支持视觉**（GPT-4o/GPT-5 系列原生支持；OpenAI 兼容 provider 需确认视觉能力）。入站解析纯逻辑在 `feishu/inbound.py`，与 runner 分发一起单测（`tests/test_feishu_image.py`）。
 

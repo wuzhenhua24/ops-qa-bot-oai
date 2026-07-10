@@ -7,7 +7,8 @@
   （头部 @ 提问者；命中 <<ESCALATE>> 时末尾 @ 负责人）
 
 会话按 (chat,user) 隔离（SessionManager），/reset 开新会话；/tasks 列出自己挂起的
-定时跟进（带取消按钮，OPS_QA_FOLLOWUP=1 时）。
+定时跟进（带取消按钮，OPS_QA_FOLLOWUP=1 时）；/cancel（或「取消」）停掉自己正在
+处理/排队中的提问——发错问题不用干等答完，也不白烧 token。
 这是"核心问答闭环"范围——反馈卡 / 追问卡 / 归档暂不做（产品壳层，不影响 SDK 对比）。
 
 支持三种可答题的消息形态（对齐 ops-qa-bot 的视觉路径）：
@@ -62,6 +63,7 @@ from .inbound import (
     parse_post_text,
 )
 from .render import (
+    CANCEL_WORDS,
     RESET_WORDS,
     TASKS_WORDS,
     build_answer_post,
@@ -71,7 +73,7 @@ from .render import (
     parse_followup_cancel_value,
     placeholder_text,
 )
-from .session import SessionManager
+from .session import InflightScope, SessionManager
 
 logger = logging.getLogger("ops_qa_bot_oai.feishu")
 
@@ -301,6 +303,19 @@ class WsRunner:
             await self._send_tasks_list(chat_id, sender_id, msg_id)
             return
 
+        # 取消在途提问：停掉自己全部处理中/排队中的答题（发错问题不用干等、不白烧
+        # token）。各条问题的占位由它们自己的 _answer_flow 收尾成"已取消"，这里只回
+        # 执行结果。按 (chat, user) 隔离，取消不掉别人的提问。
+        if not images and question.lower() in CANCEL_WORDS:
+            n = self._session.cancel_inflight(key)
+            if n == 0:
+                reply = "当前没有正在处理中的问题，无需取消。"
+            else:
+                reply = f"🛑 已请求取消你 {n} 条处理中/排队中的问题，对应消息会标记为已取消。"
+            logger.info("cancel inflight: chat=%s user=%s n=%d", chat_id, sender_id, n)
+            await self._client.send_text(chat_id, reply, parent_id=msg_id)
+            return
+
         await self._answer_flow(
             chat_id, sender_id, question, images=images or None, parent_id=msg_id
         )
@@ -365,8 +380,34 @@ class WsRunner:
                     parent_id=msg_id,
                 )
 
+        # 在途登记：/cancel 据此找到这条提问并 cancel 掉答题 task。整条 answer()
+        # （排队等锁 / 流式答题 / 审批挂起）都在这个内层 task 里，一种机制覆盖全部
+        # 状态；register 与 scope.task 赋值之间无 await，不会被 /cancel 插进来。
+        scope = InflightScope()
+        scope_id = self._session.register_inflight(key, scope)
         try:
-            result = await self._session.answer(key, question, approver=approver, images=images)
+            task = asyncio.ensure_future(
+                self._session.answer(key, question, approver=approver, images=images)
+            )
+            scope.task = task
+            result = await task
+        except asyncio.CancelledError:
+            # 只吞 /cancel 主动取消（scope.cancelled 已翻）；停机等外部取消照常传播。
+            # 注意被取消的是内层 task，当前协程自身并未被 cancel，吞掉是安全的。
+            if not scope.cancelled:
+                task.cancel()  # 被取消的是外层（如停机）：别把答题 task 留成孤儿
+                raise
+            cancel_post = build_answer_post(
+                "❌ 已取消这条问题。要重新提问直接发新消息即可。", asker_id=sender_id
+            )
+            await self._deliver(chat_id, ph_id, cancel_post, parent_id=msg_id)
+            logger.info(
+                "question cancelled by user: chat=%s user=%s q=%r",
+                chat_id,
+                sender_id,
+                question[:80],
+            )
+            return
         except Exception:
             # answer() 内部只兜了 max_turns / 护栏，其余异常（provider 5xx、鉴权失败、
             # 超时、网络抖动、ModelBehaviorError…）会抛到这里。不接住的话占位消息会永远
@@ -378,6 +419,8 @@ class WsRunner:
             err_post = build_answer_post(_ERROR_TEXT, asker_id=sender_id)
             await self._deliver(chat_id, ph_id, err_post, parent_id=msg_id)
             return
+        finally:
+            self._session.unregister_inflight(key, scope_id)
         esc = escalate_open_id(result.markers.escalate)
         final_post = build_answer_post(result.text, asker_id=sender_id, escalate_to=esc)
         # 审批轨迹（仅 GuardedAnswer 有这些字段）：黑名单自动驳回 / 人工拍板结果。

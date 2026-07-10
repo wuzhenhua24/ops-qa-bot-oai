@@ -13,6 +13,8 @@ from typing import Any
 RESET_WORDS = {"/reset", "/new", "新对话", "重置"}
 # 跟进任务管理指令：列出自己挂起的定时跟进（带取消按钮）。匹配前先 lower。
 TASKS_WORDS = {"/tasks", "跟进任务"}
+# 取消在途提问：停掉自己正在处理/排队中的提问（发错了不用干等）。匹配前先 lower。
+CANCEL_WORDS = {"/cancel", "取消"}
 
 
 def clean_question(raw_text: str, mention_keys: list[str]) -> str:

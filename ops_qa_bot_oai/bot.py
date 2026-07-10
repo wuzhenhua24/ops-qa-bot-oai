@@ -796,6 +796,12 @@ class OpsQABot:
             # 历史落盘由 session 负责：已完成的 turns 在流式过程中逐轮持久化，撞上限
             # 也保留已产出的部分上下文（与 ops-qa-bot 保留上下文的做法一致）。
             subtype = "error_max_turns"
+        finally:
+            # run_streamed 的 run 在 SDK 内部的后台 task 里跑，消费方被取消/提前
+            # 关闭（如 /cancel 取消在途提问）时它不会自动停——不停掉会白烧 token。
+            # 正常收尾 is_complete=True，cancel 是 no-op。
+            if not result.is_complete:
+                result.cancel()
 
         yield {
             "type": "done",

@@ -112,6 +112,12 @@ class ApprovalCenter:
             )
             logger.warning("审批超时自动驳回：%s", command)
             return False
+        except asyncio.CancelledError:
+            # 提问被 /cancel（答题 task 整体取消）：把待批卡片收尾成"作废"，
+            # 别在群里留一张永远等不到结果的卡。收尾后照常传播取消。
+            await self._finish_card(pend, approved=False, note="❌ 提问已被取消，该审批作废。")
+            logger.info("审批随提问取消而作废：%s", command)
+            raise
         finally:
             self._pending.pop(aid, None)
         await self._finish_card(pend, approved=approved)

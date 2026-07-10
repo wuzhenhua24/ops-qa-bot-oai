@@ -1397,6 +1397,13 @@ async def test_runner_answer_error_edits_placeholder_to_error():
     class FailingSession:
         guardrails = False
 
+        # 在途登记表桩（/cancel 用，本测试不取消）
+        def register_inflight(self, key, scope):
+            return "sid"
+
+        def unregister_inflight(self, key, scope_id):
+            pass
+
         async def answer(self, key, question, approver=None, images=None):
             raise RuntimeError("provider 500 / 超时（模拟）")
 
@@ -1415,6 +1422,13 @@ async def test_runner_answer_ok_edits_placeholder_to_answer():
 
     class OkSession:
         guardrails = False
+
+        # 在途登记表桩（/cancel 用，本测试不取消）
+        def register_inflight(self, key, scope):
+            return "sid"
+
+        def unregister_inflight(self, key, scope_id):
+            pass
 
         async def answer(self, key, question, approver=None, images=None):
             return SimpleNamespace(

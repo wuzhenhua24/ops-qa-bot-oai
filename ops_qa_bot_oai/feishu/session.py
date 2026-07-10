@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,21 @@ from ..bot import OpsQABot
 from ..model import ModelChoice, env_flag, resolve_mode, resolve_model, resolve_session_db
 
 SessionKey = tuple[str, str]  # (chat_id, user_id)
+
+
+@dataclass
+class InflightScope:
+    """一条在途提问的取消句柄，挂在 SessionManager 的 inflight 登记表里。
+
+    `task` 是整条 `SessionManager.answer()` 调用的包装 task——排队等锁、流式答题、
+    审批挂起都在同一个 task 里，`task.cancel()` 一种机制覆盖全部状态（排队中的
+    在锁上被打断，零 token；运行中的由 `bot.ask()` 的 finally 顺带停掉 SDK 后台
+    run，见 bot.py）。`cancelled` 供 runner 区分「/cancel 主动取消」和「进程停机
+    等外部取消」：前者把占位收尾成"已取消"，后者照常传播。
+    """
+
+    cancelled: bool = False
+    task: asyncio.Task | None = None
 
 
 class _Entry:
@@ -73,6 +90,10 @@ class SessionManager:
         self._entries: dict[SessionKey, _Entry] = {}
         self._guard = asyncio.Lock()  # 保护 _entries 结构
         self._sweeper: asyncio.Task | None = None
+        # 在途提问登记表：(chat, user) → {scope_id: InflightScope}。/cancel 据此
+        # 找到该用户正在处理/排队中的答题 task 并 cancel。纯内存、同 loop 同步
+        # 读写（register/cancel 之间无 await），随问题结束即清，无需加锁。
+        self._inflight: dict[SessionKey, dict[str, InflightScope]] = {}
 
     @property
     def model_choice(self) -> ModelChoice:
@@ -117,6 +138,35 @@ class SessionManager:
                 result = await entry.bot.answer(question, images=images)
             entry.last_used = time.time()
             return result
+
+    def register_inflight(self, key: SessionKey, scope: InflightScope) -> str:
+        """登记一条在途提问，返回 scope_id（注销时用）。"""
+        scope_id = uuid.uuid4().hex[:8]
+        self._inflight.setdefault(key, {})[scope_id] = scope
+        return scope_id
+
+    def unregister_inflight(self, key: SessionKey, scope_id: str) -> None:
+        scopes = self._inflight.get(key)
+        if scopes is None:
+            return
+        scopes.pop(scope_id, None)
+        if not scopes:
+            self._inflight.pop(key, None)
+
+    def cancel_inflight(self, key: SessionKey) -> int:
+        """取消该 (chat, user) 全部在途提问，返回请求取消的条数。
+
+        翻 `cancelled` 标记 + cancel 各自的答题 task。已经答完只是还没注销的
+        task，cancel 是 no-op——答案照常送达，不误伤。
+        """
+        scopes = self._inflight.get(key)
+        if not scopes:
+            return 0
+        for scope in scopes.values():
+            scope.cancelled = True
+            if scope.task is not None:
+                scope.task.cancel()
+        return len(scopes)
 
     async def reset(self, key: SessionKey) -> bool:
         """清空该会话上下文。
