@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from pathlib import Path
 
 from lark_oapi.channel import FeishuChannel
@@ -51,6 +52,14 @@ from ..model import MODE_LABELS
 from ..review import ReviewConfig
 from .approvals import ApprovalCenter
 from .archive import ArchiveStore, handle_archive_submit, safe_component_dir
+from .feedback import (
+    excerpt,
+    handle_feedback_click,
+    handle_feedback_reason_skip,
+    handle_feedback_reason_submit,
+    log_event,
+    setup_feedback_logger,
+)
 from .followup import (
     FOLLOWUP_QUESTION_PREFIX,
     FollowupRecord,
@@ -71,12 +80,15 @@ from .render import (
     TASKS_WORDS,
     build_answer_post,
     build_archive_form_card,
+    build_feedback_card,
     build_followup_tasks_card,
     clean_question,
     escalate_dir,
     escalate_open_id,
     extract_form_value,
     parse_archive_submit_value,
+    parse_feedback_reason_value,
+    parse_feedback_value,
     parse_followup_cancel_value,
     placeholder_text,
 )
@@ -234,6 +246,12 @@ class WsRunner:
         # 问答归档：升级到负责人的问题挂一张表单卡，负责人答完写进
         # docs/<组件>/qa-archive.md 并推给提问者（闭环见 feishu/archive.py）。
         self._archives = ArchiveStore()
+        # 反馈事件日志（qa / feedback / archive / cancelled…，JSON lines）：
+        # 反馈卡和 feedback_stats 报表都建在它上面。路径可用 OPS_QA_FEEDBACK_LOG 覆盖。
+        fb_path = setup_feedback_logger()
+        logger.info(
+            "反馈事件日志：%s（报表：uv run python -m ops_qa_bot_oai.feedback_stats）", fb_path
+        )
         logger.info(
             "答题模式：%s（模型 %s）",
             MODE_LABELS.get(self._session.mode, self._session.mode),
@@ -352,6 +370,8 @@ class WsRunner:
         """
         key = (chat_id, sender_id)
         msg_id = parent_id
+        # qid 贯穿一轮问答：qa 事件、反馈卡、被踩原因都用它关联（报表回填原题）。
+        qid = uuid.uuid4().hex[:12]
         logger.info(
             "Q chat=%s user=%s images=%d q=%r",
             chat_id,
@@ -425,6 +445,13 @@ class WsRunner:
                 "❌ 已取消这条问题。要重新提问直接发新消息即可。", asker_id=sender_id
             )
             await self._deliver(chat_id, ph_id, cancel_post, parent_id=msg_id)
+            log_event(
+                "cancelled",
+                qid=qid,
+                chat_id=chat_id,
+                user_id=sender_id,
+                question=excerpt(question, 200),
+            )
             logger.info(
                 "question cancelled by user: chat=%s user=%s q=%r",
                 chat_id,
@@ -439,6 +466,13 @@ class WsRunner:
             # 用 Exception（非 BaseException）：不吞 asyncio.CancelledError，优雅停机不受影响。
             logger.exception(
                 "answer failed chat=%s user=%s q=%r", chat_id, sender_id, question[:80]
+            )
+            log_event(
+                "qa_error",
+                qid=qid,
+                chat_id=chat_id,
+                user_id=sender_id,
+                question=excerpt(question, 200),
             )
             err_post = build_answer_post(_ERROR_TEXT, asker_id=sender_id)
             await self._deliver(chat_id, ph_id, err_post, parent_id=msg_id)
@@ -476,6 +510,42 @@ class WsRunner:
             )
 
         await self._deliver(chat_id, ph_id, final_post, parent_id=msg_id)
+
+        clarify = bool(getattr(result.markers, "clarify", False))
+        # qa 事件：一轮问答的完整快照。比参考项目多记 route / agent_usage / 复核
+        # 元信息 / 缓存 token——报表据此能看路由分布、按 agent 成本拆分、复核触发率。
+        log_event(
+            "qa",
+            qid=qid,
+            chat_id=chat_id,
+            user_id=sender_id,
+            question=excerpt(question),
+            answer_excerpt=excerpt(result.text),
+            subtype=result.subtype,
+            escalated_to=esc,
+            clarification=True if clarify else None,
+            images_attached=len(images) if images else None,
+            session_expired=True if session_expired else None,
+            route=getattr(result, "route", None),
+            num_turns=result.num_turns,
+            usage=result.usage,
+            agent_usage=getattr(result, "agent_usage", None),
+            reviewed=True if getattr(result, "reviewed", False) else None,
+            revised=True if getattr(result, "revised", False) else None,
+            needs_human_review=True if getattr(result, "needs_human_review", False) else None,
+            approvals=len(getattr(result, "approvals", None) or []) or None,
+            blacklist_rejections=len(getattr(result, "blacklist_rejections", None) or []) or None,
+        )
+
+        # 反馈卡：每轮答完随答案发 👍/👎（asker-only 校验在回调侧）。反问轮跳过——
+        # 让用户专注答反问，别对半截流程打分。发卡失败不影响答案交付。
+        if not clarify:
+            try:
+                await self._client.send_card(
+                    chat_id, build_feedback_card(qid, sender_id), parent_id=msg_id
+                )
+            except Exception:
+                logger.exception("send feedback card failed: chat=%s", chat_id)
 
         # 问答归档：实际 @ 了负责人时（<<ESCALATE:ou_xxx:dir>>，非 none）再发一张
         # 归档表单卡——负责人答完提交，答案写进 docs/<组件>/qa-archive.md 并推给
@@ -635,16 +705,53 @@ class WsRunner:
         await self._client.send_card(chat_id, card, parent_id=msg_id)
 
     async def _on_card_action(self, event) -> None:
-        """cardAction 统一入口：跟进取消 → 归档提交 → 写审批中心，依次尝试。
+        """cardAction 统一入口：跟进取消 → 归档提交 → 反馈 → 写审批中心，依次尝试。
 
-        各家按自己的按钮 value 结构识别（fua/… vs aq vs aid/decision），认不出
-        即交给下一家，互不干扰。
+        各家按自己的按钮 value 结构识别（fua vs aq vs fb/fbr vs aid/decision），
+        认不出即交给下一家，互不干扰。
         """
         if await self._handle_followup_cancel(event):
             return
         if await self._handle_archive_submit(event):
             return
+        if await self._handle_feedback(event):
+            return
         await self._approvals.on_card_action(event)
+
+    async def _handle_feedback(self, event) -> bool:
+        """反馈卡回调：👍/👎 点击（fb）与原因表单提交/跳过（fbr）；认不出返回 False。
+
+        asker-only 校验、白名单过滤、事件落日志都在 feedback 模块；这里只做飞书
+        I/O——用返回的卡片原地替换（👎 换原因表单、提交/跳过换 ack、非提问者点击
+        换回原卡保持可用）。
+        """
+        value = getattr(getattr(event, "action", None), "value", None)
+        clicker = getattr(getattr(event, "operator", None), "open_id", "") or ""
+        msg_id = getattr(event, "message_id", None)
+
+        parsed = parse_feedback_value(value)
+        if parsed is not None:
+            qid, rating, asker = parsed
+            card = handle_feedback_click(qid, rating, clicker, asker)
+        else:
+            parsed_r = parse_feedback_reason_value(value)
+            if parsed_r is None:
+                return False
+            qid, kind, asker = parsed_r
+            if kind == "skip":
+                card = handle_feedback_reason_skip(qid, clicker, asker)
+            else:
+                form = extract_form_value(getattr(event, "raw", None))
+                raw_reasons = form.get("reasons")
+                # multi_select 正常回传 list[str]；防御性兼容单字符串（SDK 抖动/回放）。
+                if isinstance(raw_reasons, str):
+                    raw_reasons = [raw_reasons]
+                reasons = [r for r in raw_reasons or [] if isinstance(r, str)]
+                comment = str(form.get("comment") or "") or None
+                card = handle_feedback_reason_submit(qid, reasons, comment, clicker, asker)
+        if msg_id:
+            await self._client.update_card(msg_id, card)
+        return True
 
     async def _send_archive_form(
         self, chat_id: str, asker_id: str, question: str, result, owner_id: str, parent_id

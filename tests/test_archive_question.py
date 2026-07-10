@@ -419,10 +419,9 @@ async def test_runner_end_to_end_archive_loop(tmp_path):
     r = _runner(tmp_path)
     await r._handle(_text_inbound("我们生产那套 redis7 想迁到新机房 咋整啊"))
 
-    # 升级答案已交付（@ 负责人），随后发了归档表单卡
+    # 升级答案已交付（@ 负责人），随后发了归档表单卡（答完还有一张反馈卡，取最后一张）
     assert "已请" in _flat(r._client.updated_posts[-1][1])
-    assert len(r._client.sent_cards) == 1
-    form_flat = _flat(r._client.sent_cards[0][1])
+    form_flat = _flat(r._client.sent_cards[-1][1])
     assert "问答归档" in form_flat and "Redis 集群跨机房迁移步骤" in form_flat
     assert r._archives.pending_count() == 1
     qid = next(iter(r._archives._pending))

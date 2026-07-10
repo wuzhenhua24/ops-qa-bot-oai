@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .feedback import log_event
 from .render import build_archive_ack_card, build_archive_form_card, build_archive_notify_post
 
 logger = logging.getLogger("ops_qa_bot_oai.feishu.archive")
@@ -254,6 +255,19 @@ async def handle_archive_submit(
     # 完成（写入或幂等命中）：从 pending 清掉，避免重复处理。
     store.pop(qid)
     logger.info("archived: qid=%s path=%s wrote=%s", qid, rec.archive_path_repr, wrote)
+    # 事件落 feedback.log：had_draft = 表单预填用的是 ARCHIVE_Q 草稿（非用户原话）；
+    # question_edited = 负责人改过标题。两者是"LLM 标题质量"的观察抓手——草稿率高
+    # 且改动率低说明 ARCHIVE_Q 契约在起作用。
+    log_event(
+        "archive",
+        qid=qid,
+        chat_id=rec.chat_id,
+        path=rec.archive_path_repr,
+        owner_id=rec.owner_id,
+        duplicate=True if not wrote else None,
+        had_draft=True if rec.question_default != rec.question else None,
+        question_edited=(True if question_text != " ".join(rec.question_default.split()) else None),
+    )
 
     # 仅在真写入时通知 asker——幂等命中说明同 qid 已存档过、asker 多半也通知过了。
     notify: NotifyTask | None = None

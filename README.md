@@ -554,7 +554,9 @@ uv run python run_ws.py                # 群里 @机器人 提问即可
 
 **问答归档（升级 → 负责人答复 → 沉淀进文档）**：bot 答不出而升级时（`<<ESCALATE:ou_xxx:dir>>` @ 负责人），LLM 会随附一行 `<<ARCHIVE_Q:归一化问题标题>>`，系统在升级答案后再发一张**归档表单卡**（可编辑的问题标题框预填该标题 + 多行答案框）。负责人答完提交（owner-only：别人误点会重建表单不顶掉），答案 append-only 写入 `docs/<组件>/qa-archive.md`（每文件锁 + qid 幂等防重复提交），并在原群 **@ 提问者**把答案推回去（闭环交付）。点睛之处：`qa-archive.md` 就在组件文档目录里，bot 的检索天然能命中——**负责人答一次，bot 就学会了**，下次同样的问题直接答、不再升级。目录名来自 LLM 输出，落盘前过白名单校验（防路径穿越，不合法落根目录 `qa-archive.md`）；表单 24h 没人填自动过期（纯内存，重启即丢）。实现见 `feishu/archive.py` + `feishu/render.py`，回归测试 `tests/test_archive_question.py`。
 
-> 当前是核心问答闭环 + 写操作审批闭环 + 问答归档闭环；反馈卡 / 追问卡等产品壳层尚未做，按新场景需要再扩展。
+**使用者反馈收集 + 统计报表**：每轮答完随答案发「👍 有帮助 / 👎 待改进」反馈卡（asker-only，别人点击被拒不污染数据；反问轮跳过）；点 👎 原地换成**原因表单**（白名单多选：文档过时 / 步骤不完整 / 事实错误 / 啰嗦没重点 / 其他 + 可选备注 + 提交/跳过，提交值过白名单防注入）。底座是**结构化事件日志**（`logs/feedback.log`，JSON lines，路径可用 `OPS_QA_FEEDBACK_LOG` 覆盖）：每轮 `qa` 事件除问答摘要 / 升级 / 反问 / token 用量外，还记参考项目没有的维度——**路由落点**（route）、**按 agent 用量**（多模型路由的成本拆分）、**二次复核元信息**（触发/重答/需人工）、**缓存命中 token**；`/cancel`、答题出错、归档提交也各落事件。离线报表一条命令：`uv run python -m ops_qa_bot_oai.feedback_stats --days 7`——满意率、被踩问题清单（回填原题+原因）、升级率、路由分布、复核率、按 agent 成本拆分、缓存命中率、按日问答量；传 `--price-input/--price-output`（$/1M tokens）才追加美元估算。实现见 `feishu/feedback.py` + `feedback_stats.py`，回归测试 `tests/test_feedback.py` + `tests/test_feedback_stats.py`。
+
+> 当前是核心问答闭环 + 写操作审批闭环 + 问答归档闭环 + 反馈收集与统计；追问卡等产品壳层尚未做，按新场景需要再扩展。
 
 **答题模式**：飞书没有命令行开关，默认 `auto`（自适应分诊，见上「答题模式」）。要固定成别的模式，在 `.env` 里设 `OPS_QA_MODE=single|multi|coordinator` 即可；启动日志会回显当前模式（`答题模式：自适应分诊（单专家 / 跨组件协调）（模型 …）`）。
 
@@ -568,6 +570,6 @@ uv run ruff format .     # 格式化
 
 ## 范围说明
 
-当前已落地：文档问答核心主线 + 七项能力（结构化契约 / 多模型路由 / 多 agent 编排 / 护栏+审批 / 评测台 / 实时诊断 / 二次复核）+ 飞书长连接核心问答闭环 + 飞书写操作审批闭环（HITL 卡片）+ 问答归档闭环。这些都建立在 OpenAI Agents SDK 的自由度之上（Session 会话记忆、lifecycle hooks 遥测、按角色 ModelSettings、tool-level guardrails 分层、handoff input_filter），作为承接新场景的基座。尚未做（按新场景需要再扩展）：飞书反馈卡 / 追问卡。
+当前已落地：文档问答核心主线 + 七项能力（结构化契约 / 多模型路由 / 多 agent 编排 / 护栏+审批 / 评测台 / 实时诊断 / 二次复核）+ 飞书长连接核心问答闭环 + 飞书写操作审批闭环（HITL 卡片）+ 问答归档闭环 + 反馈收集与统计报表。这些都建立在 OpenAI Agents SDK 的自由度之上（Session 会话记忆、lifecycle hooks 遥测、按角色 ModelSettings、tool-level guardrails 分层、handoff input_filter），作为承接新场景的基座。尚未做（按新场景需要再扩展）：飞书追问卡。
 
 > 后续方向：本项目不再以"对比 ops-qa-bot"为目标——两者是互补方案（Claude SDK 上手快、OpenAI SDK 自由度大）。重心转向**承接原项目够不着的场景与全新场景**，例如非 markdown / 向量检索的大规模知识库、跨组件协作型复杂任务、结构化数据对外接入自动化流程等。

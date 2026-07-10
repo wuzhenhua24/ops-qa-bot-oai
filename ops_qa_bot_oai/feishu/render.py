@@ -436,3 +436,154 @@ def extract_form_value(raw: Any) -> dict:
         return raw["event"]["action"].get("form_value") or {}
     except (KeyError, TypeError, AttributeError):
         return {}
+
+
+# ---------------------------------------------------------------------------
+# 使用者反馈：答完随答案发 👍/👎 卡；👎 换成原因表单
+# ---------------------------------------------------------------------------
+
+# 👎 原因白名单（value → 展示标签）。表单选项和提交过滤共用这一份（过滤在
+# feedback.handle_feedback_reason_submit）。放本模块避免 feedback ↔ render 循环导入。
+FEEDBACK_REASONS: dict[str, str] = {
+    "outdated": "文档过时",
+    "incomplete": "步骤不完整",
+    "incorrect": "事实错误",
+    "verbose": "答案啰嗦 / 没重点",
+    "other": "其他",
+}
+
+
+def _feedback_btn(label: str, btn_type: str, value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": label},
+        "type": btn_type,
+        "behaviors": [{"type": "callback", "value": value}],
+    }
+
+
+def build_feedback_card(qid: str, asker_id: str | None) -> dict[str, Any]:
+    """答完随答案发的反馈卡：纯 👍/👎 两颗按钮（card v2）。
+
+    用 v2 schema：👎 后要替换成带 form 的原因表单（form 是 v2 才有），原卡和
+    替换卡 schema 不一致飞书渲染会失败。v2 没有 `tag:action` 容器，按钮放进
+    column_set 并排。按钮 value 键 `fb`（与审批 aid / 归档 aq / 跟进 fua 区分），
+    asker_id 随 value 带回做 asker-only 校验，不依赖服务端状态。纯函数，可单测。
+    """
+    common = {"fb": qid, "asker": asker_id or ""}
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "body": {
+            "elements": [
+                {
+                    "tag": "column_set",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "auto",
+                            "elements": [
+                                _feedback_btn("👍 有帮助", "primary", {**common, "rating": "up"})
+                            ],
+                        },
+                        {
+                            "tag": "column",
+                            "width": "auto",
+                            "elements": [
+                                _feedback_btn("👎 待改进", "default", {**common, "rating": "down"})
+                            ],
+                        },
+                    ],
+                }
+            ]
+        },
+    }
+
+
+def build_feedback_reason_card(qid: str, asker_id: str | None) -> dict[str, Any]:
+    """👎 后替换原卡的原因收集表单（card v2 form）。
+
+    multi_select_static 多选原因 + 多行 input 备注（可选）+ 提交按钮；「跳过」放
+    form 外（form 内非 submit 按钮行为不明确）。提交回调 value 键 `fbr` +
+    kind=submit/skip，字段值从事件的 form_value 里取（见 extract_form_value）。
+    """
+    options = [
+        {"text": {"tag": "plain_text", "content": label}, "value": value}
+        for value, label in FEEDBACK_REASONS.items()
+    ]
+    common = {"fbr": qid, "asker": asker_id or ""}
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "想了解一下这次回答哪里需要改进，方便我们补文档 / 调优：",
+                },
+                {
+                    "tag": "form",
+                    "name": "fb_reason",
+                    "elements": [
+                        {
+                            "tag": "multi_select_static",
+                            "name": "reasons",
+                            "placeholder": {"tag": "plain_text", "content": "选择原因（可多选）…"},
+                            "options": options,
+                        },
+                        {
+                            "tag": "input",
+                            "name": "comment",
+                            "input_type": "multiline_text",
+                            "rows": 2,
+                            "max_length": 500,
+                            "placeholder": {"tag": "plain_text", "content": "补充说明（可选）…"},
+                            "required": False,
+                        },
+                        {
+                            "tag": "button",
+                            "name": "fb_submit",
+                            "text": {"tag": "plain_text", "content": "提交"},
+                            "type": "primary",
+                            "form_action_type": "submit",
+                            "behaviors": [
+                                {"type": "callback", "value": {**common, "kind": "submit"}}
+                            ],
+                        },
+                    ],
+                },
+                _feedback_btn("跳过", "default", {**common, "kind": "skip"}),
+            ]
+        },
+    }
+
+
+def build_feedback_ack_card(rating: str) -> dict[str, Any]:
+    """点击/提交后的最终 ack 卡（按钮移除，防重复点击）。"""
+    msg = "🙏 收到，感谢反馈！" if rating == "up" else "🙏 已记录，我们会据此补文档 / 调优。"
+    return {
+        "schema": "2.0",
+        "body": {"elements": [{"tag": "markdown", "content": msg}]},
+    }
+
+
+def parse_feedback_value(value: Any) -> tuple[str, str, str | None] | None:
+    """从按钮 value 解析 (qid, rating, asker_id)；不是反馈按钮返回 None。"""
+    value = _card_value_dict(value)
+    if value is None:
+        return None
+    qid, rating = value.get("fb"), value.get("rating")
+    if not qid or rating not in ("up", "down"):
+        return None
+    return str(qid), str(rating), str(value.get("asker") or "") or None
+
+
+def parse_feedback_reason_value(value: Any) -> tuple[str, str, str | None] | None:
+    """从按钮 value 解析 (qid, kind, asker_id)，kind ∈ submit/skip；认不出返回 None。"""
+    value = _card_value_dict(value)
+    if value is None:
+        return None
+    qid, kind = value.get("fbr"), value.get("kind")
+    if not qid or kind not in ("submit", "skip"):
+        return None
+    return str(qid), str(kind), str(value.get("asker") or "") or None
