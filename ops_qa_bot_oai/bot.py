@@ -9,7 +9,7 @@
   `reset()` 清空开新会话。默认进程内 SQLiteSession；接入层可注入持久化 session
   （如飞书按 (chat,user) 一个 session_id + 落盘 db，重启不丢上下文）。
 - `max_turns`：单轮答题步数保险丝，撞上时 subtype 标 "error_max_turns"。
-- 解析 `<<ESCALATE>>`/`<<CLARIFY>>`/`<<FOLLOWUPS>>` 标记（与 ops-qa-bot markers 对齐）。
+- 解析 `<<ESCALATE>>`/`<<CLARIFY>>` 标记（与 ops-qa-bot markers 对齐）。
 
 与 Claude 版的结构差异：Claude SDK 用常驻 `ClaudeSDKClient` 子进程维护会话；这里用
 无状态的 `Runner` + SDK Session 实现多轮，更轻、也更贴近 OpenAI SDK 的惯用法。
@@ -120,15 +120,6 @@ _HUMAN_REJECTION_MSG = (
 
 _ESCALATE_RE = re.compile(r"<<ESCALATE:([^>]*)>>")
 _CLARIFY_RE = re.compile(r"<<CLARIFY>>")
-_FOLLOWUPS_RE = re.compile(r"<<FOLLOWUPS:([^>]*)>>")
-_VALID_FOLLOWUP_KEYS = {
-    "troubleshoot",
-    "risks",
-    "rollback",
-    "checklist",
-    "commands",
-    "related",
-}
 
 
 @dataclass(frozen=True)
@@ -152,7 +143,6 @@ class Markers:
 
     escalate: str | None = None  # ESCALATE 的负载，如 "ou_xxx:redis" 或 "none"
     clarify: bool = False
-    followups: list[str] = field(default_factory=list)
 
 
 def parse_markers(text: str) -> tuple[str, Markers]:
@@ -164,21 +154,9 @@ def parse_markers(text: str) -> tuple[str, Markers]:
         markers.escalate = m.group(1).strip()
     if _CLARIFY_RE.search(text):
         markers.clarify = True
-    fm = _FOLLOWUPS_RE.search(text)
-    if fm:
-        keys = [k.strip() for k in fm.group(1).split("|") if k.strip()]
-        # 白名单过滤 + 去重保序，最多 3 个（与参考项目一致）。
-        seen: set[str] = set()
-        for k in keys:
-            if k in _VALID_FOLLOWUP_KEYS and k not in seen:
-                seen.add(k)
-                markers.followups.append(k)
-            if len(markers.followups) >= 3:
-                break
 
     cleaned = _ESCALATE_RE.sub("", text)
     cleaned = _CLARIFY_RE.sub("", cleaned)
-    cleaned = _FOLLOWUPS_RE.sub("", cleaned)
     # 标记常独占一行，剥离后会留下多余空行，收一收。
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned, markers
@@ -242,7 +220,7 @@ class GuardedAnswer:
     """`OpsQABot.answer_guarded()` 的返回值：答案 + 审批记录 + 护栏拦截信息。"""
 
     text: str
-    # 从答案里解析出的标记（escalate/clarify/followups），接入层渲染用（如飞书 @负责人）。
+    # 从答案里解析出的标记（escalate/clarify），接入层渲染用（如飞书 @负责人）。
     markers: Markers = field(default_factory=Markers)
     # 本轮经过**人工**审批的请求及其结果（approved=True/False）。
     approvals: list[tuple[ApprovalRequest, bool]] = field(default_factory=list)

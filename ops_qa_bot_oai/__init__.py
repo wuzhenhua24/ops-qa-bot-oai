@@ -41,7 +41,7 @@ from .orchestration import (
     build_coordinator_agent,
     build_triage_agent,
 )
-from .schema import AnswerContract, Decision, Followup, validate_citations
+from .schema import AnswerContract, Decision, validate_citations
 
 __all__ = [
     "OpsQABot",
@@ -62,7 +62,6 @@ __all__ = [
     "resolve_model",
     "AnswerContract",
     "Decision",
-    "Followup",
     "validate_citations",
     "Component",
     "parse_index_components",

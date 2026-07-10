@@ -38,7 +38,7 @@ def _format_agent_usage(agent_usage: dict | None) -> str | None:
 
 
 def _print_structured(sa: StructuredAnswer) -> None:
-    """渲染结构化契约：决策 + 正文 + 来源（带真实性校验）+ 追问 + 置信度。"""
+    """渲染结构化契约：决策 + 正文 + 来源（带真实性校验）+ 置信度。"""
     c = sa.contract
     print(f"bot> [{c.decision.value}]")
     print(c.answer)
@@ -50,8 +50,6 @@ def _print_structured(sa: StructuredAnswer) -> None:
             print(f"  - {cite}  {mark}")
     if c.decision.value == "escalate" and c.escalate_to:
         print(f"\n升级给：{c.escalate_to}（组件目录：{c.escalate_dir or '?'}）")
-    if c.followups:
-        print("追问建议：" + "、".join(f.value for f in c.followups))
     print(f"置信度：{c.confidence:.2f}")
     if sa.invalid_citations:
         print(f"⚠️ 有 {len(sa.invalid_citations)} 条来源不指向真实文档，答案可能不可靠。")
@@ -293,8 +291,6 @@ async def run_once(
         notes.append("这是一轮反问（CLARIFY）")
     if result.markers.escalate:
         notes.append(f"已标记升级：{result.markers.escalate}")
-    if result.markers.followups:
-        notes.append("追问建议：" + "、".join(result.markers.followups))
     if notes:
         print("\n— " + "；".join(notes))
     if result.usage:

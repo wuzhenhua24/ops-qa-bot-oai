@@ -198,7 +198,7 @@ uv run python run.py --ask "接口偶发 502 根因？" --mode auto --structured
 - `decision`：`answer` / `clarify` / `escalate` / `reject`（取代旧的 `<<CLARIFY>>`/`<<ESCALATE>>`）
 - `answer`：中文 markdown 正文
 - `citations`：答案依据的文档路径列表 —— 拿到后**用代码逐条核对是否真实存在**（把"必须引用真实文档"从 prompt 自律升级成硬校验，编造/越界的来源会被标 ✗ 并告警）
-- `escalate_to` / `escalate_dir` / `followups` / `confidence`
+- `escalate_to` / `escalate_dir` / `confidence`
 
 用**非严格** schema 下发（`strict_json_schema=False`）放宽 OpenAI 的 strict 约束。第三方端点对 `json_schema` 的支持参差不齐，`FenceTolerantOutputSchema`（`schema.py`）做了容错解析尽量把契约救出来：
 
@@ -231,7 +231,7 @@ uv run python run.py --ask "Redis 内存告警怎么处理？" --mode multi
 
 实现见 `ops_qa_bot_oai/orchestration.py`（`build_triage_agent` / `build_auto_agent`）+ `index.py`（`parse_index_components`）。`local` 组件的专家挂文档检索工具，`feishu` 组件的专家只挂 `query_feishu_doc`（见上「飞书文档问答」）。
 
-**拆成独立 agent 的代价：输出契约要各发一份。** 每个 agent 只看得见自己的 instructions，single 模式那份 `SYSTEM_PROMPT_TEMPLATE` 里的 `<<CLARIFY>>` / `<<ESCALATE>>` / `<<FOLLOWUPS>>` 契约，专家和协调者是读不到的。漏发的后果很隐蔽——答案看着完全正常，只是标记从不出现：飞书接入靠 `<<ESCALATE:...>>` 来 @ 负责人，于是默认的 `auto` 模式下 **@负责人 永远不触发**；`evaluate` 的 decision 推断也永远落到 `answer`。所以 `_tail()` 会给每个专家/协调者补一份 `free_text_markers_section()`（结构化模式改发 `AnswerContract` 字段，两者互斥）。
+**拆成独立 agent 的代价：输出契约要各发一份。** 每个 agent 只看得见自己的 instructions，single 模式那份 `SYSTEM_PROMPT_TEMPLATE` 里的 `<<CLARIFY>>` / `<<ESCALATE>>` 契约，专家和协调者是读不到的。漏发的后果很隐蔽——答案看着完全正常，只是标记从不出现：飞书接入靠 `<<ESCALATE:...>>` 来 @ 负责人，于是默认的 `auto` 模式下 **@负责人 永远不触发**；`evaluate` 的 decision 推断也永远落到 `answer`。所以 `_tail()` 会给每个专家/协调者补一份 `free_text_markers_section()`（结构化模式改发 `AnswerContract` 字段，两者互斥）。
 
 顺带一个比 single 模式更稳的地方：专家在**构建期**就知道自己组件的 `open_id` 和目录，所以升级标记 `<<ESCALATE:ou_xxx:redis>>` 是算好了直接写进 instructions 让模型照抄的——不像 single 模式要模型自己去 `INDEX.md` 查表再填，少一步查表就少一个填错 `ou_` 的机会。协调者跨组件，才需要给它一张"组件 → 标记"的表让它挑，归属不明就 `<<ESCALATE:none>>`（不 @ 人好过 @ 错人）。
 

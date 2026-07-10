@@ -73,17 +73,6 @@ class Decision(str, Enum):
     reject = "reject"  # 运维范围外，友好拒绝
 
 
-class Followup(str, Enum):
-    """建议的快捷追问类型（对应旧 <<FOLLOWUPS:...>> 的白名单）。"""
-
-    troubleshoot = "troubleshoot"
-    risks = "risks"
-    rollback = "rollback"
-    checklist = "checklist"
-    commands = "commands"
-    related = "related"
-
-
 class AnswerContract(BaseModel):
     """一轮问答的结构化结果。模型必须按此 schema 产出。"""
 
@@ -103,9 +92,6 @@ class AnswerContract(BaseModel):
     escalate_dir: str = Field(
         default="",
         description="decision=escalate 时，该组件的目录名（如 'redis'，不带斜杠）；否则留空。",
-    )
-    followups: list[Followup] = Field(
-        default_factory=list, description="建议的快捷追问，最多 3 个；不需要时留空。"
     )
     confidence: float = Field(
         default=0.0, description="对本答案的可信度自评，0~1。文档命中充分则高，靠推断则低。"

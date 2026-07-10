@@ -4,7 +4,7 @@
 - _read_doc：正常读取 / 不存在 / 路径越界。
 - _glob_docs：命中 / 无匹配 / `..` 逃逸被挡。
 - _grep_docs：命中行格式 / 限定子目录 / 无命中 / 越界 / 非法正则。
-- parse_markers：ESCALATE / CLARIFY / FOLLOWUPS 解析 + 白名单过滤 + 文本剥离。
+- parse_markers：ESCALATE / CLARIFY 解析 + 文本剥离。
 
 跑法：
     uv run pytest
@@ -30,7 +30,7 @@ from ops_qa_bot_oai.evaluate import (
 )
 from ops_qa_bot_oai.model import normalize_openai_base_url
 from ops_qa_bot_oai.orchestration import parse_index_components
-from ops_qa_bot_oai.schema import AnswerContract, Decision, Followup, validate_citations
+from ops_qa_bot_oai.schema import AnswerContract, Decision, validate_citations
 from ops_qa_bot_oai.tools import _glob_docs, _grep_docs, _read_doc
 
 _INDEX = """# 索引
@@ -167,20 +167,10 @@ def test_parse_clarify():
     assert "<<CLARIFY>>" not in cleaned
 
 
-def test_parse_followups_whitelist_and_dedup():
-    text = "扩容步骤...\n\n<<FOLLOWUPS:rollback|risks|rollback|bogus|commands|related>>"
-    cleaned, m = parse_markers(text)
-    # 去重 + 白名单过滤 + 最多 3 个
-    assert m.followups == ["rollback", "risks", "commands"]
-    assert "bogus" not in m.followups
-    assert "<<FOLLOWUPS" not in cleaned
-
-
 def test_parse_no_markers():
     cleaned, m = parse_markers("普通答案，无标记。")
     assert m.escalate is None
     assert m.clarify is False
-    assert m.followups == []
     assert cleaned == "普通答案，无标记。"
 
 
@@ -655,12 +645,10 @@ def test_contract_parses_from_json():
             "decision": "answer",
             "answer": "先看 maxmemory。",
             "citations": ["redis/troubleshooting.md"],
-            "followups": ["troubleshoot", "commands"],
             "confidence": 0.8,
         }
     )
     assert c.decision is Decision.answer
-    assert c.followups == [Followup.troubleshoot, Followup.commands]
     assert c.escalate_to == ""  # 默认值
 
 
@@ -1482,7 +1470,6 @@ def test_specialist_prompt_carries_its_exact_escalate_marker():
     agent = build_specialist_agent(_component(), "gpt-5")
     assert "<<ESCALATE:ou_abc:redis>>" in agent.instructions
     assert "<<CLARIFY>>" in agent.instructions
-    assert "<<FOLLOWUPS:" in agent.instructions
 
 
 def test_specialist_prompt_does_not_invite_inline_open_id():
@@ -1532,9 +1519,8 @@ def test_triage_gets_clarify_only_not_escalate(tmp_path):
     )
     agent, _ = build_triage_agent(tmp_path, build_model_router())
     assert "<<CLARIFY>>" in agent.instructions
-    # 分诊台不答组件问题，给它升级/追问契约会诱导它抢专家的活
+    # 分诊台不答组件问题，给它升级契约会诱导它抢专家的活
     assert "<<ESCALATE" not in agent.instructions
-    assert "<<FOLLOWUPS" not in agent.instructions
 
 
 def test_marker_round_trip_producer_to_feishu_at_mention():
