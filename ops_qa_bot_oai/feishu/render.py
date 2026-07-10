@@ -11,6 +11,8 @@ from typing import Any
 
 # 会话重置关键词（与 CLI 对齐）。
 RESET_WORDS = {"/reset", "/new", "新对话", "重置"}
+# 跟进任务管理指令：列出自己挂起的定时跟进（带取消按钮）。匹配前先 lower。
+TASKS_WORDS = {"/tasks", "跟进任务"}
 
 
 def clean_question(raw_text: str, mention_keys: list[str]) -> str:
@@ -159,11 +161,8 @@ def build_approval_result_card(
     }
 
 
-def parse_card_action_value(value: Any) -> tuple[str, bool] | None:
-    """从 cardAction 的按钮 value 解析 (approval_id, 是否批准)；不是审批按钮返回 None。
-
-    飞书可能把 value 原样回传 dict，也可能是 JSON 字符串——两种都容。纯函数，可单测。
-    """
+def _card_value_dict(value: Any) -> dict | None:
+    """cardAction 按钮 value 归一成 dict：飞书可能原样回传 dict，也可能是 JSON 字符串。"""
     if isinstance(value, str):
         try:
             import json
@@ -171,10 +170,104 @@ def parse_card_action_value(value: Any) -> tuple[str, bool] | None:
             value = json.loads(value)
         except (ValueError, TypeError):
             return None
-    if not isinstance(value, dict):
+    return value if isinstance(value, dict) else None
+
+
+def parse_card_action_value(value: Any) -> tuple[str, bool] | None:
+    """从 cardAction 的按钮 value 解析 (approval_id, 是否批准)；不是审批按钮返回 None。"""
+    value = _card_value_dict(value)
+    if value is None:
         return None
     aid = value.get("aid")
     decision = value.get("decision")
     if not aid or decision not in ("approve", "reject"):
         return None
     return str(aid), decision == "approve"
+
+
+# ---------------------------------------------------------------------------
+# 定时跟进：/tasks 任务列表卡（每条带取消按钮）
+# ---------------------------------------------------------------------------
+
+
+def _task_excerpt(task: str, limit: int = 80) -> str:
+    task = " ".join(task.split())
+    return task if len(task) <= limit else task[:limit] + "…"
+
+
+def build_followup_tasks_card(
+    asker_id: str,
+    chat_id: str,
+    items: list[dict[str, Any]],
+    *,
+    notice: str | None = None,
+) -> dict[str, Any]:
+    """/tasks 的跟进任务列表卡：每条挂起跟进一行状态 + 一颗取消按钮。
+
+    `items` 每项：record_id / task / remaining_minutes / firing。执行中（firing）
+    的条目只展示状态、不给取消按钮——那一轮已经在跑了。`notice` 是取消回调刷新
+    卡片时挂在顶部的结果行（"✅ 已取消…"）；列表为空时整卡收尾成纯文本。
+    asker-only 校验在回调侧做，按钮 value 带回 record_id 与归属。纯函数，可单测。
+    """
+    elements: list[dict[str, Any]] = []
+    if notice:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": notice}})
+    if not items:
+        elements.append(
+            {"tag": "div", "text": {"tag": "lark_md", "content": "当前没有挂起的定时跟进了。"}}
+        )
+    else:
+        head = f"⏰ 你有 **{len(items)}** 个挂起的定时跟进："
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": head}})
+        for i, item in enumerate(items, 1):
+            if item.get("firing"):
+                status = "⏳ 正在执行，结果马上发出"
+            else:
+                m = int(item.get("remaining_minutes", 0))
+                status = f"约 {m} 分钟后执行" if m > 0 else "即将执行（不足 1 分钟）"
+            elements.append(
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**{i}.** {status}\n{_task_excerpt(str(item.get('task', '')))}",
+                    },
+                }
+            )
+            if not item.get("firing"):
+                elements.append(
+                    {
+                        "tag": "action",
+                        "actions": [
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "🗑 取消这条跟进"},
+                                "type": "default",
+                                "value": {
+                                    "fua": str(item.get("record_id", "")),
+                                    "chat": chat_id,
+                                    "asker": asker_id,
+                                },
+                            }
+                        ],
+                    }
+                )
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "⏰ 定时跟进任务"},
+        },
+        "elements": elements,
+    }
+
+
+def parse_followup_cancel_value(value: Any) -> tuple[str, str, str] | None:
+    """从 cardAction 按钮 value 解析 (record_id, chat_id, asker_id)；不是取消按钮返回 None。"""
+    value = _card_value_dict(value)
+    if value is None:
+        return None
+    rid, chat, asker = value.get("fua"), value.get("chat"), value.get("asker")
+    if not rid or not chat or not asker:
+        return None
+    return str(rid), str(chat), str(asker)

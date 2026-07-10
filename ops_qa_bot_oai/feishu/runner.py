@@ -6,7 +6,8 @@
   群里 @机器人 提问 → 立即发占位消息 → 跑 OpsQABot.answer() → 把占位编辑成最终答案
   （头部 @ 提问者；命中 <<ESCALATE>> 时末尾 @ 负责人）
 
-会话按 (chat,user) 隔离（SessionManager），/reset 开新会话。
+会话按 (chat,user) 隔离（SessionManager），/reset 开新会话；/tasks 列出自己挂起的
+定时跟进（带取消按钮，OPS_QA_FOLLOWUP=1 时）。
 这是"核心问答闭环"范围——反馈卡 / 追问卡 / 归档暂不做（产品壳层，不影响 SDK 对比）。
 
 支持三种可答题的消息形态（对齐 ops-qa-bot 的视觉路径）：
@@ -41,10 +42,17 @@ from lark_oapi.channel.types import ImageContent, InboundMessage, PostContent, T
 
 from ..db_query import DB_CHANGE_TOOL_NAME, change_display
 from ..diagnostics import DiagConfig
+from ..followup import FollowupConfig
 from ..gateway_trace import GatewayTraceConfig
 from ..model import MODE_LABELS
 from ..review import ReviewConfig
 from .approvals import ApprovalCenter
+from .followup import (
+    FOLLOWUP_QUESTION_PREFIX,
+    FollowupRecord,
+    FollowupScheduler,
+    make_followup_submitter,
+)
 from .inbound import (
     MAX_IMAGE_BYTES,
     POST_MAX_IMAGES,
@@ -55,9 +63,12 @@ from .inbound import (
 )
 from .render import (
     RESET_WORDS,
+    TASKS_WORDS,
     build_answer_post,
+    build_followup_tasks_card,
     clean_question,
     escalate_open_id,
+    parse_followup_cancel_value,
     placeholder_text,
 )
 from .session import SessionManager
@@ -181,7 +192,27 @@ class WsRunner:
             ),
         )
         self._client = FeishuClient(self._channel)
-        self._session = SessionManager(docs_root, idle_ttl=idle_ttl, max_turns=max_turns)
+        # 定时跟进（OPS_QA_FOLLOWUP=1）：内存定时器 + 按 (chat,user) 绑定的 submitter 工厂。
+        # 到点回调 _fire_followup 复用 _answer_flow 整条答题落地链路。未开启时 factory=None，
+        # SessionManager 建 bot 不注入 submitter → schedule_followup 工具不挂载，零感知。
+        self._followup_config = FollowupConfig.from_env()
+        self._followups: FollowupScheduler | None = None
+        followup_factory = None
+        if self._followup_config.enabled:
+            self._followups = FollowupScheduler(
+                self._fire_followup,
+                max_pending_per_user=self._followup_config.max_pending_per_user,
+            )
+
+            def followup_factory(key):
+                return make_followup_submitter(self._followups, key[0], key[1])
+
+        self._session = SessionManager(
+            docs_root,
+            idle_ttl=idle_ttl,
+            max_turns=max_turns,
+            followup_submitter_factory=followup_factory,
+        )
         # 写操作审批闭环（HITL）：guardrails 开启时生效。cardAction 回调常驻注册（无
         # 在途审批时回调是 no-op），审批人白名单 / 超时由 ApprovalCenter 读环境变量。
         self._approvals = ApprovalCenter(self._client)
@@ -227,8 +258,15 @@ class WsRunner:
         # 二次复核（OPS_QA_REVIEW=1）：各会话 bot 自己从环境读配置，这里只做启动日志回显。
         if ReviewConfig.from_env().enabled:
             logger.info("二次复核：开（另一模型证据核对，revise-once 后交付；诊断/写不过转人工）")
+        if self._followups is not None:
+            logger.info(
+                "定时跟进：开（%d~%d 分钟，每人挂起上限 %d；内存定时器，重启丢未触发任务）",
+                self._followup_config.min_delay_minutes,
+                self._followup_config.max_delay_minutes,
+                self._followup_config.max_pending_per_user,
+            )
         self._channel.on("message", self._on_inbound)
-        self._channel.on("cardAction", self._approvals.on_card_action)
+        self._channel.on("cardAction", self._on_card_action)
         self._channel.on("reconnecting", lambda: logger.warning("ws reconnecting ..."))
         self._channel.on("reconnected", lambda: logger.info("ws reconnected"))
 
@@ -258,8 +296,37 @@ class WsRunner:
             await self._client.send_text(chat_id, "（已开启新会话）", parent_id=msg_id)
             return
 
+        # 跟进任务管理指令：列出自己挂起的定时跟进（带取消按钮）。短路应答、零 LLM 成本。
+        if not images and question.lower() in TASKS_WORDS:
+            await self._send_tasks_list(chat_id, sender_id, msg_id)
+            return
+
+        await self._answer_flow(
+            chat_id, sender_id, question, images=images or None, parent_id=msg_id
+        )
+
+    async def _answer_flow(
+        self,
+        chat_id: str,
+        sender_id: str,
+        question: str,
+        *,
+        images: list[tuple[str, bytes]] | None = None,
+        parent_id: str | None = None,
+    ) -> None:
+        """占位 → 答题 → 答案编辑回占位的完整落地流程。
+
+        入站消息（_handle）与定时跟进到点（_fire_followup）共用这一条：到点等于
+        "以用户名义发了一条新问题"，占位/审批/@ 提问者/审批轨迹全套行为一致。
+        """
+        key = (chat_id, sender_id)
+        msg_id = parent_id
         logger.info(
-            "Q chat=%s user=%s images=%d q=%r", chat_id, sender_id, len(images), question[:80]
+            "Q chat=%s user=%s images=%d q=%r",
+            chat_id,
+            sender_id,
+            len(images or []),
+            question[:80],
         )
 
         # 立即占位（post），答完编辑替换。占位以 post 发出，方便后续 edit 成 post。
@@ -299,9 +366,7 @@ class WsRunner:
                 )
 
         try:
-            result = await self._session.answer(
-                key, question, approver=approver, images=images or None
-            )
+            result = await self._session.answer(key, question, approver=approver, images=images)
         except Exception:
             # answer() 内部只兜了 max_turns / 护栏，其余异常（provider 5xx、鉴权失败、
             # 超时、网络抖动、ModelBehaviorError…）会抛到这里。不接住的话占位消息会永远
@@ -421,6 +486,114 @@ class WsRunner:
             )
         return (normalize_image_media_type("", data), data), None
 
+    # ------------------------------------------------------------------
+    # 定时跟进：到点执行 / /tasks 列表 / 取消按钮回调
+    # ------------------------------------------------------------------
+
+    async def _fire_followup(self, rec: FollowupRecord) -> None:
+        """定时跟进到点：用存好的 task 跑一轮全新答题，结果 @ 发起人推回原群。
+
+        复用 `_answer_flow` 整条落地链路（占位/审批/@ 提问者），到点等于"以用户名义
+        发了一条新问题"。无 parent（原消息可能已隔很久，按 top-level 发更自然）。
+        `_answer_flow` 内部已把答题异常兜成错误 post；走到这里的 except 是占位都没发
+        出去之类的通道故障——补一条失败提示，静默失败等于放用户鸽子。
+        """
+        question = FOLLOWUP_QUESTION_PREFIX + rec.task
+        try:
+            await self._answer_flow(rec.chat_id, rec.asker_id, question)
+        except Exception:
+            logger.exception(
+                "scheduled followup failed: id=%s chat=%s user=%s",
+                rec.record_id,
+                rec.chat_id,
+                rec.asker_id,
+            )
+            task_short = rec.task if len(rec.task) <= 100 else rec.task[:100] + "…"
+            notice = build_answer_post(
+                f"⚠️ 你之前登记的定时跟进刚才执行失败了（任务：{task_short}）。"
+                "请直接把要查的事再发我一遍，我立刻查。",
+                asker_id=rec.asker_id,
+            )
+            await self._client.send_post(rec.chat_id, notice)
+
+    def _pending_items(self, key: tuple[str, str]) -> list[dict]:
+        """该 (chat, user) 挂起的跟进，整理成 build_followup_tasks_card 要的字典列表。"""
+        if self._followups is None:
+            return []
+        return [
+            {
+                "record_id": r.record_id,
+                "task": r.task,
+                "remaining_minutes": self._followups.remaining_minutes(r),
+                "firing": r.firing,
+            }
+            for r in self._followups.list_pending(key)
+        ]
+
+    async def _send_tasks_list(self, chat_id: str, sender_id: str, msg_id: str | None) -> None:
+        """/tasks 指令：列出自己挂起的定时跟进（每条带取消按钮）。"""
+        if self._followups is None:
+            await self._client.send_text(
+                chat_id, "定时跟进功能未启用，没有可管理的跟进任务。", parent_id=msg_id
+            )
+            return
+        items = self._pending_items((chat_id, sender_id))
+        if not items:
+            await self._client.send_text(
+                chat_id,
+                "你当前没有挂起的定时跟进。需要时直接说「X 分钟后帮我再看看 …」即可登记。",
+                parent_id=msg_id,
+            )
+            return
+        card = build_followup_tasks_card(sender_id, chat_id, items)
+        await self._client.send_card(chat_id, card, parent_id=msg_id)
+
+    async def _on_card_action(self, event) -> None:
+        """cardAction 统一入口：先试跟进取消按钮，认不出再交给写审批中心。
+
+        两边都按各自的按钮 value 结构识别（fua/… vs aid/decision），认不出即忽略，
+        互不干扰。
+        """
+        if await self._handle_followup_cancel(event):
+            return
+        await self._approvals.on_card_action(event)
+
+    async def _handle_followup_cancel(self, event) -> bool:
+        """/tasks 卡片「取消」按钮回调；不是取消按钮返回 False 交回上游。
+
+        asker-only：非登记者点击直接忽略（卡片保持原样，不给反馈）。处理后用**刷新
+        过的列表卡**原地替换——列表是会过期的快照（其他任务可能已触发），每次点击
+        顺带刷新比留着陈旧列表强。
+        """
+        parsed = parse_followup_cancel_value(getattr(getattr(event, "action", None), "value", None))
+        if parsed is None:
+            return False
+        record_id, chat_id, asker_id = parsed
+        clicker = getattr(getattr(event, "operator", None), "open_id", "") or ""
+        if not clicker or clicker != asker_id:
+            logger.info(
+                "followup cancel rejected (not asker): id=%s clicker=%s", record_id, clicker
+            )
+            return True
+        if self._followups is None:
+            return True  # 功能已关（重启换配置），卡片是旧的——忽略
+        key = (chat_id, asker_id)
+        status = self._followups.cancel(record_id, key)
+        notice = {
+            "cancelled": "✅ 已取消该跟进。",
+            "not_found": "⏰ 该跟进已执行完成或已被取消。",
+            "not_yours": "⚠️ 这条跟进不是在本群登记的，无法在这里取消。",
+            "firing": "⏳ 这条跟进已经在执行了，结果马上会发出来，取消不了。",
+        }[status]
+        logger.info("followup cancel: id=%s chat=%s user=%s → %s", record_id, *key, status)
+        msg_id = getattr(event, "message_id", None)
+        if msg_id:
+            card = build_followup_tasks_card(
+                asker_id, chat_id, self._pending_items(key), notice=notice
+            )
+            await self._client.update_card(msg_id, card)
+        return True
+
     async def _deliver(
         self, chat_id: str, ph_id: str | None, post: dict, *, parent_id: str | None = None
     ) -> None:
@@ -445,6 +618,10 @@ class WsRunner:
             pass
         finally:
             try:
+                # 先停"还会往群里发消息"的定时跟进，再关会话清扫。
+                if self._followups is not None:
+                    fut = self._channel.schedule(self._followups.stop())
+                    await asyncio.wrap_future(fut)
                 fut = self._channel.schedule(self._session.stop())
                 await asyncio.wrap_future(fut)
             except Exception:

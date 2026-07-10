@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from agents import SQLiteSession
 
@@ -48,6 +50,7 @@ class SessionManager:
         mode: str | None = None,
         session_db: str | Path | None = None,
         guardrails: bool | None = None,
+        followup_submitter_factory: Callable[[SessionKey], Any] | None = None,
     ):
         self.docs_root = docs_root
         self.idle_ttl = idle_ttl
@@ -63,6 +66,10 @@ class SessionManager:
         self.guardrails = (
             env_flag("OPS_QA_GUARDRAILS", default=False) if guardrails is None else guardrails
         )
+        # 定时跟进 submitter 工厂（runner 在定时器就绪时注入）：按 (chat,user) 造一个
+        # 绑定归属的 submitter 传给 bot，schedule_followup 工具据此登记到正确的群与人。
+        # None（CLI / 未开启）时 bot 不挂该工具。
+        self._followup_submitter_factory = followup_submitter_factory
         self._entries: dict[SessionKey, _Entry] = {}
         self._guard = asyncio.Lock()  # 保护 _entries 结构
         self._sweeper: asyncio.Task | None = None
@@ -78,6 +85,7 @@ class SessionManager:
         async with self._guard:
             entry = self._entries.get(key)
             if entry is None:
+                factory = self._followup_submitter_factory
                 bot = OpsQABot(
                     docs_root=self.docs_root,
                     model_choice=self._model_choice,
@@ -85,6 +93,7 @@ class SessionManager:
                     mode=self.mode,
                     session=self._make_session(key),
                     guardrails=self.guardrails,
+                    followup_submitter=factory(key) if factory else None,
                 )
                 entry = _Entry(bot)
                 self._entries[key] = entry

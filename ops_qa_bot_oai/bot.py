@@ -53,6 +53,7 @@ from .db_query import (
 )
 from .diagnostics import DiagConfig, DiagnosticLog, make_diagnostic_tool
 from .doc_qa import DOC_QA_TOOL_NAME, DocQAConfig, DocQALog, make_feishu_doc_tool
+from .followup import FOLLOWUP_TOOL_NAME, FollowupConfig, make_schedule_followup_tool
 from .gateway_trace import (
     GW_TRACE_TOOL_NAME,
     GatewayTraceConfig,
@@ -290,6 +291,11 @@ def format_tool_call(name: str, args: dict) -> str:
         )
     if name == GW_TRACE_TOOL_NAME:
         return f"query_gateway_trace {args.get('hi_trace_id', '?')}"
+    if name == FOLLOWUP_TOOL_NAME:
+        t = str(args.get("task", "?"))
+        if len(t) > 60:
+            t = t[:60] + "…"
+        return f"schedule_followup +{args.get('delay_minutes', '?')}min: {t}"
     if name == DOC_QA_TOOL_NAME:
         q = str(args.get("question", "?"))
         if len(q) > 60:
@@ -332,6 +338,8 @@ class OpsQABot:
         doc_qa_config: DocQAConfig | None = None,
         gw_trace_config: GatewayTraceConfig | None = None,
         review_config: ReviewConfig | None = None,
+        followup_config: FollowupConfig | None = None,
+        followup_submitter: Any = None,
     ):
         if mode not in MODES:
             raise ValueError(f"未知 mode={mode!r}，可选：{' / '.join(MODES)}")
@@ -384,6 +392,18 @@ class OpsQABot:
                 self._extra_tools = self._extra_tools + [
                     make_db_change_tool(db_client, self.write_log)
                 ]
+
+        # 定时跟进（OPS_QA_FOLLOWUP=1 且接入层注入了 submitter 才挂）：schedule_followup
+        # 登记"过 N 分钟自动再查一次"，到点由接入层的定时器复用答题链路把结果推回群。
+        # 横切工具（哪个组件的变更都可能要跟进），与写审批/诊断并列进 _extra_tools。
+        # CLI 直用没有定时器（submitter=None），工具不挂、prompt 不加章节，零感知。
+        # 见 followup.py / feishu/followup.py。
+        self.followup_config = followup_config or FollowupConfig.from_env()
+        self.followup = bool(self.followup_config.enabled and followup_submitter is not None)
+        if self.followup:
+            self._extra_tools = self._extra_tools + [
+                make_schedule_followup_tool(self.followup_config, followup_submitter)
+            ]
 
         # 飞书文档问答（OPS_QA_DOC_QA_BASE_URL 配了才开）：把「用飞书文档维护知识」的组件
         # 接进来。与 diagnostics/guardrails 的区别是它不是横切工具——它是某些组件的**唯一
@@ -471,6 +491,7 @@ class OpsQABot:
                     db=self.db,
                     has_db_change_tool=self._has_db_change_tool,
                     gw_trace=self.gw_trace,
+                    followup=self.followup,
                 ),
                 # single 模式只有一个 agent，"组件专属"无处可依附——链路工具与文档检索工具
                 # 并列挂上，靠 prompt 章节区分何时用（同 query_feishu_doc 在 single 下的处境）。
