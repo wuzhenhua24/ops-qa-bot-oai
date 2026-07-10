@@ -552,7 +552,9 @@ uv run python run_ws.py                # 群里 @机器人 提问即可
 
 对比 ops-qa-bot 的同款功能，两处做得更干净：参考版要把工具包成进程内 MCP server 才能挂，这里一个 `@function_tool` 就够；参考版的定时器直接 import 答题入口、住在 3000 行的 feishu_core 里，这里定时器是纯逻辑（`feishu/followup.py`），到点执行什么由 runner 注入回调——工具校验、调度器状态机、卡片渲染、按钮回调全部可脱离飞书单测。实现见 `followup.py` + `feishu/followup.py`。
 
-> 当前是核心问答闭环 + 写操作审批闭环；反馈卡 / 追问卡 / 问答归档等产品壳层尚未做，按新场景需要再扩展。
+**问答归档（升级 → 负责人答复 → 沉淀进文档）**：bot 答不出而升级时（`<<ESCALATE:ou_xxx:dir>>` @ 负责人），LLM 会随附一行 `<<ARCHIVE_Q:归一化问题标题>>`，系统在升级答案后再发一张**归档表单卡**（可编辑的问题标题框预填该标题 + 多行答案框）。负责人答完提交（owner-only：别人误点会重建表单不顶掉），答案 append-only 写入 `docs/<组件>/qa-archive.md`（每文件锁 + qid 幂等防重复提交），并在原群 **@ 提问者**把答案推回去（闭环交付）。点睛之处：`qa-archive.md` 就在组件文档目录里，bot 的检索天然能命中——**负责人答一次，bot 就学会了**，下次同样的问题直接答、不再升级。目录名来自 LLM 输出，落盘前过白名单校验（防路径穿越，不合法落根目录 `qa-archive.md`）；表单 24h 没人填自动过期（纯内存，重启即丢）。实现见 `feishu/archive.py` + `feishu/render.py`，回归测试 `tests/test_archive_question.py`。
+
+> 当前是核心问答闭环 + 写操作审批闭环 + 问答归档闭环；反馈卡 / 追问卡等产品壳层尚未做，按新场景需要再扩展。
 
 **答题模式**：飞书没有命令行开关，默认 `auto`（自适应分诊，见上「答题模式」）。要固定成别的模式，在 `.env` 里设 `OPS_QA_MODE=single|multi|coordinator` 即可；启动日志会回显当前模式（`答题模式：自适应分诊（单专家 / 跨组件协调）（模型 …）`）。
 
@@ -566,6 +568,6 @@ uv run ruff format .     # 格式化
 
 ## 范围说明
 
-当前已落地：文档问答核心主线 + 七项能力（结构化契约 / 多模型路由 / 多 agent 编排 / 护栏+审批 / 评测台 / 实时诊断 / 二次复核）+ 飞书长连接核心问答闭环 + 飞书写操作审批闭环（HITL 卡片）。这些都建立在 OpenAI Agents SDK 的自由度之上（Session 会话记忆、lifecycle hooks 遥测、按角色 ModelSettings、tool-level guardrails 分层、handoff input_filter），作为承接新场景的基座。尚未做（按新场景需要再扩展）：数据库只读分析、定时跟进、飞书反馈卡 / 追问卡 / 问答归档。
+当前已落地：文档问答核心主线 + 七项能力（结构化契约 / 多模型路由 / 多 agent 编排 / 护栏+审批 / 评测台 / 实时诊断 / 二次复核）+ 飞书长连接核心问答闭环 + 飞书写操作审批闭环（HITL 卡片）+ 问答归档闭环。这些都建立在 OpenAI Agents SDK 的自由度之上（Session 会话记忆、lifecycle hooks 遥测、按角色 ModelSettings、tool-level guardrails 分层、handoff input_filter），作为承接新场景的基座。尚未做（按新场景需要再扩展）：飞书反馈卡 / 追问卡。
 
 > 后续方向：本项目不再以"对比 ops-qa-bot"为目标——两者是互补方案（Claude SDK 上手快、OpenAI SDK 自由度大）。重心转向**承接原项目够不着的场景与全新场景**，例如非 markdown / 向量检索的大规模知识库、跨组件协作型复杂任务、结构化数据对外接入自动化流程等。

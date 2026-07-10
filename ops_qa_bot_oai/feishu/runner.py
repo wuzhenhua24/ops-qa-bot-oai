@@ -9,7 +9,9 @@
 会话按 (chat,user) 隔离（SessionManager），/reset 开新会话；/tasks 列出自己挂起的
 定时跟进（带取消按钮，OPS_QA_FOLLOWUP=1 时）；/cancel（或「取消」）停掉自己正在
 处理/排队中的提问——发错问题不用干等答完，也不白烧 token。
-这是"核心问答闭环"范围——反馈卡 / 追问卡 / 归档暂不做（产品壳层，不影响 SDK 对比）。
+升级到负责人（<<ESCALATE:ou_xxx:dir>>）时随答案再发一张**问答归档表单卡**：负责人
+填答案提交 → 写进 docs/<组件>/qa-archive.md → @ 提问者推送答案（闭环见
+feishu/archive.py）。反馈卡 / 追问卡暂不做（产品壳层，不影响 SDK 对比）。
 
 支持三种可答题的消息形态（对齐 ops-qa-bot 的视觉路径）：
 
@@ -48,6 +50,7 @@ from ..gateway_trace import GatewayTraceConfig
 from ..model import MODE_LABELS
 from ..review import ReviewConfig
 from .approvals import ApprovalCenter
+from .archive import ArchiveStore, handle_archive_submit, safe_component_dir
 from .followup import (
     FOLLOWUP_QUESTION_PREFIX,
     FollowupRecord,
@@ -67,9 +70,13 @@ from .render import (
     RESET_WORDS,
     TASKS_WORDS,
     build_answer_post,
+    build_archive_form_card,
     build_followup_tasks_card,
     clean_question,
+    escalate_dir,
     escalate_open_id,
+    extract_form_value,
+    parse_archive_submit_value,
     parse_followup_cancel_value,
     placeholder_text,
 )
@@ -188,6 +195,7 @@ class WsRunner:
         docs_root = Path(docs_root).resolve()
         if not (docs_root / "INDEX.md").is_file():
             raise RuntimeError(f"docs_root 缺少 INDEX.md: {docs_root}")
+        self._docs_root = docs_root
         self._channel = FeishuChannel(
             app_id=app_id,
             app_secret=app_secret,
@@ -223,6 +231,9 @@ class WsRunner:
         # 写操作审批闭环（HITL）：guardrails 开启时生效。cardAction 回调常驻注册（无
         # 在途审批时回调是 no-op），审批人白名单 / 超时由 ApprovalCenter 读环境变量。
         self._approvals = ApprovalCenter(self._client)
+        # 问答归档：升级到负责人的问题挂一张表单卡，负责人答完写进
+        # docs/<组件>/qa-archive.md 并推给提问者（闭环见 feishu/archive.py）。
+        self._archives = ArchiveStore()
         logger.info(
             "答题模式：%s（模型 %s）",
             MODE_LABELS.get(self._session.mode, self._session.mode),
@@ -466,6 +477,16 @@ class WsRunner:
 
         await self._deliver(chat_id, ph_id, final_post, parent_id=msg_id)
 
+        # 问答归档：实际 @ 了负责人时（<<ESCALATE:ou_xxx:dir>>，非 none）再发一张
+        # 归档表单卡——负责人答完提交，答案写进 docs/<组件>/qa-archive.md 并推给
+        # 提问者；归档进文档后 bot 的检索能命中，下次同样的问题不再升级。
+        if esc:
+            try:
+                await self._send_archive_form(chat_id, sender_id, question, result, esc, msg_id)
+            except Exception:
+                # 表单卡发不出不影响主答案交付（升级 @ 已经送达），只丢这次沉淀机会。
+                logger.exception("send archive form failed: chat=%s", chat_id)
+
         u = result.usage or {}
         logger.info(
             "A chat=%s user=%s turns=%s in=%s out=%s",
@@ -614,14 +635,68 @@ class WsRunner:
         await self._client.send_card(chat_id, card, parent_id=msg_id)
 
     async def _on_card_action(self, event) -> None:
-        """cardAction 统一入口：先试跟进取消按钮，认不出再交给写审批中心。
+        """cardAction 统一入口：跟进取消 → 归档提交 → 写审批中心，依次尝试。
 
-        两边都按各自的按钮 value 结构识别（fua/… vs aid/decision），认不出即忽略，
-        互不干扰。
+        各家按自己的按钮 value 结构识别（fua/… vs aq vs aid/decision），认不出
+        即交给下一家，互不干扰。
         """
         if await self._handle_followup_cancel(event):
             return
+        if await self._handle_archive_submit(event):
+            return
         await self._approvals.on_card_action(event)
+
+    async def _send_archive_form(
+        self, chat_id: str, asker_id: str, question: str, result, owner_id: str, parent_id
+    ) -> None:
+        """升级交付后：登记 pending + 给负责人发归档表单卡。"""
+        component_dir = safe_component_dir(self._docs_root, escalate_dir(result.markers.escalate))
+        # 表单预填标题：优先 LLM 给的归一化标题（ARCHIVE_Q），没给退回用户原话。
+        question_default = getattr(result.markers, "archive_q", None) or question
+        rec = self._archives.register(
+            chat_id=chat_id,
+            asker_id=asker_id,
+            question=question,
+            question_default=question_default,
+            owner_id=owner_id,
+            component_dir=component_dir,
+            parent_msg_id=parent_id,
+        )
+        card = build_archive_form_card(
+            rec.qid, rec.question_default, owner_id, rec.archive_path_repr
+        )
+        await self._client.send_card(chat_id, card, parent_id=parent_id)
+        logger.info(
+            "archive form sent: qid=%s owner=%s target=%s", rec.qid, owner_id, rec.archive_path_repr
+        )
+
+    async def _handle_archive_submit(self, event) -> bool:
+        """归档表单「提交并归档」回调；不是归档按钮返回 False 交回上游。
+
+        owner-only 校验、写盘、幂等都在 archive.handle_archive_submit 里；这里只做
+        飞书 I/O：用返回的卡片原地替换表单（ack 或非负责人误点时重建的表单），有
+        通知任务就把答案 @ 提问者推回原群。
+        """
+        qid = parse_archive_submit_value(getattr(getattr(event, "action", None), "value", None))
+        if qid is None:
+            return False
+        form = extract_form_value(getattr(event, "raw", None))
+        clicker = getattr(getattr(event, "operator", None), "open_id", "") or ""
+        card, notify = await handle_archive_submit(
+            self._archives,
+            self._docs_root,
+            qid=qid,
+            question=str(form.get("question") or ""),
+            answer=str(form.get("answer") or ""),
+            clicker_id=clicker,
+        )
+        msg_id = getattr(event, "message_id", None)
+        if msg_id:
+            await self._client.update_card(msg_id, card)
+        if notify is not None:
+            n_chat, n_post, n_parent = notify
+            await self._client.send_post(n_chat, n_post, parent_id=n_parent)
+        return True
 
     async def _handle_followup_cancel(self, event) -> bool:
         """/tasks 卡片「取消」按钮回调；不是取消按钮返回 False 交回上游。

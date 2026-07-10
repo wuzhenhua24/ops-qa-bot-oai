@@ -122,6 +122,10 @@ _HUMAN_REJECTION_MSG = (
 
 _ESCALATE_RE = re.compile(r"<<ESCALATE:([^>]*)>>")
 _CLARIFY_RE = re.compile(r"<<CLARIFY>>")
+# 归档问题标题：升级时 LLM 随附的归一化标题（问答归档的表单预填值）。负载不吃
+# `<` `>` 和换行（防误匹配跨行内容），允许为空（空的照样剥掉、只是不产出标题）。
+_ARCHIVE_Q_RE = re.compile(r"<<ARCHIVE_Q:([^<>\n\r]*?)>>")
+_ARCHIVE_Q_MAX_LEN = 100
 
 
 @dataclass(frozen=True)
@@ -145,6 +149,7 @@ class Markers:
 
     escalate: str | None = None  # ESCALATE 的负载，如 "ou_xxx:redis" 或 "none"
     clarify: bool = False
+    archive_q: str | None = None  # ARCHIVE_Q 的负载：归一化问题标题（归档表单预填值）
 
 
 def parse_markers(text: str) -> tuple[str, Markers]:
@@ -156,9 +161,17 @@ def parse_markers(text: str) -> tuple[str, Markers]:
         markers.escalate = m.group(1).strip()
     if _CLARIFY_RE.search(text):
         markers.clarify = True
+    m = _ARCHIVE_Q_RE.search(text)
+    if m:
+        # 折叠空白成单行（标题最终写成 `## Q: ...`），超长截断补省略号。
+        draft = " ".join(m.group(1).split())
+        if len(draft) > _ARCHIVE_Q_MAX_LEN:
+            draft = draft[:_ARCHIVE_Q_MAX_LEN] + "…"
+        markers.archive_q = draft or None
 
     cleaned = _ESCALATE_RE.sub("", text)
     cleaned = _CLARIFY_RE.sub("", cleaned)
+    cleaned = _ARCHIVE_Q_RE.sub("", cleaned)
     # 标记常独占一行，剥离后会留下多余空行，收一收。
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned, markers

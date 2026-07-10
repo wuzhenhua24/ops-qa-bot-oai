@@ -40,6 +40,21 @@ def escalate_open_id(payload: str | None) -> str | None:
     return head if head.startswith("ou_") else None
 
 
+def escalate_dir(payload: str | None) -> str | None:
+    """从 ESCALATE marker 负载里抠出组件目录提示（`ou_xxx:redis` 的 `redis`）。
+
+    只做拆分不做校验——目录是 LLM 输出的，落盘前必须过 archive.safe_component_dir
+    的白名单校验（防路径穿越 / 不存在的目录）。没带目录或 `none` 返回 None。
+    """
+    if not payload:
+        return None
+    parts = payload.split(":", 1)
+    if len(parts) < 2:
+        return None
+    d = parts[1].strip()
+    return d or None
+
+
 def _render_body(markdown: str) -> list[list[dict[str, Any]]]:
     """markdown → 飞书 post 段落列表（委托 lark-oapi）。"""
     from lark_oapi.channel.outbound.markdown import markdown_to_post_ast
@@ -279,3 +294,145 @@ def parse_followup_cancel_value(value: Any) -> tuple[str, str, str] | None:
     if not rid or not chat or not asker:
         return None
     return str(rid), str(chat), str(asker)
+
+
+# ---------------------------------------------------------------------------
+# 问答归档：升级后发给负责人的表单卡 + 提交回执卡 + "已答复"通知 post
+# ---------------------------------------------------------------------------
+
+
+def _excerpt(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def build_archive_form_card(
+    qid: str,
+    question_default: str,
+    owner_id: str,
+    archive_path_repr: str,
+) -> dict[str, Any]:
+    """归档表单卡（card v2 form）：可编辑问题标题 + 多行答案输入框 + 提交按钮。
+
+    question_default：预填进"问题"输入框的标题——优先是答题那轮 LLM 给的归一化
+    标题（ARCHIVE_Q），否则是用户原话。负责人可改成更通用的说法再提交；最终写盘
+    用框里的值。archive_path_repr：展示给负责人的相对路径（如 "redis/qa-archive.md"），
+    让他知道答案会落到哪个文件。提交按钮 value 带 {"aq": qid}，cardAction 回调据此
+    识别归档提交（区别于审批的 aid / 跟进取消的 fua）。纯函数，可单测。
+    """
+    intro = (
+        f"<at id={owner_id}></at> 下面的「问题」是系统自动整理的，"
+        "可改成更通用的说法（它会作为归档标题和以后的检索关键词）；"
+        "把整理过的答案填进答案框，"
+        f"提交后会追加进 `{archive_path_repr}`，下次同样的问题 bot 就能直接答。"
+    )
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "📝 问答归档"},
+            "template": "blue",
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": intro},
+                {
+                    "tag": "form",
+                    "name": "archive_form",
+                    "elements": [
+                        {
+                            "tag": "input",
+                            "name": "question",
+                            "default_value": _excerpt(question_default, 100),
+                            "max_length": 120,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "归档用的问题标题（可修订）…",
+                            },
+                            "required": True,
+                        },
+                        {
+                            "tag": "input",
+                            "name": "answer",
+                            "input_type": "multiline_text",
+                            "rows": 6,
+                            "max_length": 1000,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "粘贴整理后的答案文本（最多 1000 字）…",
+                            },
+                            "required": True,
+                        },
+                        {
+                            "tag": "button",
+                            "name": "submit_btn",
+                            "text": {"tag": "plain_text", "content": "提交并归档"},
+                            "type": "primary",
+                            "form_action_type": "submit",
+                            "behaviors": [{"type": "callback", "value": {"aq": qid}}],
+                        },
+                    ],
+                },
+            ]
+        },
+    }
+
+
+def build_archive_ack_card(icon: str, message: str) -> dict[str, Any]:
+    """提交后用来替换原表单卡的提示卡（card v2，纯文本）。"""
+    return {
+        "schema": "2.0",
+        "body": {"elements": [{"tag": "markdown", "content": f"{icon} {message}"}]},
+    }
+
+
+def build_archive_notify_post(
+    *,
+    asker_id: str,
+    owner_id: str,
+    question: str,
+    answer_markdown: str,
+    archive_rel: str,
+) -> dict[str, Any]:
+    """ "负责人已答复"通知 post：@ 提问者把归档答案推回原群（闭环交付）。
+
+    asker_id 放第一段以 @ 推送（不 @ 的话 asker 永远不知道负责人答了）；答案正文
+    走 markdown 渲染保留列表/代码块结构；末尾告知归档路径（bot 已能检索到）。
+    """
+    paragraphs: list[list[dict[str, Any]]] = [
+        [
+            {"tag": "at", "user_id": asker_id},
+            {"tag": "text", "text": " 📣 你之前的问题负责人已答复："},
+        ],
+        [{"tag": "text", "text": f"Q: {question}"}],
+    ]
+    paragraphs.extend(_render_body(answer_markdown))
+    paragraphs.append(
+        [
+            {"tag": "text", "text": f"（已归档进 `{archive_rel}`，答复人 "},
+            {"tag": "at", "user_id": owner_id},
+            {"tag": "text", "text": "；下次同样的问题可以直接问我）"},
+        ]
+    )
+    return {"zh_cn": {"title": "", "content": paragraphs}}
+
+
+def parse_archive_submit_value(value: Any) -> str | None:
+    """从 cardAction 按钮 value 解析归档提交的 qid；不是归档按钮返回 None。"""
+    value = _card_value_dict(value)
+    if value is None:
+        return None
+    qid = value.get("aq")
+    return str(qid) if qid else None
+
+
+def extract_form_value(raw: Any) -> dict:
+    """从 cardAction 事件的 raw envelope 抽 form_value。
+
+    channel 的 CardActionPayload 只暴露按钮 payload（action.value），form 元素
+    （input）的填写结果在 envelope 内部：raw["event"]["action"]["form_value"]。
+    """
+    try:
+        return raw["event"]["action"].get("form_value") or {}
+    except (KeyError, TypeError, AttributeError):
+        return {}
