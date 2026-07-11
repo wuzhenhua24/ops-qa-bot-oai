@@ -6,7 +6,7 @@ provider/模型由环境变量决定（见 README 的「模型 / provider 配置
 对比"= 换 OPS_QA_* 环境变量再跑一次。
 
 用法：
-    uv run python run_eval.py                                  # 默认跑 structured + free + multi
+    uv run python run_eval.py                                 # 默认跑 free+structured+multi+auto
     uv run python run_eval.py --modes structured              # 只跑结构化
     uv run python run_eval.py --modes structured,multi --detail
     uv run python run_eval.py --cases path/to/cases.json --docs path/to/docs
