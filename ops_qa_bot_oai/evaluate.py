@@ -34,8 +34,13 @@ from .index import norm_key, parse_feishu_citation, safe_ident
 from .model import ModelChoice, resolve_model
 from .schema import validate_citations
 
-# 抽取正文里的来源标注：支持全角（来源：x）和半角(来源:x)，逗号分隔多个。
-_CITATION_RE = re.compile(r"[（(]\s*来源\s*[:：]\s*([^）)]+)[）)]")
+# 抽取正文里的来源标注：支持全角（来源：x）和半角(来源:x)。全角分支放前面且允许内容里
+# 出现半角括号（文件名如 `API网关 (FaaS 网关) 使用手册.md`）；逗号/顿号分隔多个。
+# 与 review._CITATION_RE 同款（那边独立一份，避免 bot → evaluate → bot 循环导入）。
+_CITATION_RE = re.compile(
+    r"（\s*来源\s*[:：]\s*([^（）\n]+)）|[（(]\s*来源\s*[:：]\s*([^）)\n]+)[）)]"
+)
+_CITATION_SPLIT_RE = re.compile(r"[,，、]")
 _REJECT_HINTS = ("不在我覆盖", "不在覆盖", "帮不上忙", "范围内", "无法回答", "不在.*范围")
 
 
@@ -107,7 +112,7 @@ def extract_citations(text: str) -> list[str]:
     """从自由文本答案里抽取 `（来源：path）` 标注的路径（去重保序）。"""
     out: list[str] = []
     for m in _CITATION_RE.finditer(text):
-        for part in m.group(1).split(","):
+        for part in _CITATION_SPLIT_RE.split(m.group(1) or m.group(2)):
             p = part.strip().strip("`").lstrip("/")
             if p and p not in out:
                 out.append(p)

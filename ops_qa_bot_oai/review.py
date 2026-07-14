@@ -73,7 +73,8 @@ class ReviewConfig:
 
     enabled: bool = False
     # 喂给 reviewer 的证据（引用文档内容 + 诊断输出）截断上限，防超长文档撑爆复核上下文。
-    max_evidence_chars: int = 8000
+    # 16000 的量级：一篇使用手册类文档就常有大几千字符，引用 3-4 篇 + 诊断输出要都能进证据。
+    max_evidence_chars: int = 16000
 
     @classmethod
     def from_env(cls) -> ReviewConfig:
@@ -85,9 +86,9 @@ class ReviewConfig:
         )
         raw = (os.environ.get("OPS_QA_REVIEW_MAX_EVIDENCE") or "").strip()
         try:
-            max_chars = int(raw) if raw else 8000
+            max_chars = int(raw) if raw else 16000
         except ValueError:
-            max_chars = 8000
+            max_chars = 16000
         return cls(enabled=enabled, max_evidence_chars=max_chars)
 
 
@@ -177,19 +178,43 @@ def build_reviewer_agent(model: Any, *, name: str = "reviewer") -> Agent:
 
 
 # 自由文本答案里的 `（来源：path）` 标注（与 evaluate._CITATION_RE 同款；这里独立一份，
-# 避免 bot → evaluate → bot 的循环导入）。全/半角冒号与括号都容忍，逗号分隔多个。
-_CITATION_RE = re.compile(r"[（(]\s*来源\s*[:：]\s*([^）)]+)[）)]")
+# 避免 bot → evaluate → bot 的循环导入）。全/半角冒号与括号都容忍。全角外括号的分支放前面
+# 且允许内容里出现**半角**括号——真实文件名会带（如 `API网关 (FaaS 网关) 使用手册.md`），
+# 旧正则 `[^）)]+` 在文件名的 `)` 处截断、产出坏路径 → 读到 [未找到] → reviewer 误判
+# "引用无据"。捕获排除换行，防缺闭括号时贪婪跨行。
+_CITATION_RE = re.compile(
+    r"（\s*来源\s*[:：]\s*([^（）\n]+)）|[（(]\s*来源\s*[:：]\s*([^）)\n]+)[）)]"
+)
+# 多来源分隔符：英文逗号 / 中文逗号 / 顿号（模型列多篇文档时最常写顿号）。
+_CITATION_SPLIT_RE = re.compile(r"[,，、]")
 
 
 def extract_citations(text: str) -> list[str]:
     """从自由文本答案里抽取 `（来源：path）` 标注的路径（去重保序）。纯函数。"""
     out: list[str] = []
     for m in _CITATION_RE.finditer(text):
-        for part in m.group(1).split(","):
+        for part in _CITATION_SPLIT_RE.split(m.group(1) or m.group(2)):
             p = part.strip().strip("`").lstrip("/")
             if p and p not in out:
                 out.append(p)
     return out
+
+
+def _allocate_evidence_budget(lengths: list[int], budget: int) -> list[int]:
+    """把总预算按"水位法"分给各证据部分：从短到长逐个分配，短的整段保留，省下的归长的。
+
+    比整体截尾公平——n 篇引用文档每篇都能进证据；比 `budget // n` 硬均分利用率高——短
+    部分用不完的份额流给长部分。纯函数。
+    """
+    alloc = [0] * len(lengths)
+    remaining = budget
+    left = len(lengths)
+    for i in sorted(range(len(lengths)), key=lambda i: lengths[i]):
+        share = max(0, remaining) // left
+        alloc[i] = min(lengths[i], share)
+        remaining -= alloc[i]
+        left -= 1
+    return alloc
 
 
 def gather_evidence(
@@ -198,7 +223,7 @@ def gather_evidence(
     diag_outputs: list[str],
     *,
     feishu_answers: dict[str, str] | None = None,
-    max_chars: int = 8000,
+    max_chars: int = 16000,
 ) -> str:
     """把答案依据的证据拼成给 reviewer 的文本：引用来源的**实际内容** + 诊断**实际输出**。
 
@@ -214,7 +239,10 @@ def gather_evidence(
       结果、`query_gateway_trace` 取到的网关链路表。三者都带来源前缀，reviewer 据此核对
       "结论是否被实时数据支持"。
 
-    整体截断到 max_chars 防超长。
+    超预算时按份**均摊**（见 _allocate_evidence_budget）而不是整体截尾：整体 `text[:max]`
+    会让第一篇长文档吃光预算、其余引用文档一个字都进不了证据，reviewer 拿到残缺证据后
+    稳定误判"引用无据"（真实案例：引用 4 篇使用手册，只有第一篇的开头进了证据，好答案
+    被挂满复核提示）。
     """
     # 键归一化，好让 citation 里的组件名（大小写/目录名）能对上工具调用记录。
     pending = {norm_key(k): (k, v) for k, v in (feishu_answers or {}).items()}
@@ -240,9 +268,15 @@ def gather_evidence(
     if not parts:
         return "（无可核对的证据：答案未引用任何文档、也没有诊断输出。）"
     text = "\n\n".join(parts)
-    if len(text) > max_chars:
-        text = text[:max_chars] + f"\n\n…[证据超过 {max_chars} 字符已截断]"
-    return text
+    if len(text) <= max_chars:
+        return text
+    alloc = _allocate_evidence_budget([len(p) for p in parts], max_chars)
+    fitted = []
+    for p, quota in zip(parts, alloc):
+        if len(p) > quota:
+            p = p[:quota] + f"\n…[本节证据超出均摊份额已截断，总预算 {max_chars} 字符]"
+        fitted.append(p)
+    return "\n\n".join(fitted)
 
 
 def is_review_eligible(citations: list[str], risky: bool, clarify: bool) -> bool:

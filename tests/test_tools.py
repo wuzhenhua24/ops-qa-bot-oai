@@ -793,6 +793,16 @@ def test_extract_citations_comma_and_dedup():
     assert extract_citations(text) == ["redis/a.md", "redis/b.md"]
 
 
+def test_extract_citations_ideographic_comma_and_parens_in_filename():
+    """与 review.extract_citations 的同名回归保持一致：顿号分隔 + 文件名含半角括号。
+    评测的来源命中率用的是这份解析，坏路径会让 component_cited 误判。"""
+    text = "（来源：gateway/AI 网关使用手册.md、gateway/API网关 (FaaS 网关) 使用手册.md）"
+    assert extract_citations(text) == [
+        "gateway/AI 网关使用手册.md",
+        "gateway/API网关 (FaaS 网关) 使用手册.md",
+    ]
+
+
 def test_infer_decision_from_markers():
     assert infer_decision_freetext(Markers(clarify=True), "随便") == "clarify"
     assert infer_decision_freetext(Markers(escalate="ou_x:redis"), "随便") == "escalate"

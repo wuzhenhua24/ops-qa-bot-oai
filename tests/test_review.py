@@ -42,6 +42,19 @@ def test_extract_citations():
     assert extract_citations("没有来源标注的答案") == []
 
 
+def test_extract_citations_ideographic_comma_and_parens_in_filename():
+    """回归（真实误伤案例）：顿号分隔多来源 + 文件名含半角括号。旧解析在文件名的 `)` 处
+    截断且不认顿号，产出坏路径 `gateway/AI 网关使用手册.md、gateway/API网关 (FaaS 网关`
+    → 读到 [未找到] → reviewer 误判"引用无据"、好答案被挂复核提示。"""
+    text = "（来源：gateway/AI 网关使用手册.md、gateway/API网关 (FaaS 网关) 使用手册.md）"
+    assert extract_citations(text) == [
+        "gateway/AI 网关使用手册.md",
+        "gateway/API网关 (FaaS 网关) 使用手册.md",
+    ]
+    # 半角外括号的老写法不回归
+    assert extract_citations("(来源: redis/a.md)") == ["redis/a.md"]
+
+
 def test_is_review_eligible():
     assert is_review_eligible(["redis/x.md"], False, False) is True  # 有引用
     assert is_review_eligible([], True, False) is True  # 跑了诊断
@@ -92,7 +105,24 @@ def test_gather_evidence_empty():
 
 def test_gather_evidence_truncates(docs_root: Path):
     ev = gather_evidence(docs_root, ["redis/troubleshooting.md"], ["x" * 5000], max_chars=200)
-    assert len(ev) <= 260 and "已截断" in ev
+    assert len(ev) <= 300 and "已截断" in ev
+    assert "内存告警" in ev  # 均摊：短的文档部分整段保留，被截的是超长诊断输出
+
+
+def test_gather_evidence_budget_shared_across_docs(docs_root: Path):
+    """回归（真实误伤案例）：旧实现整体 text[:max]，第一篇长文档吃光预算，其余引用文档
+    一个字都进不了证据 → reviewer 稳定误判"引用无据"。均摊后每篇都要有实际内容。"""
+    (docs_root / "gateway").mkdir()
+    for i in range(4):
+        (docs_root / "gateway" / f"manual{i}.md").write_text(
+            f"# 手册{i}\n标志内容{i}。" + "填充" * 3000, encoding="utf-8"
+        )
+    cites = [f"gateway/manual{i}.md" for i in range(4)]
+    ev = gather_evidence(docs_root, cites, [], max_chars=8000)
+    for i in range(4):
+        assert f"引用文档：gateway/manual{i}.md" in ev
+        assert f"标志内容{i}" in ev  # 每篇都有正文进证据，不只是标题行
+    assert len(ev) <= 8000 + 4 * 60  # 总量仍受预算约束（截断标注的少量溢出除外）
 
 
 # ---------------------------------------------------------------------------
