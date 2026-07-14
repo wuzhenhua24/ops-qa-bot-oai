@@ -184,8 +184,10 @@ def _orchestration_lines(mode: str, bot: OpsQABot) -> list[str]:
         head += "（跨组件问题自动升级协调者）"
     lines = [head]
     if bot.model_router is not None:
-        entry = "coordinator" if mode == "coordinator" else "triage"
-        roles = [entry] + [c.dir for c in bot.components]
+        roles = ["coordinator"] if mode == "coordinator" else ["triage"]
+        if mode == "auto":
+            roles.append("coordinator")  # auto 也会建协调者，MODEL_COORDINATOR 覆盖要能看见
+        roles += [c.dir for c in bot.components]
         lines.append(f"模型路由：{bot.model_router.describe(roles)}")
     return lines
 

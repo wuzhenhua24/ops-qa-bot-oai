@@ -51,7 +51,7 @@ from ..diagnostics import DiagConfig
 from ..followup import FollowupConfig
 from ..gateway_trace import GatewayTraceConfig
 from ..index import parse_index_components
-from ..model import MODE_LABELS
+from ..model import MODE_LABELS, build_model_router
 from ..review import ReviewConfig
 from .approvals import ApprovalCenter
 from .archive import ArchiveStore, handle_archive_submit, safe_component_dir
@@ -262,6 +262,20 @@ class WsRunner:
             MODE_LABELS.get(self._session.mode, self._session.mode),
             self._session.model_choice.description,
         )
+        if self._session.mode != "single":
+            # 多模型路由回显（CLI 有横幅、飞书此前没有）：OPS_QA_MODEL_<组件> 这类覆盖
+            # 键没对上目录名时是**静默闲置**的，不打这行就无从确认配置是否生效。
+            # roles 按当前模式实际会建的角色拼；reviewer 在开复核时一并列出。
+            try:
+                roles = ["coordinator"] if self._session.mode == "coordinator" else ["triage"]
+                if self._session.mode == "auto":
+                    roles.append("coordinator")
+                roles += [c.dir for c in parse_index_components(docs_root)]
+                if ReviewConfig.from_env().enabled:
+                    roles.append("reviewer")
+                logger.info("模型路由：%s", build_model_router().describe(roles))
+            except Exception as e:  # 回显失败不拦启动；reviewer 独立端点配错会在这里显形
+                logger.warning("模型路由解析失败（答题时会再次报错）：%s", e)
         logger.info(
             "会话历史：%s",
             "内存（重启即丢；设 OPS_QA_SESSION_DB 可落盘）"
