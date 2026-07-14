@@ -527,8 +527,9 @@ class OpsQABot:
         self._structured_agent: Agent[DocsContext] | None = None
 
         # 二次复核（#7）：另一个模型对答案做证据核对，revise-once 后交付。缺省从环境读。
-        # reviewer 用 model router 的 reviewer 角色（OPS_QA_REVIEWER_MODEL 可指到不同模型，
-        # 降低同错同漏）；single 模式没有 router 时按需建一个（仅在开启复核时）。懒构造。
+        # reviewer 用 model router 的 reviewer 角色（OPS_QA_REVIEWER_MODEL 换模型名，复用主
+        # 端点；OPS_QA_REVIEWER_PROVIDER 切独立端点，跨家族复核降低同错同漏）；single 模式
+        # 没有 router 时按需建一个（仅在开启复核时）。懒构造。
         self.review_config = review_config or ReviewConfig.from_env()
         self.review = self.review_config.enabled
         self._review_router: ModelRouter | None = (

@@ -527,7 +527,8 @@ def main() -> None:
         "--review",
         action="store_true",
         help="开启二次复核（等价 OPS_QA_REVIEW=1）：另一模型对答案做证据核对，revise-once 后交付。"
-        "OPS_QA_REVIEWER_MODEL 可指到不同模型。开启后走非流式路径",
+        "OPS_QA_REVIEWER_MODEL 可指到不同模型（复用主端点）；主端点没有目标模型时再设 "
+        "OPS_QA_REVIEWER_PROVIDER/_BASE_URL/_API_KEY 切独立端点。开启后走非流式路径",
     )
     args = parser.parse_args()
     docs_root = Path(args.docs).resolve()

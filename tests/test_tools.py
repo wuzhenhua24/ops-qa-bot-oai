@@ -318,6 +318,72 @@ def test_router_describe(monkeypatch):
     assert "redis" not in desc  # redis 无覆盖，不列
 
 
+def test_router_reviewer_model_only_reuses_main_provider(monkeypatch):
+    """只设 OPS_QA_REVIEWER_MODEL → 复用主 provider/client，仅换模型名（端点支持多模型）。"""
+    from ops_qa_bot_oai.model import build_model_router
+
+    _clear_model_env(monkeypatch)
+    monkeypatch.setenv("OPS_QA_MODEL", "gpt-5")
+    monkeypatch.setenv("OPS_QA_REVIEWER_MODEL", "gpt-5-mini")
+    router = build_model_router()
+    assert router.role_factories == {}  # 没配 REVIEWER_PROVIDER，不建独立端点
+    name, model = router.for_role("reviewer")
+    assert name == "gpt-5-mini"
+    assert model == "gpt-5-mini"  # openai provider 下 model 就是字符串，走主 client
+
+
+def test_router_reviewer_independent_provider(monkeypatch):
+    """设 OPS_QA_REVIEWER_PROVIDER → 复核者切独立端点，其余角色不受影响。"""
+    from agents import OpenAIChatCompletionsModel
+
+    from ops_qa_bot_oai.model import build_model_router
+
+    _clear_model_env(monkeypatch)
+    monkeypatch.setenv("OPS_QA_MODEL", "gpt-5")
+    monkeypatch.setenv("OPS_QA_REVIEWER_PROVIDER", "compatible")
+    monkeypatch.setenv("OPS_QA_REVIEWER_BASE_URL", "https://proxy.example.com/v1")
+    monkeypatch.setenv("OPS_QA_REVIEWER_API_KEY", "sk-r")
+    monkeypatch.setenv("OPS_QA_REVIEWER_MODEL", "glm-4.6")
+    router = build_model_router()
+    name, model = router.for_role("reviewer")
+    assert name == "glm-4.6"
+    assert isinstance(model, OpenAIChatCompletionsModel)  # 独立 client 铸出的 Model 实例
+    assert str(model._client.base_url).rstrip("/") == "https://proxy.example.com/v1"
+    # 其余角色仍走主 provider（openai，字符串模型名）。
+    assert router.for_role("redis") == ("gpt-5", "gpt-5")
+    # 横幅能看出 reviewer 在独立端点上。
+    assert "reviewer=compatible:glm-4.6" in router.describe([])
+
+
+def test_router_reviewer_independent_provider_default_model(monkeypatch):
+    """独立端点没设 OPS_QA_REVIEWER_MODEL 时，回退该 provider 的缺省模型（而非主模型名）。"""
+    from ops_qa_bot_oai.model import _DEFAULT_MODEL, build_model_router
+
+    _clear_model_env(monkeypatch)
+    monkeypatch.setenv("OPS_QA_MODEL", "gpt-5")
+    monkeypatch.setenv("OPS_QA_REVIEWER_PROVIDER", "compatible")
+    monkeypatch.setenv("OPS_QA_REVIEWER_BASE_URL", "https://proxy.example.com/v1")
+    monkeypatch.setenv("OPS_QA_REVIEWER_API_KEY", "sk-r")
+    name, _ = build_model_router().for_role("reviewer")
+    assert name == _DEFAULT_MODEL["compatible"]
+
+
+def test_router_reviewer_independent_provider_missing_config_raises(monkeypatch):
+    """独立端点缺 URL/key 必须在启动时抛——reviewer 运行期 fail-open，配错拖到运行期
+    只会表现成"复核静默全过"。"""
+    import pytest
+
+    from ops_qa_bot_oai.model import build_model_router
+
+    _clear_model_env(monkeypatch)
+    monkeypatch.setenv("OPS_QA_REVIEWER_PROVIDER", "compatible")
+    with pytest.raises(ValueError, match="OPS_QA_REVIEWER_BASE_URL"):
+        build_model_router()
+    monkeypatch.setenv("OPS_QA_REVIEWER_PROVIDER", "no-such-provider")
+    with pytest.raises(ValueError, match="OPS_QA_REVIEWER_PROVIDER"):
+        build_model_router()
+
+
 # ---------------------------------------------------------------------------
 # 护栏 + 写操作审批（差异化 #4）
 # ---------------------------------------------------------------------------

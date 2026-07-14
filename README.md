@@ -476,12 +476,21 @@ uv run python run.py --review --ask "Redis 内存告警的阈值是多少？"
 OPS_QA_DIAG=1 uv run python run.py --diagnostics --review \
   --ask "10.1.2.3 现在 redis 淘汰策略是什么？内存到顶会怎样？"
 
-# 复核用另一个模型（降低同错同漏），走 model router 的 reviewer 角色：
+# 复核用另一个模型（降低同错同漏），走 model router 的 reviewer 角色。
+# 只换模型名 → 复用主 provider/URL/key（端点支持多模型时最省事）：
 OPS_QA_MODEL=glm-4.6 OPS_QA_REVIEWER_MODEL=gpt-5 \
+  uv run python run.py --review
+
+# 主端点只服务一个模型家族（如 Anthropic 协议网关上要不到 gpt-5）时，
+# 给复核者配**独立端点**（跨家族复核才是"另一个模型"的完全体）：
+OPS_QA_REVIEWER_PROVIDER=compatible \
+OPS_QA_REVIEWER_BASE_URL=https://another-proxy.example.com/v1 \
+OPS_QA_REVIEWER_API_KEY=sk-... \
+OPS_QA_REVIEWER_MODEL=gpt-5 \
   uv run python run.py --review
 ```
 
-环境变量：`OPS_QA_REVIEW`（开关）/ `OPS_QA_REVIEWER_MODEL`（复核者模型，建议与答题不同）/ `OPS_QA_REVIEW_MAX_EVIDENCE`（证据截断上限）。终端 `--review`，飞书认 `OPS_QA_REVIEW=1`。**与编排/输出/护栏/诊断正交**：在 `answer()` / `answer_guarded()` / `answer_structured()` 三条非流式路径收尾处叠加（流式 REPL 开 `--review` 时自动切非流式，因为答案要先成型才能核对）。实现见 `ops_qa_bot_oai/review.py`；四条终态（approve / revise→approve / 仍不过→A / 仍不过→B）+ fail-open 由 `tests/test_review.py` 的桩化用例锁住。
+环境变量：`OPS_QA_REVIEW`（开关）/ `OPS_QA_REVIEWER_MODEL`（复核者模型，建议与答题不同；只设它 → 复用主 provider/client 换模型名）/ `OPS_QA_REVIEWER_PROVIDER` + `OPS_QA_REVIEWER_BASE_URL` + `OPS_QA_REVIEWER_API_KEY`（+ `OPS_QA_REVIEWER_ANTHROPIC_AUTH`，复核者独立端点，语义与主配置同名变量一致；配错在启动时就抛——reviewer 运行期 fail-open，配错拖到运行期只会表现成"复核静默全过"）/ `OPS_QA_REVIEW_MAX_EVIDENCE`（证据截断上限）。终端 `--review`，飞书认 `OPS_QA_REVIEW=1`。**与编排/输出/护栏/诊断正交**：在 `answer()` / `answer_guarded()` / `answer_structured()` 三条非流式路径收尾处叠加（流式 REPL 开 `--review` 时自动切非流式，因为答案要先成型才能核对）。实现见 `ops_qa_bot_oai/review.py`；四条终态（approve / revise→approve / 仍不过→A / 仍不过→B）+ fail-open 由 `tests/test_review.py` 的桩化用例锁住。
 
 > **关于"收益量不量得出"**：干净文档上 reviewer 无错可抓，聚合评测量不出增益是正常的——安全网要在"它该拦的失败"上量，不在 happy path 量。落地上靠**可观测**取信号：每次复核落日志（`review: verdict1=… revised=… escalate=…`），答案带 `reviewed/revised/needs_human_review` 元信息，肉眼翻 trace 就能判断"重答是修了真问题还是把好答案改花了"。要量化 catch rate，可往 `eval/cases.json` 加对抗性 fixture（文档说 X 诱导说非 X、诊断 94% 却说正常、引用存在但不支撑）——在它该拦的失败上量，而非正常题。
 
