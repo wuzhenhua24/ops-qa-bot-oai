@@ -1382,6 +1382,37 @@ async def test_approval_center_allowlist_and_reject():
     assert client.updated[-1][1]["header"]["template"] == "red"
 
 
+async def test_approval_center_stale_click_marks_card_invalid():
+    """回归：服务重启丢了内存态的挂起审批后，审批人点旧卡。旧行为是静默忽略——卡片
+    永远保持可点、点了没任何动静；现在原地替换成"已失效"卡（无按钮）给出明确反馈。"""
+    from types import SimpleNamespace
+
+    from ops_qa_bot_oai.feishu.approvals import ApprovalCenter
+
+    client = _FakeCardClient()
+    center = ApprovalCenter(client, approvers=frozenset(), timeout=5.0)  # 空在途表 = 重启后
+    event = SimpleNamespace(
+        action=SimpleNamespace(value={"aid": "ghost", "decision": "approve"}),
+        operator=SimpleNamespace(open_id="ou_boss", name="值班人"),
+        message_id="msg_old_card",
+    )
+    await center.on_card_action(event)
+    msg_id, card = client.updated[-1]
+    assert msg_id == "msg_old_card"
+    assert "失效" in str(card)
+    assert not any(e.get("tag") == "action" for e in card["elements"])  # 按钮已移除
+
+
+async def test_approval_center_stale_click_without_message_id_is_noop():
+    """事件缺 message_id（异常形态）时不炸、也不发起更新。"""
+    from ops_qa_bot_oai.feishu.approvals import ApprovalCenter
+
+    client = _FakeCardClient()
+    center = ApprovalCenter(client, approvers=frozenset(), timeout=5.0)
+    await center.on_card_action(_card_event("ghost", "approve"))  # 该假事件没有 message_id
+    assert client.updated == []
+
+
 async def test_approval_center_timeout_and_send_failure():
     from ops_qa_bot_oai.feishu.approvals import ApprovalCenter
 

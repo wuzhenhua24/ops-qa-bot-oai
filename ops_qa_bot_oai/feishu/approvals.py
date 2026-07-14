@@ -13,6 +13,9 @@ OpenAI Agents SDK 的 `needs_approval` 让 run 在写提议处挂起（interrupt
   点按钮有效，其他人点了在卡片上提示无权限；不设则群里任何人可拍板（演示模式）。
 - 拍板后卡片**原地替换**成结果卡（按钮移除，防重复点击 / 双人竞态：第一个有效
   点击生效，后到的发现 Future 已 resolve 即忽略）。
+- **在途审批是纯内存的**：服务重启即丢（挂起的答题 run 也一并丢，无从恢复）。
+  重启后遗留的死卡被点击时（在途表查无此审批）原地替换成"已失效"卡，给审批人
+  明确反馈；未被点过的孤儿卡不主动清理（无落盘记录可扫），属已知取舍。
 
 黑名单命中的毁灭性命令在 `answer_guarded` 的审批前短路就驳回了，根本不会走到
 这里发卡片——审批卡片只为"有风险但可能合理"的命令出现（三层分级见 guardrails.py）。
@@ -27,7 +30,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from .render import build_approval_card, build_approval_result_card, parse_card_action_value
+from .render import (
+    build_approval_card,
+    build_approval_result_card,
+    build_approval_stale_card,
+    parse_card_action_value,
+)
 
 logger = logging.getLogger("ops_qa_bot_oai.feishu.approvals")
 
@@ -118,10 +126,13 @@ class ApprovalCenter:
             await self._finish_card(pend, approved=False, note="❌ 提问已被取消，该审批作废。")
             logger.info("审批随提问取消而作废：%s", command)
             raise
+        else:
+            # 结果卡写完再从在途表摘除（finally 最后执行）：写卡期间的重复点击落在
+            # "future 已 done"分支被忽略，而不是查无记录、被误替换成"已失效"卡。
+            await self._finish_card(pend, approved=approved)
+            return approved
         finally:
             self._pending.pop(aid, None)
-        await self._finish_card(pend, approved=approved)
-        return approved
 
     async def on_card_action(self, event: Any) -> None:
         """cardAction 回调：解析按钮 value → 校验白名单 → resolve 对应 Future。"""
@@ -130,8 +141,14 @@ class ApprovalCenter:
             return  # 不是审批按钮（其他卡片交互），忽略
         aid, approved = parsed
         pend = self._pending.get(aid)
-        if pend is None or pend.future.done():
-            return  # 已拍板/超时/重复点击，忽略
+        if pend is None:
+            # 在途表里查无此审批：典型是服务重启——挂起审批与发起它的答题 run 都是
+            # 内存态、随进程丢了，卡片却留在群里保持可点。原地替换成"已失效"给点击
+            # 的人明确反馈，否则死卡"点了没任何动静"、只会被反复点。
+            await self._finish_stale_card(event, aid)
+            return
+        if pend.future.done():
+            return  # 已拍板/超时后的重复点击（结果卡即将替换），忽略
         operator = getattr(event, "operator", None)
         open_id = getattr(operator, "open_id", "") or ""
         if self.approvers and open_id not in self.approvers:
@@ -142,6 +159,19 @@ class ApprovalCenter:
         logger.info(
             "审批拍板：%s → %s（by %s）", pend.command, "批准" if approved else "驳回", open_id
         )
+
+    async def _finish_stale_card(self, event: Any, aid: str) -> None:
+        """把查无在途记录的审批卡原地替换成"已失效"卡（移除按钮）。失败仅记日志。"""
+        logger.warning(
+            "审批点击查无在途记录（aid=%s，多半是服务重启丢了挂起审批），卡片置为失效", aid
+        )
+        msg_id = getattr(event, "message_id", None)
+        if not msg_id:
+            return
+        try:
+            await self._client.update_card(msg_id, build_approval_stale_card())
+        except Exception:
+            logger.exception("失效审批卡更新失败 msg=%s", msg_id)
 
     async def _finish_card(self, pend: _Pending, *, approved: bool, note: str = "") -> None:
         """把待批卡片原地替换成结果卡（移除按钮）。失败仅记日志，不影响主流程。"""

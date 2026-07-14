@@ -186,6 +186,31 @@ def build_approval_result_card(
     }
 
 
+def build_approval_stale_card() -> dict[str, Any]:
+    """失效卡片：按钮被点击、但在途表里查无此审批时原地替换（无按钮）。
+
+    典型场景是服务重启：挂起审批与发起它的答题 run 都是内存态、随进程一起丢，卡片却留在
+    群里保持可点。不替换的话审批人"点了没任何动静"，只会反复点。纯函数，可单测。
+    """
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "grey",
+            "title": {"tag": "plain_text", "content": "写操作审批已失效"},
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "该审批已不在在途记录中（通常因服务重启，挂起的审批与原提问"
+                    "一并中断，未执行任何操作）。如仍需执行，请重新提问、走一遍新的审批。",
+                },
+            }
+        ],
+    }
+
+
 def _card_value_dict(value: Any) -> dict | None:
     """cardAction 按钮 value 归一成 dict：飞书可能原样回传 dict，也可能是 JSON 字符串。"""
     if isinstance(value, str):
