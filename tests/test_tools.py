@@ -1259,12 +1259,23 @@ def test_handoff_strip_tools_wired_by_default(docs_root: Path, monkeypatch):
 
 
 def test_handoff_strip_tools_env_off(docs_root: Path, monkeypatch):
-    """OPS_QA_HANDOFF_STRIP_TOOLS=0 关闭：不带 run_config（SDK 默认行为，转交看全量历史）。"""
+    """OPS_QA_HANDOFF_STRIP_TOOLS=0 关闭：不设 handoff_input_filter（转交看全量历史）。"""
     from ops_qa_bot_oai.bot import OpsQABot
 
     monkeypatch.setenv("OPS_QA_HANDOFF_STRIP_TOOLS", "0")
     bot = OpsQABot(docs_root=docs_root, model_choice=_model_choice(), mode="multi")
-    assert "run_config" not in bot._run_kwargs()
+    assert bot._run_kwargs()["run_config"].handoff_input_filter is None
+
+
+def test_unknown_tool_call_fed_back_to_model_not_fatal(docs_root: Path):
+    """回归（真实故障）：同一会话上一轮专家调过 query_database，工具记录随 session 历史
+    喂给下一轮分诊台，分诊台有样学样直接调它——它没挂这个工具，SDK 默认抛
+    ModelBehaviorError 掀翻整轮（用户看到"回答失败"）。run 级配置改为把"工具不存在"
+    喂回模型让它自己纠正（改走 handoff）。"""
+    from ops_qa_bot_oai.bot import OpsQABot
+
+    bot = OpsQABot(docs_root=docs_root, model_choice=_model_choice(), mode="multi")
+    assert bot._run_kwargs()["run_config"].tool_not_found_behavior == "return_error_to_model"
 
 
 # ---------------------------------------------------------------------------

@@ -456,10 +456,18 @@ class OpsQABot:
         # session 落盘的历史不动（SDK 语义）。所有 handoff 想要同一策略，故用 run 级
         # RunConfig.handoff_input_filter（未设 per-handoff filter 时全局生效）；
         # OPS_QA_HANDOFF_STRIP_TOOLS=0 可关（调试/评测 A/B 用）。
-        self._run_config: RunConfig | None = (
-            RunConfig(handoff_input_filter=remove_all_tools)
-            if env_flag("OPS_QA_HANDOFF_STRIP_TOOLS", default=True)
-            else None
+        #
+        # tool_not_found_behavior="return_error_to_model"：模型调了当前 agent 没挂载的
+        # 工具时，把"工具不存在"作为 function_call_output 喂回让它自己纠正，而不是抛
+        # ModelBehaviorError 掀翻整轮。真实触发形态：同一会话上一轮专家用过
+        # query_database，工具记录随 session 历史喂给下一轮的分诊台，分诊台有样学样直接
+        # 调它——分诊台物理上没有这个工具是设计使然（工具只挂专家），但代价不该是整轮
+        # 答题失败；喂回错误后模型会改走 handoff。
+        self._run_config: RunConfig = RunConfig(
+            handoff_input_filter=(
+                remove_all_tools if env_flag("OPS_QA_HANDOFF_STRIP_TOOLS", default=True) else None
+            ),
+            tool_not_found_behavior="return_error_to_model",
         )
 
         self._agent: Agent[DocsContext]
@@ -741,7 +749,7 @@ class OpsQABot:
     def _run_kwargs(self) -> dict[str, Any]:
         # session：SDK 自动做多轮历史的读取与落盘（run 前取历史拼 input、run 后存新 items）。
         # hooks：运行遥测（转交链 / 按 agent 用量），调用方在 run 前 reset_run()。
-        # run_config：转交剥噪音的 handoff input_filter（见 __init__）。
+        # run_config：转交剥噪音的 handoff input_filter + 未知工具调用喂回纠正（见 __init__）。
         kwargs: dict[str, Any] = {
             "context": self._context,
             "session": self._session,
