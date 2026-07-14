@@ -35,7 +35,7 @@ from .db_query import DB_CHANGE_TOOL_NAME, DB_TOOL_NAME
 from .diagnostics import DIAG_TOOL_NAME
 from .followup import FOLLOWUP_TOOL_NAME
 from .gateway_trace import GW_TRACE_TOOL_NAME
-from .index import Component, feishu_citation, parse_index_components
+from .index import Component, feishu_citation, parse_index_components, safe_ident
 from .model import ModelRouter, role_model_settings
 from .prompt import (
     STRUCTURED_CONTRACT_SUFFIX,
@@ -96,7 +96,10 @@ def _trace_routing_note(
 ) -> str:
     """分诊台的 Hi-Trace-Id 路由兜底规则（没挂链路工具时为空串）。见 prompt.trace_routing_rule。"""
     c = _gw_trace_component(components, scoped_tools)
-    return trace_routing_rule(c.name, c.dir, has_coordinator=has_coordinator) if c else ""
+    # 传清洗后的目录名：规则里写的 `<dir>_specialist` 要和实际 agent 名一致。
+    if not c:
+        return ""
+    return trace_routing_rule(c.name, safe_ident(c.dir), has_coordinator=has_coordinator)
 
 
 def routable_components(components: list[Component], feishu_tool: object | None) -> list[Component]:
@@ -317,7 +320,10 @@ def build_specialist_agent(
     names = _tool_names(extra) | _tool_names(scoped)
     instructions_fn = _feishu_specialist_instructions if c.is_feishu else _specialist_instructions
     return Agent[DocsContext](
-        name=f"{c.dir}_specialist",
+        # safe_ident：SDK 按 agent 名自动生成 handoff 工具 transfer_to_<名>，目录名带
+        # 连字符等字符（如 anti-asset）会触发 SDK 的改名 WARNING，且 prompt 里的转交
+        # 目标名与实际工具名对不上——在源头就用合法标识符。
+        name=f"{safe_ident(c.dir)}_specialist",
         handoff_description=f"{c.name} 运维问题（{c.coverage}）",
         instructions=instructions_fn(
             c,
@@ -338,7 +344,10 @@ def build_specialist_agent(
 
 
 def _triage_instructions(components: list[Component], trace_note: str = "") -> str:
-    lines = [f"- **{c.name}**（转交目标：{c.dir}_specialist）：{c.coverage}" for c in components]
+    lines = [
+        f"- **{c.name}**（转交目标：{safe_ident(c.dir)}_specialist）：{c.coverage}"
+        for c in components
+    ]
     roster = "\n".join(lines) if lines else "（INDEX.md 未解析到组件）"
     body = f"""你是内部运维问答的**分诊台**。你自己不查组件文档、不回答组件细节问题——你的职责是把问题**转交（handoff）给正确的组件专家**。
 
@@ -450,7 +459,7 @@ def _coordinator_escalate_rule(components: list[Component]) -> str:
 
 
 def _coordinator_instructions(components: list[Component]) -> str:
-    lines = [f"- **{c.name}**（工具 `ask_{c.dir}`）：{c.coverage}" for c in components]
+    lines = [f"- **{c.name}**（工具 `ask_{safe_ident(c.dir)}`）：{c.coverage}" for c in components]
     roster = "\n".join(lines) if lines else "（INDEX.md 未解析到组件）"
     return f"""你是内部运维问答的**跨组件协调者**，专门处理"一个现象可能牵涉多个组件"的复杂排查。你不直接查文档，而是把问题拆给对应的**组件专家工具**，收齐证据后综合出根因。
 
@@ -518,7 +527,7 @@ def build_coordinator_agent(
             scoped_tools=scoped_tools,
             feishu_tool=feishu_tool,
         ).as_tool(
-            tool_name=f"ask_{c.dir}",
+            tool_name=f"ask_{safe_ident(c.dir)}",
             tool_description=(
                 f"就某现象咨询 {c.name} 组件专家（覆盖：{c.coverage}）。"
                 f"传一个自包含的子问题；返回该组件文档依据下的发现。"
@@ -565,7 +574,10 @@ _AUTO_COORDINATOR_HANDOFF_DESC = (
 
 
 def _auto_triage_instructions(components: list[Component], trace_note: str = "") -> str:
-    lines = [f"- **{c.name}**（转交目标：{c.dir}_specialist）：{c.coverage}" for c in components]
+    lines = [
+        f"- **{c.name}**（转交目标：{safe_ident(c.dir)}_specialist）：{c.coverage}"
+        for c in components
+    ]
     roster = "\n".join(lines) if lines else "（INDEX.md 未解析到组件）"
     body = f"""你是内部运维问答的**分诊台**（自适应路由）。你自己不查组件文档、不回答组件细节——职责是把问题**转交（handoff）给正确的处理者**。
 

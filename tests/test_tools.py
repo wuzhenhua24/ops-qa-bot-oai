@@ -841,6 +841,18 @@ def test_score_case_invalid_citations_flag():
     assert score.citations_all_valid is False
 
 
+def test_score_case_route_with_hyphen_dir():
+    """目录名带连字符时（如 anti-asset），agent 名构建期被 safe_ident 清洗，route 剥后缀
+    得到的是清洗名（anti_asset）；用例里 expected_route 写**真实目录名**也必须判对。"""
+    from ops_qa_bot_oai.evaluate import normalize_route
+
+    route = normalize_route("anti_asset_specialist")
+    assert route == "anti_asset"
+    case = EvalCase(id="r1", question="q", expected_decision=None, expected_route="anti-asset")
+    score = score_case(case, _outcome("answer", [], route=route))
+    assert score.route_correct is True
+
+
 def test_aggregate_rates():
     cases = [
         EvalCase(id="a", question="q", expected_decision="answer", expected_component="redis"),
@@ -1611,6 +1623,32 @@ def test_triage_gets_clarify_only_not_escalate(tmp_path):
     assert "<<CLARIFY>>" in agent.instructions
     # 分诊台不答组件问题，给它升级契约会诱导它抢专家的活
     assert "<<ESCALATE" not in agent.instructions
+
+
+def test_safe_ident():
+    from ops_qa_bot_oai.index import safe_ident
+
+    assert safe_ident("redis") == "redis"  # 合法标识符原样保留
+    assert safe_ident("anti-asset") == "anti_asset"
+    assert safe_ident("a.b c") == "a_b_c"
+
+
+def test_hyphen_dir_identifiers_sanitized_across_graph(tmp_path):
+    """目录名带连字符（如 anti-asset）时，agent 名 / ask_ 工具名 / 分诊 prompt 的转交目标
+    都在源头清洗成合法标识符——否则 SDK 按 agent 名生成 transfer_to_<名> 工具时会打
+    改名 WARNING，且 prompt 里的目标名与实际工具名对不上。"""
+    (tmp_path / "INDEX.md").write_text(
+        "| 组件 | 目录 | 覆盖内容 | open_id |\n|---|---|---|---|\n"
+        "| 反资产 | `anti-asset/` | 反资产服务 | ou_aaa |\n",
+        encoding="utf-8",
+    )
+    triage, comps = build_triage_agent(tmp_path, build_model_router())
+    assert comps[0].dir == "anti-asset"  # 组件解析保留真实目录名（读文档/作用域用）
+    assert triage.handoffs[0].name == "anti_asset_specialist"
+    assert "anti_asset_specialist" in triage.instructions  # 转交目标与实际 agent 名一致
+    assert "anti-asset_specialist" not in triage.instructions
+    coordinator, _ = build_coordinator_agent(tmp_path, build_model_router())
+    assert [t.name for t in coordinator.tools] == ["ask_anti_asset"]
 
 
 def test_marker_round_trip_producer_to_feishu_at_mention():

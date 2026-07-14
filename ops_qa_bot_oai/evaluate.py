@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from .bot import Markers, OpsQABot
-from .index import norm_key, parse_feishu_citation
+from .index import norm_key, parse_feishu_citation, safe_ident
 from .model import ModelChoice, resolve_model
 from .schema import validate_citations
 
@@ -133,6 +133,10 @@ def normalize_route(route: str | None) -> str:
 
     `None`（无 handoff，入口 agent 自答）→ "self"；`coordinator` → "coordinator"；
     `<dir>_specialist` → "<dir>"（组件目录名）；其余原样返回。
+
+    注意 agent 名在构建期经过了 safe_ident 清洗（连字符等 → `_`），所以剥后缀得到的是
+    **清洗后**的目录名（`anti-asset` 的专家 → `anti_asset`）；score_case 比对时对
+    expected_route 做同样清洗，两边才能对上。
     """
     if route is None:
         return "self"
@@ -171,9 +175,11 @@ def score_case(case: EvalCase, outcome: RunOutcome) -> CaseScore:
         )
 
     # 路由只在能路由的模式下评分（outcome.route 为 None 表示该模式不计路由）。
+    # expected_route 用 safe_ident 清洗后再比：用例里写的是真实目录名（可能带连字符），
+    # 而 route 来自 agent 名（构建期已清洗），见 normalize_route 的注意事项。
     route_correct: bool | None = None
     if case.expected_route is not None and outcome.route is not None:
-        route_correct = outcome.route == case.expected_route
+        route_correct = outcome.route == safe_ident(case.expected_route)
 
     usage = outcome.usage or {}
     return CaseScore(

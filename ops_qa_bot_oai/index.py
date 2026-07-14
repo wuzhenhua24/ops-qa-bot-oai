@@ -61,6 +61,21 @@ def norm_key(s: str) -> str:
     return s.strip().strip("`").strip("/").strip().lower()
 
 
+# 函数调用的工具名只允许 [A-Za-z0-9_]。
+_IDENT_RE = re.compile(r"[^0-9A-Za-z_]")
+
+
+def safe_ident(s: str) -> str:
+    """把组件目录名转成函数调用安全的标识符（非字母/数字/下划线的字符 → `_`）。
+
+    专家 agent 名（SDK 会自动生成 handoff 工具 `transfer_to_<agent名>`）和协调者的
+    `ask_<dir>` 工具名都受工具命名约束。目录名带连字符等字符时（如 `anti-asset`），
+    SDK 会自己转换并打 WARNING，且分诊 prompt 里的转交目标名会与实际工具名对不上——
+    在源头转掉。评测比对 route 时用同一函数清洗 expected_route，保证能对上。
+    """
+    return _IDENT_RE.sub("_", s)
+
+
 def feishu_citation(component_name: str) -> str:
     """构造飞书来源的引用标识，如 `飞书文档·Nginx`。"""
     return f"{CITATION_PREFIX}{component_name}"
