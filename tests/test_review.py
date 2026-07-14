@@ -55,6 +55,33 @@ def test_extract_citations_ideographic_comma_and_parens_in_filename():
     assert extract_citations("(来源: redis/a.md)") == ["redis/a.md"]
 
 
+def test_reviewer_instructions_pin_json_output_with_example():
+    """回归：不支持 json_schema 的端点（如智谱 paas/v4 上的 GLM）会按 prompt 字面输出
+    `verdict: approve` 这类 YAML 风格纯文本——解析必败、复核每次 fail-open 被静默旁路。
+    prompt 里必须钉死"只输出一个 JSON 对象"并给出具体样例。"""
+    assert '{"verdict": "approve", "findings": [], "grounded": true}' in R.REVIEWER_INSTRUCTIONS
+    assert "JSON 对象" in R.REVIEWER_INSTRUCTIONS
+
+
+async def test_run_review_contract_violation_logged_distinctly(monkeypatch, caplog):
+    """输出不符合契约（ModelBehaviorError）与"调用失败"分开报——前者每次必现、该换
+    reviewer 模型，笼统报"调用失败"会把排查方向误导到鉴权/网络上（真实案例）。"""
+    import logging
+
+    from agents.exceptions import ModelBehaviorError
+
+    async def boom(*a, **kw):
+        raise ModelBehaviorError("Invalid JSON when parsing verdict: approve ...")
+
+    monkeypatch.setattr(R.Runner, "run", boom)
+    agent = R.build_reviewer_agent("gpt-5")
+    with caplog.at_level(logging.WARNING, logger="ops_qa_bot_oai.review"):
+        verdict = await R.run_review(agent, "q", "a", "ev")
+    assert verdict is None  # 仍然 fail-open
+    assert "不符合 ReviewVerdict 契约" in caplog.text
+    assert "调用失败" not in caplog.text
+
+
 def test_is_review_eligible():
     assert is_review_eligible(["redis/x.md"], False, False) is True  # 有引用
     assert is_review_eligible([], True, False) is True  # 跑了诊断
