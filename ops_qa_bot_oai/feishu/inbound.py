@@ -73,6 +73,42 @@ def _iter_post_documents(post: dict) -> list[dict]:
     return [doc for doc in post.values() if isinstance(doc, dict)]
 
 
+# @所有人 在 post AST 的 ``at`` 元素里 ``user_id`` 实测取值。线上抓包（2026-06-24，
+# ops-qa-bot）是 ``@_all``；SDK 文档的 ``is_mention_all`` 又按 ``all`` 判——两种都收，
+# 避免再被 wire 取值变体绕过。普通 @某人 是 open_id（``ou_xxx``），不会撞这两个值。
+_POST_AT_ALL_IDS = frozenset({"all", "@_all"})
+
+
+def post_mention_all_ids(post: dict) -> tuple[bool, set[str]]:
+    """扫 post AST 的 ``at`` 元素，返回 ``(是否含@所有人, 其余被@到的 id 集合)``。
+
+    富文本里 @所有人 是 ``{"tag":"at","user_id":"@_all"}``、@某人是 ``user_id=ou_xxx``。
+    SDK 的 ``mentioned_all`` 只认纯文本里的 ``@_all`` 占位符——post 的 ``at`` 元素被
+    ``converters/post.py`` 直接渲染成字面 ``@所有人``，all 信号在转换时就丢了，于是
+    post 形态的 @所有人（典型场景：@所有人 + 截图发通知）绕过 channel PolicyGate
+    （``policy_mention_all_blocked`` 不触发）。这里直接走 raw AST 兜底识别，不依赖
+    SDK 的 mention 抽取。
+
+    ``user_id`` 字段在飞书 post wire 里装的就是 open_id（``ou_xxx``）；@所有人 是
+    ``_POST_AT_ALL_IDS`` 里的特例。``open_id`` 作历史形态兜底。
+    """
+    has_all = False
+    at_ids: set[str] = set()
+    for doc in _iter_post_documents(post):
+        for para in doc.get("content") or []:
+            if not isinstance(para, list):
+                continue
+            for el in para:
+                if not isinstance(el, dict) or el.get("tag") != "at":
+                    continue
+                uid = el.get("user_id") or el.get("open_id") or ""
+                if uid in _POST_AT_ALL_IDS:
+                    has_all = True
+                elif uid:
+                    at_ids.add(uid)
+    return has_all, at_ids
+
+
 def parse_post_text(post_ast: dict) -> str:
     """从 post AST 抽出供 LLM 阅读的纯文本（image_key 由 ``inbound.resources``
     给出，不在这里重复抽）。

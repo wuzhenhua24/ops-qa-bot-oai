@@ -76,6 +76,7 @@ from .inbound import (
     extract_image_caption,
     normalize_image_media_type,
     parse_post_text,
+    post_mention_all_ids,
 )
 from .render import (
     CANCEL_WORDS,
@@ -614,8 +615,9 @@ class WsRunner:
         - text  → 剥 @bot 占位后的纯文字，无图。
         - image → 下载单图走视觉路径；下载失败/超大/为空回提示不进答题。引导问题用
           caption（转发/第三方客户端偶有）或 DEFAULT_IMAGE_PROMPT。
-        - post  → AST 抽文字 + 从 inbound.resources 下载图（最多 POST_MAX_IMAGES 张，
-          单张失败只丢那一张不阻塞）；文字和图都为空才回 unsupported。
+        - post  → 先拦 @所有人 广播（见分支内注释），再 AST 抽文字 + 从
+          inbound.resources 下载图（最多 POST_MAX_IMAGES 张，单张失败只丢那一张
+          不阻塞）；文字和图都为空才回 unsupported。
         - 其它  → unsupported 提示。
         """
         content = inbound.content
@@ -637,6 +639,22 @@ class WsRunner:
             return compose_image_question(caption, 1), [img]
 
         if isinstance(content, PostContent):
+            # post 形态的 @所有人 走不到 channel PolicyGate 的 mention_all 拦截（SDK
+            # 只认纯文本里的 @_all 占位符，post 的 at 元素在转换时被渲染成字面
+            # @所有人，all 信号丢了）——这里 AST 兜底：纯 @所有人 广播（典型场景：
+            # @所有人 + 截图发通知）静默不答；"@所有人 + 同时单独 @bot" 仍放行答题
+            # （对齐 text 路径语义）。bot identity 未解析时 fail-safe 按广播丢，
+            # 宁可漏答不误答广播。
+            has_mention_all, post_at_ids = post_mention_all_ids(content.post or {})
+            if has_mention_all:
+                bot_ids = self._bot_self_ids()
+                mentioned_bot = bool(post_at_ids & bot_ids) or any(
+                    getattr(m, "open_id", None) in bot_ids for m in (inbound.mentions or [])
+                )
+                if not mentioned_bot:
+                    logger.info("post @所有人 广播已过滤（未单独 @bot）：chat=%s", chat_id)
+                    return None
+
             text = parse_post_text(content.post or {})
             keys = [
                 r.file_key for r in (inbound.resources or []) if r.type == "image" and r.file_key
@@ -680,6 +698,17 @@ class WsRunner:
                 "请压缩后重发，或把关键内容用文字描述出来。"
             )
         return (normalize_image_media_type("", data), data), None
+
+    def _bot_self_ids(self) -> set[str]:
+        """bot 自身身份 id 集合（open_id + user_id）；identity 未解析时为空集。
+
+        channel 启动时异步拉 ``/bot/v3/info``，极早期的消息可能赶在解析完成前到达，
+        此时返回空集——调用方据此 fail-safe（@所有人 post 一律按广播丢）。
+        """
+        identity = getattr(self._channel, "bot_identity", None)
+        if identity is None:
+            return set()
+        return {i for i in (identity.open_id, identity.user_id) if i}
 
     # ------------------------------------------------------------------
     # 定时跟进：到点执行 / /tasks 列表 / 取消按钮回调
